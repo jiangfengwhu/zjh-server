@@ -16,7 +16,15 @@
 2. `npm run typecheck` 检查类型。
 3. `npm run deploy` 发布到既有 zijinhua Worker。
 
-保留 zijinhua.297782.xyz 域名、CATALOG KV 和 BLOBS R2，继续使用现有线上数据与 Secrets。JULES_API_KEY 和 PUBLISH_TOKEN 由 Cloudflare Secrets 管理；本地调试可用忽略的 .dev.vars，不提交凭证。
+保留 zijinhua.297782.xyz 域名、CATALOG KV 和 BLOBS R2，继续使用现有线上数据与 Secrets。JULES_API_KEY、PUBLISH_TOKEN 和 GITHUB_MERGE_TOKEN 由 Cloudflare Secrets 管理；本地调试可用忽略的 .dev.vars，不提交凭证。GitHub 合入凭证仅保留在本地维护者与服务端，部署时应使用只允许 zjh-dynamic 内容与 PR 写入的凭证，不下发手机或 Jules。
+
+## 工坊确认
+
+WORKSHOP Durable Object 串行管理一份活动心愿，记录会话确认凭证。新建会话会占用工坊；制作完成仍保留，只有用户确认合入或制作中止才能释放。不允许并行制作或向已完成会话追加任务。
+
+POST /v1/workshop 的 status 接回状态，confirm 由用户点击触发。确认必须持有会话凭证，并核对正在运行代码的 buildId 等于最新清单 source.buildId、源码已提交且清单 commit 等于该会话 PR head、PR 属于 zjh-dynamic 并以 main 为目标、底稿没有遗漏 main 的改动。确认使用普通 merge 和预期 head SHA，重复请求可返回已经收好的结果；失败保留当前心愿。
+
+发布仅表示作品可体验，不自动合入。升级前已有会话在首次接回时登记，旧包或与 PR 不对应的包仍不能确认。
 
 ## 权限边界
 
