@@ -1,6 +1,15 @@
 # 服务端边界
 
 只维护服务端源码和部署配置，客户端分别由 zjh-android 与 zjh-dynamic 维护。
+
+本仓库仅供本地维护者使用，不向云端 Agent 开放。云端唯一仓库为 zjh-dynamic；不向云端环境提供服务端源码、JULES_API_KEY、Cloudflare 管理凭证或 Wrangler 登录信息。
+
 保持现有 Worker 名称、路由、KV/R2 绑定、数据和 Secrets，不因迁移新建生产存储。
+
 动态发布接口不得写运行时契约；Jules 会话必须限制到 zjh-dynamic。
-不提交 node_modules、.wrangler、.dev.vars、凭证或构建缓存。本次迁移不新增测试文件，使用类型检查与部署构建验证。
+
+涉及权限调整时，同时区分 API 校验、集成仓库授权和存储凭证权限；不能用来源过滤代替真实授权，也不能将本机管理权限作为云端发布方案。
+
+代码修改使用 npm run typecheck 和必要的 Wrangler 部署预构建验证；部署按用户授权执行。默认不新增测试文件，用户明确要求时按其要求执行。纯文档修改无需部署。
+
+不提交 node_modules、.wrangler、.dev.vars、凭证或构建缓存。

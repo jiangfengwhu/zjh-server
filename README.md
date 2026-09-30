@@ -2,6 +2,8 @@
 
 独立维护 Cloudflare Worker：动态清单读写、R2 产物读取和 Jules 会话代理。Android 在 [zjh-android](https://github.com/jiangfengwhu/zjh-android)，RN 在 [zjh-dynamic](https://github.com/jiangfengwhu/zjh-dynamic)。本仓库由服务端当前快照建立独立历史，不携带客户端源码。
 
+本仓库由本地维护者管理，不向云端 Agent 开放。云端只使用 zjh-dynamic，不需要服务端源码；服务端变更由用户交给本地维护者处理。
+
 | 路径 | 职责 |
 | --- | --- |
 | src/index.ts | HTTP 路由、清单权限校验与 Jules 代理 |
@@ -20,4 +22,8 @@
 
 /v1/runtime 仅供动态构建读取，动态发布接口只能写 release 与 vendor 编号表。SDK 和包体按 SHA-256 不可变地址读取。运行时契约由 Android 壳维护者的管理权限发布。
 
-Jules 代理仅暴露并允许 sources/github/jiangfengwhu/zjh-dynamic 会话。GitHub/Jules 集成自身的访问权限由账户管理员另外配置。
+Jules 代理仅暴露并允许 sources/github/jiangfengwhu/zjh-dynamic 会话。维护者须在用于云端 Agent 的 GitHub/Jules 集成授权中仅开放 zjh-dynamic，代理过滤不能代替账户授权。
+
+云端环境只注入动态上传凭证和清单发布 token，不注入 JULES_API_KEY、Cloudflare 管理 token 或本机 Wrangler 登录信息。通过 /v1/catalog 的动态发布 token 不能写 /v1/runtime；直接 R2/KV 管理凭证的权限需要维护者另外配置，不能把 API 的限制等同于管理凭证的限制。
+
+纯文档修改无需部署 Worker。
