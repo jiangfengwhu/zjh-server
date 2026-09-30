@@ -1,8 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 
 /** 清单类的键：整套清单和 vendor 的模块编号表。格式变了就换前缀（v3/…），旧版本的手机继续读旧前缀。 */
-const JSON_KEY = /^v1\/(?:release|runtime|maps\/vendor\.json)$/;
-const DYNAMIC_JSON_KEY = /^v1\/(?:release|maps\/vendor\.json)$/;
+const JSON_KEY = /^v1\/(?:release|runtime|maps\/vendor\.json|applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|releases\/[a-f0-9]{64}))$/;
+const DYNAMIC_JSON_KEY = /^v1\/(?:release|maps\/vendor\.json|applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|releases\/[a-f0-9]{64}))$/;
 const DYNAMIC_SOURCE = "sources/github/jiangfengwhu/zjh-dynamic";
 
 /** 包体的键：vendor、app、插件 DEX，全部按内容哈希命名，写入后不再改。 */
@@ -17,7 +17,20 @@ export default {
   async fetch(request, env): Promise<Response> {
     const url = new URL(request.url);
     try {
-      if (request.method === "PUT" && url.pathname === "/v1/catalog") return putCatalog(request, env);
+      if (request.method === "PUT" && url.pathname === "/v1/catalog") return env.WORKSHOP.getByName("dynamic").fetch(request);
+      if (request.method === "GET" && url.pathname === "/v1/applications") {
+        const manifests: unknown[] = [];
+        let cursor: string | undefined;
+        do {
+          const page = await env.CATALOG.list({ prefix: "v1/applications/", ...(cursor ? { cursor } : {}) });
+          for (const key of page.keys) if (key.name.endsWith("/latest")) {
+            const item = await env.CATALOG.get(key.name, "json");
+            if (item) manifests.push(item);
+          }
+          cursor = page.list_complete ? undefined : page.cursor;
+        } while (cursor);
+        return json({ applications: manifests }, 200);
+      }
       if (request.method === "POST" && url.pathname === "/v1/workshop") return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && url.pathname === "/v1/jules") {
         const operation = await request.clone().json() as { method?: string };
@@ -188,6 +201,7 @@ function pathBeforeQuery(path: string): string {
 type WorkshopTask = { session: string; token: string; legacy?: boolean };
 type CloudSession = { name?: string; state?: string; sourceContext?: { source?: string }; outputs?: { pullRequest?: { url?: string } }[] };
 type WorkshopRelease = { id: string; source: { commit: string; dirty: boolean; buildId?: string } };
+type ApplicationRelease = { appId: string; releaseId: string; source: { commit: string; dirty: boolean } };
 
 // 串行保存工坊心愿；合入权限只由用户的确认请求触发。
 export class Workshop extends DurableObject<Env> {
@@ -225,10 +239,60 @@ export class Workshop extends DurableObject<Env> {
     return release;
   }
 
+  private async applicationRelease(number: string): Promise<ApplicationRelease | undefined> {
+    const ids = new Set<string>();
+    for (let page = 1; page <= 30; page++) {
+      const files = await this.github(`pulls/${number}/files?per_page=100&page=${page}`) as Array<{ filename: string }>;
+      for (const file of files) {
+        const id = file.filename.match(/^packages\/features\/([a-z][a-z0-9-]{0,63})\//)?.[1];
+        if (id && id !== "src" && id !== "avatars") ids.add(id);
+      }
+      if (files.length < 100) break;
+    }
+    if (ids.size > 1) throw new Error("一次制作只能交付一个应用，请联系维护者拆分发布");
+    const id = [...ids][0];
+    if (!id) return undefined;
+    const application = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${id}/latest`, "json");
+    if (!application) return { appId: id, releaseId: "", source: { commit: "", dirty: true } };
+    return application;
+  }
+
   private async handle(request: Request): Promise<Response> {
     try {
+      if (new URL(request.url).pathname === "/v1/catalog") {
+        if (!await authorized(request, this.env.PUBLISH_TOKEN)) return json({ error: "unauthorized" }, 401);
+        const text = await request.clone().text();
+        if (text.length > 8_000_000) return json({ error: "catalog too large" }, 413);
+        const { objects } = JSON.parse(text) as { objects?: CatalogObject[] };
+        for (const item of objects ?? []) {
+          if (typeof item.key !== "string" || typeof item.body !== "string") continue;
+          const match = item.key.match(/^v1\/applications\/([a-z][a-z0-9-]{0,63})\/(latest|releases\/[a-f0-9]{64})$/);
+          if (!match) continue;
+          const manifest = JSON.parse(item.body) as { appId: string; releaseId: string; source: { dirty: boolean }; modules: { base: number; size: number } };
+          const base = manifest.modules?.base;
+          if (manifest.appId !== match[1] || manifest.source?.dirty !== false || !/^[a-f0-9]{64}$/.test(manifest.releaseId) || !Number.isSafeInteger(base) || base < 2000000 || base % 100000 || manifest.modules.size !== 100000) return json({ error: "application manifest invalid" }, 400);
+          const document = JSON.parse(item.body);
+          const { releaseId, ...content } = document;
+          const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(content)));
+          const identity = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+          if (identity !== releaseId || document.format !== 1 || !/^[a-f0-9]{40}$/.test(document.source.commit) || !document.requires?.engineAbi || !document.requires?.sdk) return json({ error: "application integrity invalid" }, 400);
+          const fixedOwners: Record<number, string> = { 2000000: "jolly", 2100000: "notepad", 2200000: "pomodoro" };
+          if (fixedOwners[base] && fixedOwners[base] !== manifest.appId) return json({ error: "application module range reserved" }, 409);
+          const priorLatest = await this.env.CATALOG.get<{ modules: { base: number } }>(`v1/applications/${manifest.appId}/latest`, "json");
+          if (priorLatest && priorLatest.modules.base !== base) return json({ error: "application module range cannot change" }, 409);
+          const owner = await this.ctx.storage.get<string>(`application-range:${base}`);
+          if (owner && owner !== manifest.appId) return json({ error: "application module range occupied" }, 409);
+          await this.ctx.storage.put(`application-range:${base}`, manifest.appId);
+          if (match[2] !== "latest") {
+            if (!match[2].endsWith(manifest.releaseId)) return json({ error: "application release identity mismatch" }, 400);
+            const prior = await this.env.CATALOG.get(item.key);
+            if (prior && prior !== item.body) return json({ error: "application release is immutable" }, 409);
+          }
+        }
+        return putCatalog(request, this.env);
+      }
       let task = await this.ctx.storage.get<WorkshopTask>("active");
-      const input = await request.clone().json() as { action?: string; session?: string; token?: string; buildId?: string; method?: string; path?: string; body?: string; approvalToken?: string };
+      const input = await request.clone().json() as { action?: string; session?: string; token?: string; buildId?: string; applicationReleases?: Record<string, string>; method?: string; path?: string; body?: string; approvalToken?: string };
       if (new URL(request.url).pathname === "/v1/jules") {
         if (input.method === "POST" && input.path === "/v1alpha/sessions") {
           if (task) return json({ message: "先收下工坊里这份心愿，再开始下一个吧" }, 409);
@@ -276,7 +340,8 @@ export class Workshop extends DurableObject<Env> {
         let message = "代码已完成，新作品尚未发布，请等待发布后再加载。";
         if (session.state === "COMPLETED" && prUrl) {
           const pr = await this.github(`pulls/${prUrl.split("/").pop()}`);
-          const release = await this.release();
+          const application = await this.applicationRelease(prUrl.split("/").pop()!);
+          const release = application ? { id: application.releaseId, source: application.source } : await this.release();
           if (pr.base?.ref !== "main" || pr.head?.repo?.full_name !== "jiangfengwhu/zjh-dynamic" || (!pr.merged && (pr.state !== "open" || pr.draft))) {
             delivery = "blocked";
             message = "这份作品的交付记录未准备好，请联系维护者处理。";
@@ -286,8 +351,11 @@ export class Workshop extends DurableObject<Env> {
               delivery = "blocked";
               message = "工坊的底稿有了更新，请联系维护者同步后重新发布。";
             } else {
-              delivery = input.buildId && release.source.buildId === input.buildId ? "loaded" : "update";
+              delivery = application
+                ? input.applicationReleases?.[application.appId] === application.releaseId ? "loaded" : "update"
+                : input.buildId && (release.source as WorkshopRelease["source"]).buildId === input.buildId ? "loaded" : "update";
               message = delivery === "loaded" ? "正在运行这次作品，体验满意后可以确认收下。" : "这次作品已发布，请加载后体验，再确认收下。";
+              return json({ state: session.state, token: task.token, completed: true, prUrl, merged: false, delivery, message, ...(application ? { application } : {}) }, 200);
             }
           }
         }
@@ -295,10 +363,12 @@ export class Workshop extends DurableObject<Env> {
       }
       if (input.action !== "confirm" || !input.token || input.token !== task.token) return json({ message: "请从工坊亲自收下这份心愿" }, 403);
       if (session.state !== "COMPLETED" || !prUrl) return json({ message: "这份心愿还在收尾，请稍后再来收下" }, 409);
-      const release = await this.release();
-      if (!input.buildId || release.source.buildId !== input.buildId) return json({ message: "新作品还没打开。先加载最新内容，体验后再收下吧", needsUpdate: true }, 409);
       const number = prUrl.split("/").pop();
       const pr = await this.github(`pulls/${number}`);
+      const application = await this.applicationRelease(number!);
+      const release = application ? { id: application.releaseId, source: application.source } : await this.release();
+      const running = application ? input.applicationReleases?.[application.appId] === application.releaseId : input.buildId && (release.source as WorkshopRelease["source"]).buildId === input.buildId;
+      if (!running) return json({ message: "新作品还没打开。先加载最新内容，体验后再收下吧", needsUpdate: true }, 409);
       if (pr.base?.ref !== "main" || pr.head?.repo?.full_name !== "jiangfengwhu/zjh-dynamic") return json({ message: "这份作品的交付记录不匹配，请联系维护者" }, 409);
       if (release.source.dirty || release.source.commit !== pr.head?.sha) return json({ message: "正在体验的作品与待收下的代码不一致，请联系维护者重新发布" }, 409);
       if (!pr.merged) {
@@ -306,7 +376,8 @@ export class Workshop extends DurableObject<Env> {
         const comparison = await this.github(`compare/main...${pr.head.sha}`);
         if (comparison.status !== "ahead" && comparison.status !== "identical") return json({ message: "工坊的底稿有了更新，请联系维护者同步后重新发布" }, 409);
       }
-      if ((await this.release()).id !== release.id) return json({ message: "又有新内容送到了，加载后再收下吧", needsUpdate: true }, 409);
+      const latestId = application ? (await this.applicationRelease(number!))?.releaseId : (await this.release()).id;
+      if (latestId !== release.id) return json({ message: "又有新内容送到了，加载后再收下吧", needsUpdate: true }, 409);
       const result = pr.merged ? { merged: true, sha: pr.merge_commit_sha } : await this.github(`pulls/${number}/merge`, "PUT", { sha: pr.head.sha, merge_method: "merge" });
       if (!result.merged) return json({ message: "暂时没能收下这份心愿，请稍后再试" }, 409);
       await this.ctx.storage.put("confirmed", { ...task, mergeCommit: result.sha });
