@@ -4,6 +4,8 @@ import { DurableObject } from "cloudflare:workers";
 const JSON_KEY = /^v1\/(?:release|runtime|maps\/vendor\.json|applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|releases\/[a-f0-9]{64}))$/;
 const DYNAMIC_JSON_KEY = /^v1\/(?:release|maps\/vendor\.json|applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|releases\/[a-f0-9]{64}))$/;
 const DYNAMIC_SOURCE = "sources/github/jiangfengwhu/zjh-dynamic";
+const PLUGIN_SOURCE = "sources/github/jiangfengwhu/zjh-plugin";
+const allowedSource = (source?: string) => source === PLUGIN_SOURCE || source === DYNAMIC_SOURCE;
 
 /** 包体的键：vendor、app、插件 DEX，全部按内容哈希命名，写入后不再改。 */
 const BLOB_KEY = /^v1\/(?:vendor|app|sdk)\/[a-f0-9]{64}$|^v1\/plugins\/[a-z0-9-]+\/[a-f0-9]{64}$/;
@@ -128,14 +130,14 @@ async function proxyJules(request: Request, env: Env): Promise<Response> {
   if (method === "POST" && path === "/v1alpha/sessions") {
     let session: { sourceContext?: { source?: string } };
     try { session = JSON.parse(body); } catch { return json({ error: "session json" }, 400); }
-    if (session.sourceContext?.source !== DYNAMIC_SOURCE) return json({ error: "仅允许 zjh-dynamic 仓库" }, 403);
+    if (session.sourceContext?.source !== PLUGIN_SOURCE) return json({ error: "仅允许 zjh-plugin 仓库" }, 403);
   }
   const sessionMatch = /^\/v1alpha\/sessions\/([A-Za-z0-9_-]+)(?::(?:approvePlan|sendMessage)|\/activities)?(?:\?.*)?$/.exec(path);
   if (sessionMatch) {
     const existing = await fetch(`https://jules.googleapis.com/v1alpha/sessions/${sessionMatch[1]}`, { headers: { "X-Goog-Api-Key": env.JULES_API_KEY } });
     if (!existing.ok) return json({ error: "session access failed" }, existing.status);
     const session = await existing.json() as { sourceContext?: { source?: string } };
-    if (session.sourceContext?.source !== DYNAMIC_SOURCE) return json({ error: "仅允许 zjh-dynamic 会话" }, 403);
+    if (!allowedSource(session.sourceContext?.source)) return json({ error: "会话仓库未授权" }, 403);
   }
   const headers = new Headers();
   headers.set("X-Goog-Api-Key", env.JULES_API_KEY);
@@ -150,7 +152,7 @@ async function proxyJules(request: Request, env: Env): Promise<Response> {
   });
   if (method === "GET" && pathBeforeQuery(path) === "/v1alpha/sources" && upstream.ok) {
     const result = await upstream.json() as { sources?: Array<{ name?: string }>; nextPageToken?: string };
-    return json({ sources: (result.sources ?? []).filter(source => source.name === DYNAMIC_SOURCE), ...(result.nextPageToken ? { nextPageToken: result.nextPageToken } : {}) }, 200);
+    return json({ sources: (result.sources ?? []).filter(source => source.name === PLUGIN_SOURCE), ...(result.nextPageToken ? { nextPageToken: result.nextPageToken } : {}) }, 200);
   }
   console.log(JSON.stringify({ event: "jules", method, path: pathBeforeQuery(path), status: upstream.status }));
   const responseHeaders = new Headers();
@@ -201,7 +203,7 @@ function pathBeforeQuery(path: string): string {
 type WorkshopTask = { session: string; token: string; legacy?: boolean };
 type CloudSession = { name?: string; state?: string; sourceContext?: { source?: string }; outputs?: { pullRequest?: { url?: string } }[] };
 type WorkshopRelease = { id: string; source: { commit: string; dirty: boolean; buildId?: string } };
-type ApplicationRelease = { appId: string; releaseId: string; source: { commit: string; dirty: boolean } };
+type ApplicationRelease = { appId: string; releaseId: string; source: { repository?: string; commit: string; dirty: boolean } };
 
 // 串行保存工坊心愿；合入权限只由用户的确认请求触发。
 export class Workshop extends DurableObject<Env> {
@@ -218,13 +220,13 @@ export class Workshop extends DurableObject<Env> {
     const response = await fetch(`https://jules.googleapis.com/v1alpha/${name}`, { headers: { "X-Goog-Api-Key": this.env.JULES_API_KEY } });
     if (!response.ok) throw new Error("暂时接不上这份心愿，请稍后再试");
     const session = await response.json() as CloudSession;
-    if (session.sourceContext?.source !== DYNAMIC_SOURCE) throw new Error("这份心愿不属于当前工坊");
+    if (!allowedSource(session.sourceContext?.source)) throw new Error("这份心愿不属于当前工坊");
     return session;
   }
 
-  private async github(path: string, method = "GET", body?: unknown): Promise<any> {
+  private async github(path: string, method = "GET", body?: unknown, repository = "jiangfengwhu/zjh-plugin"): Promise<any> {
     if (!this.env.GITHUB_MERGE_TOKEN) throw new Error("工坊的收下功能还未配置好，请联系维护者");
-    const response = await fetch(`https://api.github.com/repos/jiangfengwhu/zjh-dynamic/${path}`, {
+    const response = await fetch(`https://api.github.com/repos/${repository}/${path}`, {
       method,
       headers: { Authorization: `Bearer ${this.env.GITHUB_MERGE_TOKEN}`, Accept: "application/vnd.github+json", "User-Agent": "zijinhua-workshop", "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -239,21 +241,25 @@ export class Workshop extends DurableObject<Env> {
     return release;
   }
 
-  private async applicationRelease(number: string): Promise<ApplicationRelease | undefined> {
+  private async applicationRelease(number: string, repository: string): Promise<ApplicationRelease | undefined> {
     const ids = new Set<string>();
     for (let page = 1; page <= 30; page++) {
-      const files = await this.github(`pulls/${number}/files?per_page=100&page=${page}`) as Array<{ filename: string }>;
+      const files = await this.github(`pulls/${number}/files?per_page=100&page=${page}`, "GET", undefined, repository) as Array<{ filename: string }>;
       for (const file of files) {
-        const id = file.filename.match(/^packages\/features\/([a-z][a-z0-9-]{0,63})\//)?.[1];
+        const id = file.filename.match(repository === "jiangfengwhu/zjh-plugin" ? /^apps\/([a-z][a-z0-9-]{0,63})\// : /^packages\/features\/([a-z][a-z0-9-]{0,63})\//)?.[1];
         if (id && id !== "src" && id !== "avatars") ids.add(id);
       }
       if (files.length < 100) break;
     }
     if (ids.size > 1) throw new Error("一次制作只能交付一个应用，请联系维护者拆分发布");
     const id = [...ids][0];
-    if (!id) return undefined;
+    if (!id) {
+      if (repository === "jiangfengwhu/zjh-plugin") throw new Error("这次制作没有交付应用，请联系维护者处理");
+      return undefined;
+    }
     const application = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${id}/latest`, "json");
     if (!application) return { appId: id, releaseId: "", source: { commit: "", dirty: true } };
+    if (application.source.repository && application.source.repository !== repository) throw new Error("应用发布仓库与交付记录不一致");
     return application;
   }
 
@@ -333,20 +339,21 @@ export class Workshop extends DurableObject<Env> {
       } else if (task.session !== input.session || task.token !== input.token) {
         return json({ message: "工坊里还有另一份心愿，请先完成它" }, 409);
       }
-      const prUrl = session.outputs?.map(output => output.pullRequest?.url).find(url => /^https:\/\/github\.com\/jiangfengwhu\/zjh-dynamic\/pull\/[0-9]+$/.test(url ?? ""));
+      const repository = session.sourceContext?.source === PLUGIN_SOURCE ? "jiangfengwhu/zjh-plugin" : "jiangfengwhu/zjh-dynamic";
+      const prUrl = session.outputs?.map(output => output.pullRequest?.url).find(url => url?.startsWith(`https://github.com/${repository}/pull/`) && /^[0-9]+$/.test(url.split("/").pop() ?? ""));
       if (input.action === "status") {
         if (session.state === "FAILED") await this.ctx.storage.delete("active");
         let delivery = "unpublished";
         let message = "代码已完成，新作品尚未发布，请等待发布后再加载。";
         if (session.state === "COMPLETED" && prUrl) {
-          const pr = await this.github(`pulls/${prUrl.split("/").pop()}`);
-          const application = await this.applicationRelease(prUrl.split("/").pop()!);
+          const pr = await this.github(`pulls/${prUrl.split("/").pop()}`, "GET", undefined, repository);
+          const application = await this.applicationRelease(prUrl.split("/").pop()!, repository);
           const release = application ? { id: application.releaseId, source: application.source } : await this.release();
-          if (pr.base?.ref !== "main" || pr.head?.repo?.full_name !== "jiangfengwhu/zjh-dynamic" || (!pr.merged && (pr.state !== "open" || pr.draft))) {
+          if (pr.base?.ref !== "main" || pr.head?.repo?.full_name !== repository || (!pr.merged && (pr.state !== "open" || pr.draft))) {
             delivery = "blocked";
             message = "这份作品的交付记录未准备好，请联系维护者处理。";
           } else if (!release.source.dirty && release.source.commit === pr.head?.sha) {
-            const comparison = pr.merged ? undefined : await this.github(`compare/main...${pr.head.sha}`);
+            const comparison = pr.merged ? undefined : await this.github(`compare/main...${pr.head.sha}`, "GET", undefined, repository);
             if (comparison && comparison.status !== "ahead" && comparison.status !== "identical") {
               delivery = "blocked";
               message = "工坊的底稿有了更新，请联系维护者同步后重新发布。";
@@ -364,21 +371,21 @@ export class Workshop extends DurableObject<Env> {
       if (input.action !== "confirm" || !input.token || input.token !== task.token) return json({ message: "请从工坊亲自收下这份心愿" }, 403);
       if (session.state !== "COMPLETED" || !prUrl) return json({ message: "这份心愿还在收尾，请稍后再来收下" }, 409);
       const number = prUrl.split("/").pop();
-      const pr = await this.github(`pulls/${number}`);
-      const application = await this.applicationRelease(number!);
+      const pr = await this.github(`pulls/${number}`, "GET", undefined, repository);
+      const application = await this.applicationRelease(number!, repository);
       const release = application ? { id: application.releaseId, source: application.source } : await this.release();
       const running = application ? input.applicationReleases?.[application.appId] === application.releaseId : input.buildId && (release.source as WorkshopRelease["source"]).buildId === input.buildId;
       if (!running) return json({ message: "新作品还没打开。先加载最新内容，体验后再收下吧", needsUpdate: true }, 409);
-      if (pr.base?.ref !== "main" || pr.head?.repo?.full_name !== "jiangfengwhu/zjh-dynamic") return json({ message: "这份作品的交付记录不匹配，请联系维护者" }, 409);
+      if (pr.base?.ref !== "main" || pr.head?.repo?.full_name !== repository) return json({ message: "这份作品的交付记录不匹配，请联系维护者" }, 409);
       if (release.source.dirty || release.source.commit !== pr.head?.sha) return json({ message: "正在体验的作品与待收下的代码不一致，请联系维护者重新发布" }, 409);
       if (!pr.merged) {
         if (pr.state !== "open" || pr.draft) return json({ message: "这份心愿还未准备好收下" }, 409);
-        const comparison = await this.github(`compare/main...${pr.head.sha}`);
+        const comparison = await this.github(`compare/main...${pr.head.sha}`, "GET", undefined, repository);
         if (comparison.status !== "ahead" && comparison.status !== "identical") return json({ message: "工坊的底稿有了更新，请联系维护者同步后重新发布" }, 409);
       }
-      const latestId = application ? (await this.applicationRelease(number!))?.releaseId : (await this.release()).id;
+      const latestId = application ? (await this.applicationRelease(number!, repository))?.releaseId : (await this.release()).id;
       if (latestId !== release.id) return json({ message: "又有新内容送到了，加载后再收下吧", needsUpdate: true }, 409);
-      const result = pr.merged ? { merged: true, sha: pr.merge_commit_sha } : await this.github(`pulls/${number}/merge`, "PUT", { sha: pr.head.sha, merge_method: "merge" });
+      const result = pr.merged ? { merged: true, sha: pr.merge_commit_sha } : await this.github(`pulls/${number}/merge`, "PUT", { sha: pr.head.sha, merge_method: "merge" }, repository);
       if (!result.merged) return json({ message: "暂时没能收下这份心愿，请稍后再试" }, 409);
       await this.ctx.storage.put("confirmed", { ...task, mergeCommit: result.sha });
       await this.ctx.storage.delete("active");
