@@ -1,0 +1,31 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "zijinhua",
+  "routes": [{ "pattern": "zijinhua.297782.xyz/*", "zone_name": "297782.xyz" }],
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-29",
+  "compatibility_flags": ["nodejs_compat"],
+  "secrets": {
+    "required": ["JULES_API_KEY", "PUBLISH_TOKEN"]
+  },
+  "migrations": [
+    { "tag": "v1-release-catalog", "new_sqlite_classes": ["ReleaseCatalog"] },
+    { "tag": "v2-drop-release-catalog", "deleted_classes": ["ReleaseCatalog"] }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "kv_namespaces": [
+    {
+      "binding": "CATALOG",
+      "id": "da19ca26504047a596afd448b36a9d6e"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BLOBS",
+      "bucket_name": "zijinhua"
+    }
+  ]
+}
