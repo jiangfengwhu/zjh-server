@@ -272,7 +272,26 @@ export class Workshop extends DurableObject<Env> {
       const prUrl = session.outputs?.map(output => output.pullRequest?.url).find(url => /^https:\/\/github\.com\/jiangfengwhu\/zjh-dynamic\/pull\/[0-9]+$/.test(url ?? ""));
       if (input.action === "status") {
         if (session.state === "FAILED") await this.ctx.storage.delete("active");
-        return json({ state: session.state, token: task.token, completed: session.state === "COMPLETED", prUrl: prUrl ?? "", merged: false }, 200);
+        let delivery = "unpublished";
+        let message = "代码已完成，新作品尚未发布，请等待发布后再加载。";
+        if (session.state === "COMPLETED" && prUrl) {
+          const pr = await this.github(`pulls/${prUrl.split("/").pop()}`);
+          const release = await this.release();
+          if (pr.base?.ref !== "main" || pr.head?.repo?.full_name !== "jiangfengwhu/zjh-dynamic" || (!pr.merged && (pr.state !== "open" || pr.draft))) {
+            delivery = "blocked";
+            message = "这份作品的交付记录未准备好，请联系维护者处理。";
+          } else if (!release.source.dirty && release.source.commit === pr.head?.sha) {
+            const comparison = pr.merged ? undefined : await this.github(`compare/main...${pr.head.sha}`);
+            if (comparison && comparison.status !== "ahead" && comparison.status !== "identical") {
+              delivery = "blocked";
+              message = "工坊的底稿有了更新，请联系维护者同步后重新发布。";
+            } else {
+              delivery = input.buildId && release.source.buildId === input.buildId ? "loaded" : "update";
+              message = delivery === "loaded" ? "正在运行这次作品，体验满意后可以确认收下。" : "这次作品已发布，请加载后体验，再确认收下。";
+            }
+          }
+        }
+        return json({ state: session.state, token: task.token, completed: session.state === "COMPLETED", prUrl: prUrl ?? "", merged: false, delivery, message }, 200);
       }
       if (input.action !== "confirm" || !input.token || input.token !== task.token) return json({ message: "请从工坊亲自收下这份心愿" }, 403);
       if (session.state !== "COMPLETED" || !prUrl) return json({ message: "这份心愿还在收尾，请稍后再来收下" }, 409);
