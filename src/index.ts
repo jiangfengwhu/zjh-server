@@ -235,7 +235,15 @@ export class Workshop extends DurableObject<Env> {
           const current = await this.ctx.storage.get<WorkshopTask>(`task:${task.appId}`);
           const candidate = await this.candidate(task.appId);
           if (!current || this.resetting || this.summaryKey(current, candidate) !== key) return;
-          await this.ctx.storage.put(`work-summary:${task.appId}`, { key, at: Date.now(), status: summarizeWork(current, session, candidate) });
+          const status = summarizeWork(current, session, candidate);
+          const phase = status.completed ? status.application ? "ready" : "working" : ["FAILED", "PAUSED"].includes(status.state) ? "paused" : current.phase;
+          const title = status.application?.title || current.title;
+          if (current.phase !== phase || current.title !== title) {
+            current.phase = phase; current.title = title;
+            if (phase === "paused") current.repair = true;
+            await this.saveTask(current);
+          }
+          await this.ctx.storage.put(`work-summary:${task.appId}`, { key: this.summaryKey(current, candidate), at: Date.now(), status });
         });
       } catch { /* Preserve the last result; the list marks expired data stale. */ }
     }).finally(() => this.summaries.delete(key));
@@ -575,14 +583,17 @@ export class Workshop extends DurableObject<Env> {
           await Promise.race([pending, new Promise<void>(resolve => { timer = setTimeout(resolve, 6500); })]);
           if (timer) clearTimeout(timer);
         }
-        const works = await Promise.all(entries.map(async ({ task, application, shared, cached: previous }) => {
+        const works = await Promise.all(entries.map(async ({ task: initial, cached: previous }) => {
+          const task = await this.ctx.storage.get<WorkshopTask>(`task:${initial.appId}`);
+          if (!task || task.ownerId !== user.id) return undefined;
+          const [application, shared] = await Promise.all([this.candidate(task.appId), this.ctx.storage.get<MarketEntry>(`shared:${task.appId}`)]);
           const cached = await this.ctx.storage.get<{ key: string; at: number; status: WorkSummary }>(`work-summary:${task.appId}`);
           const valid = cached?.key === this.summaryKey(task, application);
           const status = valid ? cached.status : summarizeWork(task, { state: task.phase === "ready" ? "COMPLETED" : "QUEUED" }, application);
           const ttl = status.completed && status.application ? 300000 : 20000;
-          return { appId: task.appId, ownerId: task.ownerId, session: task.session, approvalToken: task.token, title: task.title ?? task.appId, wish: task.wish ?? "", startedAt: task.startedAt, originalAppId: task.originalAppId, originalReleaseId: task.originalReleaseId, originalCommit: task.originalCommit, branch: task.branch, phase: task.phase, status: { ...status, stale: !valid || Date.now() - cached.at >= ttl || force && cached.at === previous?.at }, sharing: { shared, application }, updatedAt: valid ? cached.at : null };
+          return { appId: task.appId, ownerId: task.ownerId, session: task.session, approvalToken: task.token, title: task.title ?? task.appId, wish: task.wish ?? "", startedAt: task.startedAt, originalAppId: task.originalAppId, originalReleaseId: task.originalReleaseId, originalCommit: task.originalCommit, branch: task.branch, phase: task.phase, status: { ...status, stale: !valid || Date.now() - cached.at >= ttl || force && cached.at === previous?.at }, sharing: { shared: shared?.authorId === user.id ? shared : null, application }, updatedAt: valid ? cached.at : null };
         }));
-        const response = json({ works }, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
+        const response = json({ works: works.filter(Boolean) }, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
       }
       const input = await request.json() as { appId?: string; originalAppId?: string; originalReleaseId?: string; requestId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; applicationReleases?: Record<string, string> };
       const appId = input.appId;
