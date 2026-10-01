@@ -6,7 +6,7 @@
 
 执行 npm ci、npm run typecheck 和 npx wrangler deploy --dry-run；协调升级后执行 npm run deploy。保留现有 Worker、zijinhua.297782.xyz 域名、CATALOG KV、BLOBS R2、WORKSHOP/ACCOUNTS Durable Object 与数据。纯文档修改无需部署。
 
-JULES_API_KEY、GITHUB_MERGE_TOKEN、OFFICIAL_PUBLISH_TOKEN 只保留在服务端及维护者安全环境。GitHub/Jules 集成仅开放 zjh-plugin；合入 token 仅需该仓库内容与 PR 权限。旧 PUBLISH_TOKEN 不再允许发布。本地 .dev.vars 忽略，不提交凭证和缓存。
+JULES_API_KEY、GITHUB_MERGE_TOKEN、OFFICIAL_PUBLISH_TOKEN 只保留在服务端及维护者安全环境。GitHub/Jules 集成仅开放 zjh-plugin；现有 GITHUB_MERGE_TOKEN 仅用于读取该仓库分支与导出信息，交付流程不调用 merge。旧 PUBLISH_TOKEN 不再允许发布。本地 .dev.vars 忽略，不提交凭证和缓存。
 
 ## 邮箱登录
 
@@ -27,7 +27,7 @@ GET/PATCH /v1/account 读取资料或修改 1–24 字昵称；PUT/DELETE /v1/ac
 
 WORKSHOP 按应用串行，公开读取不等待云端请求；不同应用可并行，同应用收下后继续 session 的新轮次。默认每账号每天 10 轮、同时最多 3 个制作任务，短事务预留额度。模块范围由事务分配，既有 appId 与范围保持稳定。
 
-POST /v1/workshop status 接回交付；confirm 由宿主确认后触发。运行 releaseId 等于本轮候选、source.dirty=false、候选 source.tree 等于最终 PR 的 Git 源码树（旧清单仍要求 source.commit 等于 PR head）；PR 属于 zjh-plugin、指向 main、仅改目标应用与必要根锁文件，并保留 main 的应用改动。普通 merge 核对预期 head SHA，失败保留任务，不自动分享。
+POST /v1/workshop status 接回候选交付；confirm 由宿主确认后触发。服务端核对正在运行的 releaseId 等于本轮候选，收下只记录该不可变版本，不检查 PR 状态、main 内容或调用合并接口。作者主动分享后才更新市场公开版本。
 
 ## 发布授权
 
@@ -51,4 +51,6 @@ GET /v1/applications/<id>/releases/<releaseId> 对已经公开过的快照保持
 
 开发清库：维护者以 POST /v1/development-reset 及 confirm=RESET_WORKSHOP_DEVELOPMENT_DATA 清除工坊任务、候选、分享和应用清单，保留账号、runtime/宿主清单及不可变产物。重置期间停止新请求并等待在途请求结束，然后重新发布官方应用。不支持历史仓库基线或匿名任务迁移。
 
-Jules 交付按源码树核对，允许提交号重写但拒绝源码内容变化；收下记录最终 PR head 和已核对源码树，分享保持 immutable releaseId，原作初始化使用可从 GitHub 获取的实际 PR 提交。
+用户应用在 Jules 自动创建的分支长期迭代。平台从导出信息记录分支和可获取的源码提交，此信息读取失败不阻塞候选体验和收下。main 只维护官方应用。Remix 创建新的应用 ID、owner 与独立分支，从原应用分支开始，并保留原作版本来源。
+
+同一应用的写操作串行执行；制作轮次变更使旧发布授权失效。sendMessage 记录 Jules 状态版本，拒绝多设备重复提交同一轮。SDK 1.1.8 移除应用发布的提交祖先检查，仍保留授权、CAS、包体完整性和运行时兼容校验。

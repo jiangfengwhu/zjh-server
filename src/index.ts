@@ -199,10 +199,10 @@ function pathBeforeQuery(path: string): string {
   return index < 0 ? path : path.slice(0, index);
 }
 type ApplicationRelease = { appId: string; releaseId: string; title: string; summary: string; modules: { base: number }; source: { repository: string; commit: string; tree?: string; dirty: boolean } };
-type Accepted = { releaseId: string; commit: string; sourceTree?: string; mergeCommit: string; pr: number };
-type WorkshopTask = { ownerId: string; appId: string; session: string; token: string; phase: "working" | "review" | "accepted" | "paused"; previousCommit?: string; repair?: boolean; accepted?: Accepted; publishEpoch?: string; requestId?: string; creationTitle?: string; creationRejected?: boolean; title?: string; wish?: string; originalAppId?: string; originalReleaseId?: string; originalCommit?: string; startedAt?: number };
-type CloudSession = { name?: string; state?: string; sourceContext?: { source?: string }; outputs?: { pullRequest?: { url?: string } }[] };
-type MarketEntry = { manifest: ApplicationRelease; title: string; summary: string; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null; sourceCommit?: string };
+type Accepted = { releaseId: string; commit: string; sourceTree?: string; branch?: string };
+type WorkshopTask = { branch?: string; branchCommit?: string; roundRelease?: string; dispatchVersion?: string; originalBranch?: string; ownerId: string; appId: string; session: string; token: string; phase: "working" | "review" | "accepted" | "paused"; previousCommit?: string; repair?: boolean; accepted?: Accepted; publishEpoch?: string; requestId?: string; creationTitle?: string; creationRejected?: boolean; title?: string; wish?: string; originalAppId?: string; originalReleaseId?: string; originalCommit?: string; startedAt?: number };
+type CloudSession = { name?: string; state?: string; updateTime?: string; sourceContext?: { source?: string }; outputs?: { pullRequest?: { url?: string } }[] };
+type MarketEntry = { manifest: ApplicationRelease; title: string; summary: string; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null; sourceCommit?: string; sourceBranch?: string };
 
 export class Workshop extends DurableObject<Env> {
   private queue = new KeyedQueue();
@@ -281,7 +281,7 @@ export class Workshop extends DurableObject<Env> {
   }
   private async publisherInstruction(task: WorkshopTask) {
     const grant = await issuePublisherGrant({ appId: task.appId, ownerId: task.ownerId, epoch: task.publishEpoch! }, this.env.OFFICIAL_PUBLISH_TOKEN);
-    return `使用 SDK 1.1.7 或更新版本。发包前执行 npx zjh-app authorize ${task.appId} '${grant}'，只授权本应用本轮候选发布；不得输出授权、提交授权文件或使用环境里的旧全局发布凭据。`;
+    return `使用 SDK 1.1.8 或更新版本；已有分支如工具过旧，执行 npm install --save-dev @zijinhua/app-sdk@https://zjh-cdn.297782.xyz/v1/sdk/04887da2f435cc6e36412d7fc3a7d5370f4f524dfae2e193567a5579a36bfdd5，只更新根 SDK 依赖与锁文件，不同步 main。发包前执行 npx zjh-app authorize ${task.appId} '${grant}'，只授权本应用本轮候选发布；不得输出授权、提交授权文件或使用环境里的旧全局发布凭据。`;
   }
   private async recoverSession(task: WorkshopTask): Promise<WorkshopTask> {
     if (task.session || !task.creationTitle) return task;
@@ -327,45 +327,23 @@ export class Workshop extends DurableObject<Env> {
     // KV is a mirror, never the authority for a candidate that has not committed.
     return await this.ctx.storage.get<ApplicationRelease>(`candidate:${appId}`) ?? null;
   }
-  private async applicationRelease(number: number, appId: string): Promise<ApplicationRelease> {
-    let touched = false;
-    for (let page = 1; page <= 30; page++) {
-      const files = await this.github(`pulls/${number}/files?per_page=100&page=${page}`) as Array<{ filename: string }>;
-      for (const file of files) {
-        if (file.filename.startsWith(`apps/${appId}/`)) touched = true;
-        else if (file.filename !== "package-lock.json") throw new Error("这份 PR 修改了目标应用之外的文件，请拆分交付");
-      }
-      if (files.length < 100) break;
-    }
-    if (!touched) throw new Error("这份 PR 没有交付目标应用");
-    const app = await this.candidate(appId);
-    if (!app || app.source.repository !== "jiangfengwhu/zjh-plugin") throw new Error("这个应用还没有发布本轮作品");
-    return app;
-  }
-  private async delivery(task: WorkshopTask, session: CloudSession) {
+  private async recordBranch(task: WorkshopTask, session: CloudSession, application: ApplicationRelease) {
     const urls = session.outputs?.map(output => output.pullRequest?.url).filter((url): url is string => /^https:\/\/github\.com\/jiangfengwhu\/zjh-plugin\/pull\/[0-9]+$/.test(url ?? "")) ?? [];
     for (const url of urls.reverse()) {
-      const number = Number(url.split("/").pop());
-      const pr = await this.github(`pulls/${number}`);
-      if (pr.head?.sha === task.previousCommit || (task.accepted && number === task.accepted.pr && task.phase !== "accepted")) continue;
-      const application = await this.applicationRelease(number, task.appId);
-      if (pr.base?.ref !== "main" || pr.head?.repo?.full_name !== "jiangfengwhu/zjh-plugin" || pr.draft || (!pr.merged && pr.state !== "open")) throw new Error("这份 PR 尚未准备好交付");
-      if (application.source.dirty) return { ready: false, message: "候选来自未提交改动，请提交源码后重新发包", application, pr, number, url };
+      const pr = await this.github(`pulls/${Number(url.split("/").pop())}`);
+      if (pr.head?.repo?.full_name !== "jiangfengwhu/zjh-plugin" || !pr.head.ref || pr.head.ref === "main" || !pr.head.sha) continue;
       const commit = await this.github(`git/commits/${pr.head.sha}`);
-      const sourceTree = commit.tree?.sha as string | undefined;
-      if (!sourceTree || (application.source.tree ? application.source.tree !== sourceTree : application.source.commit !== pr.head.sha)) return { ready: false, message: "候选源码与最终 PR 内容不一致，请使用 SDK 1.1.7 从当前源码重新发包", application, pr, number, url };
-      // Unrelated applications can merge first. Only this app and shared lock conflicts block delivery.
-      if (!pr.merged) {
-        const comparison = await this.github(`compare/${pr.head.sha}...main`);
-        if ((comparison.files ?? []).some((file: { filename: string }) => file.filename.startsWith(`apps/${task.appId}/`)) || pr.mergeable === false) {
-          task.repair = true; await this.ctx.storage.put(`task:${task.appId}`, task);
-          return { ready: false, message: "底稿有冲突，请在这个 session 继续：同步 main，处理冲突后重新发包", application, pr, number, url };
-        }
-      }
-      await this.ctx.storage.put(`source-proof:${task.appId}:${application.releaseId}`, { commit: pr.head.sha, tree: sourceTree });
-      return { ready: true, application, sourceTree, pr, number, url, message: "" };
+      if (application.source.commit !== pr.head.sha && (!application.source.tree || application.source.tree !== commit.tree?.sha)) continue;
+      task.branch = pr.head.ref; task.branchCommit = pr.head.sha;
+      await this.ctx.storage.put(`source-proof:${task.appId}:${application.releaseId}`, { commit: pr.head.sha, tree: application.source.tree });
+      await this.saveTask(task); return;
     }
-    return undefined;
+  }
+  private async delivery(task: WorkshopTask, _session: CloudSession) {
+    const application = await this.candidate(task.appId);
+    if (!application || (task.roundRelease ? task.roundRelease !== application.releaseId : application.source.commit === task.previousCommit)) return undefined;
+    try { await this.recordBranch(task, _session, application); } catch { /* A candidate is usable without PR metadata or GitHub availability. */ }
+    return { ready: true, application, message: "" };
   }
   private async handle(request: Request): Promise<Response> {
     try {
@@ -398,7 +376,7 @@ export class Workshop extends DurableObject<Env> {
         if (request.method !== "GET") return json({ error: "method" }, 405);
         const base = await this.ctx.storage.get<number>(`allocation:${appId}`);
         const task = await this.ctx.storage.get<WorkshopTask>(`task:${appId}`);
-        const origin = await this.publisher(request, appId) ? { title: task?.title, originalAppId: task?.originalAppId, originalReleaseId: task?.originalReleaseId, originalCommit: task?.originalCommit } : {};
+        const origin = await this.publisher(request, appId) ? { title: task?.title, originalAppId: task?.originalAppId, originalReleaseId: task?.originalReleaseId, originalCommit: task?.originalCommit, originalBranch: task?.originalBranch, branch: task?.branch } : {};
         return base ? json({ appId, moduleBase: base, ...origin }, 200) : json({ error: "请先在 Jolly 创建这个应用的心愿" }, 404);
       }
       if ((path === "/v1/market" || path === "/v1/applications") && request.method === "GET") {
@@ -478,7 +456,13 @@ export class Workshop extends DurableObject<Env> {
         });
         const response = await putCatalog(request, this.env);
         if (!response.ok) return response;
-        if (candidates.size) await this.ctx.storage.put(Object.fromEntries([...candidates].map(([id, manifest]) => [`candidate:${id}`, manifest])));
+        if (candidates.size) {
+          await this.ctx.storage.put(Object.fromEntries([...candidates].map(([id, manifest]) => [`candidate:${id}`, manifest])));
+          for (const [id, manifest] of candidates) {
+            const task = await this.ctx.storage.get<WorkshopTask>(`task:${id}`);
+            if (task) { task.roundRelease = manifest.releaseId; await this.saveTask(task); }
+          }
+        }
         return response;
       }
 
@@ -526,7 +510,7 @@ export class Workshop extends DurableObject<Env> {
         for (let index = 0; index < tasks.length; index++) {
           if (!tasks[index].session && tasks[index].creationTitle) tasks[index] = await this.queue.run(`app:${tasks[index].appId}`, async () => this.recoverSession((await this.ctx.storage.get<WorkshopTask>(`task:${tasks[index].appId}`))!));
         }
-        return json({ works: tasks.map(task => ({ appId: task.appId, ownerId: task.ownerId, session: task.session, approvalToken: task.token, title: task.title ?? task.appId, wish: task.wish ?? "", startedAt: task.startedAt, originalAppId: task.originalAppId, originalReleaseId: task.originalReleaseId, originalCommit: task.originalCommit, accepted: task.accepted, phase: task.phase })) }, 200);
+        return json({ works: tasks.map(task => ({ appId: task.appId, ownerId: task.ownerId, session: task.session, approvalToken: task.token, title: task.title ?? task.appId, wish: task.wish ?? "", startedAt: task.startedAt, originalAppId: task.originalAppId, originalReleaseId: task.originalReleaseId, originalCommit: task.originalCommit, branch: task.branch, accepted: task.accepted, phase: task.phase })) }, 200);
       }
       const input = await request.json() as { appId?: string; originalAppId?: string; originalReleaseId?: string; requestId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; applicationReleases?: Record<string, string> };
       const appId = input.appId;
@@ -553,21 +537,21 @@ export class Workshop extends DurableObject<Env> {
         if (!prompt) return json({ message: "请描述想做什么" }, 400);
         if (prompt.length > 8000) return json({ message: "心愿最多 8000 个字符，请精简后再提交" }, 400);
         let original: ApplicationRelease | undefined;
-        let originalCommit: string | undefined;
+        let originalCommit: string | undefined; let originalBranch: string | undefined;
         if (input.originalAppId) {
           const shared = await this.ctx.storage.get<MarketEntry>(`shared:${input.originalAppId}`);
           if (!shared || shared.manifest.releaseId !== input.originalReleaseId) return json({ message: "原作公开版本已改变，请刷新市场后重新创作" }, 409);
-          original = shared.manifest; originalCommit = shared.sourceCommit ?? original.source.commit;
+          original = shared.manifest; originalCommit = shared.sourceCommit ?? original.source.commit; originalBranch = shared.sourceBranch;
         }
         if (!await this.quota(user.id, appId)) return json({ message: "每天最多发起 10 轮制作，同时最多制作 3 个作品" }, 429);
         const moduleBase = await this.allocate(appId);
-        task = { ownerId: user.id, appId, session: "", token: crypto.randomUUID(), phase: "working", publishEpoch: crypto.randomUUID(), requestId: input.requestId, title: String(payload.title ?? appId).slice(0, 80), wish: prompt, startedAt: Date.now(), originalAppId: original?.appId, originalReleaseId: original?.releaseId, originalCommit };
+        task = { ownerId: user.id, appId, session: "", token: crypto.randomUUID(), phase: "working", publishEpoch: crypto.randomUUID(), requestId: input.requestId, title: String(payload.title ?? appId).slice(0, 80), wish: prompt, startedAt: Date.now(), originalAppId: original?.appId, originalReleaseId: original?.releaseId, originalCommit, originalBranch };
         task.creationTitle = `${task.title?.slice(0, 40)} [${crypto.randomUUID()}]`;
         payload.title = task.creationTitle;
-        payload.sourceContext = { source: PLUGIN_SOURCE, githubRepoContext: { startingBranch: "main" }, environmentVariablesEnabled: false };
+        payload.sourceContext = { source: PLUGIN_SOURCE, githubRepoContext: { startingBranch: originalBranch ?? "main" }, environmentVariablesEnabled: false };
         await this.saveTask(task);
-        const origin = original ? `原作 ${original.appId} 的版本 ${original.releaseId}、源码提交 ${originalCommit} 已锁定，init 工具会从这个提交复制 src/assets；不得改用 main 的新版。` : "";
-        payload.prompt = `目标应用：${appId}；只交付 apps/${appId}/。${await this.publisherInstruction(task)} 新建时执行 npm run init:application -- ${appId}，平台分配 moduleBase=${moduleBase}。${origin} 用户需求：\n${prompt}`;
+        const origin = original ? `从原作分支 ${originalBranch ?? "main"} 新建属于本作者的独立分支，禁止修改原作分支。原作 ${original.appId} 的版本 ${original.releaseId}、源码提交 ${originalCommit} 已锁定，init 工具会从这个提交复制 src/assets；不得改用 main 的新版。` : "";
+        payload.prompt = `目标应用：${appId}；只交付 apps/${appId}/。${await this.publisherInstruction(task)} Jules 自动创建的工作分支就是本应用的长期分支；不合入或同步 main。新建时执行 npm run init:application -- ${appId}，平台分配 moduleBase=${moduleBase}。${origin} 用户需求：\n${prompt}`;
         const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
         if (!response.ok) { task.phase = "paused"; task.creationRejected = response.status >= 400 && response.status < 500; await this.saveTask(task); return response; }
         const session = await response.json() as CloudSession;
@@ -596,7 +580,7 @@ export class Workshop extends DurableObject<Env> {
         const title = input.title?.trim() ?? shared?.title ?? manifest.title;
         const summary = input.summary?.trim() ?? shared?.summary ?? manifest.summary;
         if (!title || title.length > 60 || summary.length > 300) return json({ message: "名称不能为空且最多 60 字，介绍最多 300 字" }, 400);
-        const entry: MarketEntry = { manifest, title, summary, authorId: user.id, authorName: user.name, authorAvatarUrl: user.avatarUrl, authorOfficial: user.id === OFFICIAL_ACCOUNT_ID, originalAppId: (manifest as ApplicationRelease & { originalAppId?: string }).originalAppId ?? null, sourceCommit: input.action === "edit" ? shared!.sourceCommit : accepted!.commit };
+        const entry: MarketEntry = { manifest, title, summary, authorId: user.id, authorName: user.name, authorAvatarUrl: user.avatarUrl, authorOfficial: user.id === OFFICIAL_ACCOUNT_ID, originalAppId: (manifest as ApplicationRelease & { originalAppId?: string }).originalAppId ?? null, sourceCommit: input.action === "edit" ? shared!.sourceCommit : accepted!.commit, sourceBranch: input.action === "edit" ? shared!.sourceBranch : accepted!.branch };
         await this.ctx.storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${manifest.releaseId}`]: true });
         await this.ctx.storage.delete(`withdrawn:${appId}`);
         return json({ shared: entry, accepted: accepted ?? null, application }, 200);
@@ -608,17 +592,18 @@ export class Workshop extends DurableObject<Env> {
           const current = await this.session(task.session);
           if (!["COMPLETED", "PAUSED", "AWAITING_USER_FEEDBACK", "FAILED"].includes(current.state ?? "")) return json({ message: "这个应用正在制作，请等本轮完成" }, 409);
           if (current.state === "COMPLETED" && task.phase !== "accepted" && !task.repair) return json({ message: "请先加载并收下这轮作品，再修改这个应用" }, 409);
+          const dispatchVersion = `${current.state}:${current.updateTime ?? ""}`;
+          if (task.dispatchVersion === dispatchVersion) return json({ message: "本轮修改已提交，请等待制作状态更新" }, 409);
           const payload = JSON.parse(input.body ?? "{}");
           if (typeof payload.prompt !== "string" || !payload.prompt.trim() || payload.prompt.length > 8000) return json({ message: "请提交 1 到 8000 个字符的修改需求" }, 400);
           if (!await this.quota(user.id, appId)) return json({ message: "制作额度已用完或同时制作作品过多，请稍后再试" }, 429);
           const previous = structuredClone(task);
-          task.publishEpoch = crypto.randomUUID();
-          const acceptedRound = task.phase === "accepted";
-          task.previousCommit = acceptedRound ? task.accepted?.commit : task.previousCommit;
+          task.publishEpoch = crypto.randomUUID(); task.dispatchVersion = dispatchVersion;
+          task.previousCommit = (await this.candidate(appId))?.source.commit ?? task.previousCommit; task.roundRelease = undefined;
           task.phase = "working"; task.repair = false; task.wish = String(payload.prompt ?? ""); task.startedAt = Date.now();
           // Persist the new round before upstream work starts; ambiguous timeouts can still deliver.
           await this.saveTask(task);
-          payload.prompt = `继续修改应用 ${appId}，只改 apps/${appId}/ 与所需根锁文件。${await this.publisherInstruction(task)} ${acceptedRound ? "已收下的 PR 不再续写：从 origin/main 同步后创建新的任务分支和 PR。" : "保留当前未收下的 PR，修复交付后重新发包，不创建重复 PR。"} 用户需求：\n${payload.prompt ?? ""}`;
+          payload.prompt = `继续修改应用 ${appId}，只改 apps/${appId}/ 与所需根锁文件。${await this.publisherInstruction(task)} ${task.branch ? `在应用专属分支 ${task.branch} 继续迭代，git fetch origin 后 checkout 该分支。` : "继续使用这个 session 自动创建的应用分支。"} 不同步或合入 main，不新建迭代 PR；提交并发包即可交付。 用户需求：\n${payload.prompt ?? ""}`;
           const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
           if (!response.ok && response.status < 500) await this.saveTask(previous);
           return response;
@@ -627,20 +612,21 @@ export class Workshop extends DurableObject<Env> {
       }
       if (input.session !== task.session) return json({ message: "Session 不属于这个应用" }, 403);
       const session = await this.session(task.session);
+      if (task.dispatchVersion && task.dispatchVersion !== `${session.state}:${session.updateTime ?? ""}`) { task.dispatchVersion = undefined; await this.saveTask(task); }
       if (input.action === "stop") {
         if (session.state === "COMPLETED" && task.phase !== "accepted" && !task.repair) return json({ message: "请先收下这轮作品" }, 409);
         if (!["COMPLETED", "PAUSED", "FAILED"].includes(session.state ?? "")) {
-          const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ method: "POST", path: `/v1alpha/${task.session}:sendMessage`, body: JSON.stringify({ prompt: "停止当前制作，不再修改、发布或创建 PR，等待我的下一条需求。" }) }) }), this.env);
+          const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ method: "POST", path: `/v1alpha/${task.session}:sendMessage`, body: JSON.stringify({ prompt: "停止当前制作，不再修改或发布，等待我的下一条需求。" }) }) }), this.env);
           if (!response.ok) return response;
         }
-        task.phase = "paused"; task.repair = true;
+        task.phase = "paused"; task.repair = true; task.dispatchVersion = undefined;
         const latest = await this.candidate(appId);
         task.previousCommit = latest?.source.commit ?? task.previousCommit;
         await this.saveTask(task);
         return json({ stopped: true }, 200);
       }
       if (task.phase === "paused") return json({ completed: false, merged: false, state: "PAUSED", accepted: task.accepted, message: "已发送停止请求，可以继续这个应用" }, 200);
-      if (task.phase === "accepted") return json({ completed: true, merged: true, state: session.state, accepted: task.accepted, application: await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/releases/${task.accepted!.releaseId}`, "json"), message: "这轮作品已收下，可继续修改同一个应用" }, 200);
+      if (task.phase === "accepted") return json({ completed: true, collected: true, merged: true, state: session.state, branch: task.branch, accepted: task.accepted, application: await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/releases/${task.accepted!.releaseId}`, "json"), message: "这轮作品已收下，可继续修改同一个应用" }, 200);
       if (session.state !== "COMPLETED") {
         if (["FAILED", "PAUSED"].includes(session.state ?? "")) { task.phase = "paused"; task.repair = true; await this.saveTask(task); }
         return json({ completed: false, merged: false, state: session.state, delivery: "unpublished", message: ["FAILED", "PAUSED"].includes(session.state ?? "") ? "制作已暂停，可以继续处理" : "这轮作品仍在制作" }, 200);
@@ -656,33 +642,25 @@ export class Workshop extends DurableObject<Env> {
       const loaded = ready && input.applicationReleases?.[appId] === delivery!.application.releaseId;
       if (input.action === "status") {
         if (delivery?.application.title && delivery.application.title !== appId) task.title = delivery.application.title;
-        task.phase = "review"; await this.saveTask(task);
-        return json({ completed: true, merged: false, state: session.state, delivery: !delivery ? "unpublished" : !ready ? "blocked" : loaded ? "loaded" : "update", message: !delivery ? "等待本轮新 PR 和发包" : !ready ? delivery.message : loaded ? "正在运行本轮作品，可以确认收下" : "先加载本轮作品，体验后收下", ...(delivery ? { application: delivery.application, prUrl: delivery.url } : {}) }, 200);
+        task.phase = ready ? "review" : "working"; await this.saveTask(task);
+        return json({ completed: true, merged: false, state: session.state, delivery: !delivery ? "unpublished" : !ready ? "blocked" : loaded ? "loaded" : "update", message: !delivery ? "等待本轮候选包发布" : !ready ? delivery.message : loaded ? "正在运行本轮作品，可以确认收下" : "先加载本轮作品，体验后收下", ...(delivery ? { application: delivery.application, branch: task.branch } : {}) }, 200);
       }
       if (input.action !== "confirm" || !ready || !loaded) return json({ message: "先加载并体验本轮作品，准备好后再收下" }, 409);
       const latest = await this.candidate(appId);
       if (latest?.releaseId !== delivery!.application.releaseId) return json({ message: "有新版本送到，请重新加载" }, 409);
-      const pr = delivery!.pr;
-      let merged;
-      try { merged = pr.merged ? { merged: true, sha: pr.merge_commit_sha } : await this.github(`pulls/${delivery!.number}/merge`, "PUT", { sha: pr.head.sha, merge_method: "merge" }); }
-      catch (error) {
-        task.repair = true; await this.saveTask(task);
-        return json({ message: "合入未完成，请在当前 session 同步 main、修复交付并重新发包" }, 409);
-      }
-      if (!merged.merged) return json({ message: "合入尚未完成，请重试" }, 409);
-      task.phase = "accepted"; task.accepted = { releaseId: latest.releaseId, commit: pr.head.sha, sourceTree: delivery!.sourceTree, mergeCommit: merged.sha, pr: delivery!.number };
+      const proof = await this.ctx.storage.get<{ commit: string; tree?: string }>(`source-proof:${appId}:${latest.releaseId}`);
+      task.phase = "accepted"; task.accepted = { releaseId: latest.releaseId, commit: proof?.commit ?? latest.source.commit, sourceTree: latest.source.tree, branch: task.branch };
       await this.saveTask(task); await this.ctx.storage.put(`accepted:${appId}`, { releaseId: task.accepted.releaseId });
-      return json({ merged: true, accepted: task.accepted }, 200);
+      return json({ collected: true, merged: true, accepted: task.accepted }, 200);
     } catch (error) { return json({ message: error instanceof Error ? error.message : "工坊暂时不可用" }, 502); }
   }
-  private async github(path: string, method = "GET", body?: unknown, repository = "jiangfengwhu/zjh-plugin"): Promise<any> {
-    if (!this.env.GITHUB_MERGE_TOKEN) throw new Error("工坊的收下功能还未配置好，请联系维护者");
-    const response = await fetch(`https://api.github.com/repos/${repository}/${path}`, {
-      method,
+  private async github(path: string): Promise<any> {
+    if (!this.env.GITHUB_MERGE_TOKEN) throw new Error("工坊的分支信息读取还未配置好，请联系维护者");
+    const response = await fetch(`https://api.github.com/repos/jiangfengwhu/zjh-plugin/${path}`, {
+      signal: AbortSignal.timeout(5000),
       headers: { Authorization: `Bearer ${this.env.GITHUB_MERGE_TOKEN}`, Accept: "application/vnd.github+json", "User-Agent": "zijinhua-workshop", "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json" },
-      body: body === undefined ? undefined : JSON.stringify(body),
     });
-    if (!response.ok) throw new Error(response.status === 409 || response.status === 405 ? "这份心愿的代码有了变化，暂时不能收下，请联系维护者处理" : "暂时没能收下这份心愿，请稍后再试");
+    if (!response.ok) throw new Error("暂时无法读取应用分支，请稍后再试");
     return response.json();
   }
 
