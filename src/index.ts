@@ -390,7 +390,12 @@ export class Workshop extends DurableObject<Env> {
       if (task.phase === "paused") return json({ completed: false, merged: false, state: "PAUSED", accepted: task.accepted, message: "已发送停止请求，可以继续这个应用" }, 200);
       if (task.phase === "accepted") return json({ completed: true, merged: true, state: session.state, accepted: task.accepted, message: "这轮作品已收下，可继续修改同一个应用" }, 200);
       if (session.state !== "COMPLETED") return json({ completed: false, merged: false, state: session.state, delivery: "unpublished", message: "这轮作品仍在制作" }, 200);
-      const delivery = await this.delivery(task, session);
+      let delivery: Awaited<ReturnType<Workshop["delivery"]>>;
+      try { delivery = await this.delivery(task, session); }
+      catch (error) {
+        task.repair = true; await this.ctx.storage.put(`task:${appId}`, task);
+        return json({ completed: true, merged: false, state: session.state, delivery: "blocked", message: error instanceof Error ? error.message : "请在当前 session 修复交付后重新发包" }, input.action === "status" ? 200 : 409);
+      }
       const ready = delivery?.ready === true;
       if (!ready) { task.repair = true; await this.ctx.storage.put(`task:${appId}`, task); }
       const loaded = ready && input.applicationReleases?.[appId] === delivery!.application.releaseId;
@@ -402,7 +407,12 @@ export class Workshop extends DurableObject<Env> {
       const latest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/latest`, "json");
       if (latest?.releaseId !== delivery!.application.releaseId) return json({ message: "有新版本送到，请重新加载" }, 409);
       const pr = delivery!.pr;
-      const merged = pr.merged ? { merged: true, sha: pr.merge_commit_sha } : await this.github(`pulls/${delivery!.number}/merge`, "PUT", { sha: pr.head.sha, merge_method: "merge" });
+      let merged;
+      try { merged = pr.merged ? { merged: true, sha: pr.merge_commit_sha } : await this.github(`pulls/${delivery!.number}/merge`, "PUT", { sha: pr.head.sha, merge_method: "merge" }); }
+      catch (error) {
+        task.repair = true; await this.ctx.storage.put(`task:${appId}`, task);
+        return json({ message: "合入未完成，请在当前 session 同步 main、修复交付并重新发包" }, 409);
+      }
       if (!merged.merged) return json({ message: "合入尚未完成，请重试" }, 409);
       task.phase = "accepted"; task.accepted = { releaseId: latest.releaseId, commit: latest.source.commit, mergeCommit: merged.sha, pr: delivery!.number };
       await this.ctx.storage.put(`task:${appId}`, task);
