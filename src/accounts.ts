@@ -1,7 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 
 type AccountEnv = Env & { RESEND_API_KEY?: string; MAIL_FROM?: string };
-export type User = { id: string; email: string; name: string; avatarUrl: string | null; createdAt: number };
+export const OFFICIAL_ACCOUNT_ID = "00000000-0000-4000-8000-000000000001";
+export const OFFICIAL_APPLICATIONS = ["jolly", "notepad", "pomodoro"] as const;
+export type User = { id: string; email: string | null; name: string; avatarUrl: string | null; createdAt: number };
 type Session = { userId: string; expiresAt: number };
 type Challenge = { salt: string; digest: string; expiresAt: number; attempts: number; sentAt: number };
 type Counter = { count: number; expiresAt: number };
@@ -29,6 +31,14 @@ const friendlyName = () => {
 
 /** Account records are separate from workshop state and application business data. */
 export class Accounts extends DurableObject<AccountEnv> {
+  constructor(ctx: DurableObjectState, env: AccountEnv) {
+    super(ctx, env);
+    ctx.blockConcurrencyWhile(async () => {
+      const prior = await ctx.storage.get<User>(`user:${OFFICIAL_ACCOUNT_ID}`);
+      const user: User = { ...(prior ?? { id: OFFICIAL_ACCOUNT_ID, name: "紫金花官方", avatarUrl: null, createdAt: Date.now() }), email: null };
+      await ctx.storage.put(`user:${OFFICIAL_ACCOUNT_ID}`, user);
+    });
+  }
   private queue: Promise<unknown> = Promise.resolve();
   fetch(request: Request): Promise<Response> {
     // Public profile reads must not wait for an outgoing login email.
@@ -39,6 +49,7 @@ export class Accounts extends DurableObject<AccountEnv> {
     const token = request.headers.get("Authorization")?.match(/^Bearer ([a-f0-9]{64})$/)?.[1]; if (!token) return;
     const key = `session:${await hash(token)}`; const record = await this.ctx.storage.get<Session>(key);
     if (!record || record.expiresAt <= Date.now()) { if (record) await this.ctx.storage.delete(key); return; }
+    if (record.userId === OFFICIAL_ACCOUNT_ID) return;
     const user = await this.ctx.storage.get<User>(`user:${record.userId}`); if (user) return { key, record, user };
   }
   private async limited(key: string, limit: number, duration: number): Promise<boolean> {
@@ -86,7 +97,8 @@ export class Accounts extends DurableObject<AccountEnv> {
         if (challenge.attempts >= 5) return json({ message: "尝试次数过多，请重新发送验证码" }, 429);
         challenge.attempts++; await this.ctx.storage.put(key, challenge);
         if (!equal(challenge.digest, await hash(`${challenge.salt}:${code}`))) return json({ message: "验证码不正确，请重新输入" }, 400);
-        const userId = await this.ctx.storage.get<string>(`email:${emailHash}`); let user = userId ? await this.ctx.storage.get<User>(`user:${userId}`) : undefined;
+        const userId = await this.ctx.storage.get<string>(`email:${emailHash}`);
+        let user = userId && userId !== OFFICIAL_ACCOUNT_ID ? await this.ctx.storage.get<User>(`user:${userId}`) : undefined;
         if (!user) user = { id: crypto.randomUUID(), email, name: friendlyName(), avatarUrl: null, createdAt: Date.now() };
         const token = random(); const expiresAt = Date.now() + 90 * 86400000; const sessionKey = `session:${await hash(token)}`; const account = user;
         await this.ctx.storage.transaction(async storage => { await storage.delete(key); await storage.put(`user:${account.id}`, account); await storage.put(`email:${emailHash}`, account.id); await storage.put<Session>(sessionKey, { userId: account.id, expiresAt }); });

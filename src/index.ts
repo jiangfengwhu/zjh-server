@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { authenticatedUser, publicProfiles, readAvatar } from "./accounts";
+import { authenticatedUser, OFFICIAL_ACCOUNT_ID, OFFICIAL_APPLICATIONS, publicProfiles, readAvatar } from "./accounts";
 export { Accounts } from "./accounts";
 
 /** 清单类的键：整套清单和 vendor 的模块编号表。格式变了就换前缀（v3/…），旧版本的手机继续读旧前缀。 */
@@ -209,7 +209,7 @@ type ApplicationRelease = { appId: string; releaseId: string; title: string; sum
 type Accepted = { releaseId: string; commit: string; mergeCommit: string; pr: number };
 type WorkshopTask = { ownerId: string; appId: string; session: string; token: string; phase: "working" | "review" | "accepted" | "paused"; previousCommit?: string; repair?: boolean; accepted?: Accepted };
 type CloudSession = { name?: string; state?: string; sourceContext?: { source?: string }; outputs?: { pullRequest?: { url?: string } }[] };
-type MarketEntry = { manifest: ApplicationRelease; title: string; summary: string; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; originalAppId: string | null };
+type MarketEntry = { manifest: ApplicationRelease; title: string; summary: string; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null };
 
 export class Workshop extends DurableObject<Env> {
   private queue: Promise<unknown> = Promise.resolve();
@@ -291,9 +291,33 @@ export class Workshop extends DurableObject<Env> {
       }
       if (path === "/v1/market" && request.method === "GET") {
         const entries = [...(await this.ctx.storage.list<MarketEntry>({ prefix: "shared:" })).values()];
-        for (const appId of ["jolly", "notepad", "pomodoro"]) if (!entries.some(entry => entry.manifest.appId === appId) && !await this.ctx.storage.get(`withdrawn:${appId}`)) {
+        for (const appId of OFFICIAL_APPLICATIONS) if (!entries.some(entry => entry.manifest.appId === appId) && !await this.ctx.storage.get(`withdrawn:${appId}`)) {
           const manifest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/latest`, "json");
-          if (manifest) entries.push({ manifest, title: manifest.title, summary: manifest.summary, authorId: null, authorName: "社区创作者", originalAppId: null });
+          if (manifest) entries.push({ manifest, title: manifest.title, summary: manifest.summary, authorId: OFFICIAL_ACCOUNT_ID, authorName: "紫金花官方", originalAppId: null });
+        }
+        // Local maintainer tools may publish directly through Wrangler KV instead of /v1/catalog.
+        // Resolve both paths from the same trusted catalog; user workshop builds never auto-share.
+        let cursor: string | undefined;
+        do {
+          const page = await this.env.CATALOG.list({ prefix: "v1/applications/", ...(cursor ? { cursor } : {}) });
+          for (const key of page.keys) {
+            const match = key.name.match(/^v1\/applications\/([a-z][a-z0-9-]{0,63})\/latest$/);
+            if (!match || await this.ctx.storage.get(`withdrawn:${match[1]}`)) continue;
+            const builtin = (OFFICIAL_APPLICATIONS as readonly string[]).includes(match[1]);
+            if (!builtin && await this.ctx.storage.get(`task:${match[1]}`)) continue;
+            const manifest = await this.env.CATALOG.get<ApplicationRelease & { originalAppId?: string }>(key.name, "json");
+            if (!manifest) continue;
+            const entry: MarketEntry = { manifest, title: manifest.title, summary: manifest.summary, authorId: OFFICIAL_ACCOUNT_ID, authorName: "紫金花官方", authorAvatarUrl: null, authorOfficial: true, originalAppId: manifest.originalAppId ?? null };
+            const prior = entries.findIndex(item => item.manifest.appId === manifest.appId);
+            if (prior >= 0) entries[prior] = entry; else entries.push(entry);
+            const stored = await this.ctx.storage.get<MarketEntry>(`shared:${manifest.appId}`);
+            if (stored?.authorId !== OFFICIAL_ACCOUNT_ID || stored.manifest.releaseId !== manifest.releaseId) await this.ctx.storage.put(`shared:${manifest.appId}`, entry);
+          }
+          cursor = page.list_complete ? undefined : page.cursor;
+        } while (cursor);
+        for (const entry of entries) {
+          if ((OFFICIAL_APPLICATIONS as readonly string[]).includes(entry.manifest.appId)) { entry.authorId = OFFICIAL_ACCOUNT_ID; entry.authorName = "紫金花官方"; entry.authorAvatarUrl = null; }
+          entry.authorOfficial = entry.authorId === OFFICIAL_ACCOUNT_ID;
         }
         // Public browsing never authenticates the visitor. Profile lookup is optional enrichment.
         try {
@@ -332,7 +356,20 @@ export class Workshop extends DurableObject<Env> {
             if (prior && prior !== item.body) return json({ error: "application release is immutable" }, 409);
           }
         }
-        return putCatalog(request, this.env);
+        const response = await putCatalog(request, this.env);
+        if (!response.ok) return response;
+        // Tool-published applications without a user workshop task belong to the official publisher.
+        // Workshop builds keep their owner and remain private until that owner explicitly shares.
+        for (const item of objects ?? []) {
+          if (typeof item.key !== "string" || typeof item.body !== "string") continue;
+          const match = item.key.match(/^v1\/applications\/([a-z][a-z0-9-]{0,63})\/latest$/);
+          if (!match || await this.ctx.storage.get(`task:${match[1]}`)) continue;
+          const manifest = JSON.parse(item.body) as ApplicationRelease & { originalAppId?: string };
+          const entry: MarketEntry = { manifest, title: manifest.title, summary: manifest.summary, authorId: OFFICIAL_ACCOUNT_ID, authorName: "紫金花官方", authorAvatarUrl: null, authorOfficial: true, originalAppId: manifest.originalAppId ?? null };
+          await this.ctx.storage.put(`shared:${manifest.appId}`, entry);
+          await this.ctx.storage.delete(`withdrawn:${manifest.appId}`);
+        }
+        return response;
       }
 
       const input = await request.json() as { appId?: string; originalAppId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; applicationReleases?: Record<string, string> };
@@ -343,7 +380,7 @@ export class Workshop extends DurableObject<Env> {
       let task = await this.ctx.storage.get<WorkshopTask>(`task:${appId}`);
       if (task && task.ownerId !== user.id) return json({ message: "这个作品属于其他账号" }, 403);
       if (path === "/v1/jules" && input.method === "POST" && input.path === "/v1alpha/sessions") {
-        if (["jolly", "notepad", "pomodoro"].includes(appId)) return json({ message: "请基于这个应用创作新作品" }, 403);
+        if ((OFFICIAL_APPLICATIONS as readonly string[]).includes(appId)) return json({ message: "请基于这个应用创作新作品" }, 403);
         if (task && input.approvalToken !== task.token) return json({ message: "这个应用的 session 凭据不匹配" }, 403);
         if (task?.session) return json({ message: "这个应用已有 session，请继续它；新应用才创建新 session" }, 409);
         if (await this.env.CATALOG.get(`v1/applications/${appId}/latest`)) return json({ message: "应用 ID 已存在，请基于它创作新作品" }, 409);
@@ -381,7 +418,7 @@ export class Workshop extends DurableObject<Env> {
         const title = input.title?.trim() ?? shared?.title ?? manifest.title;
         const summary = input.summary?.trim() ?? shared?.summary ?? manifest.summary;
         if (!title || title.length > 60 || summary.length > 300) return json({ message: "名称不能为空且最多 60 字，介绍最多 300 字" }, 400);
-        const entry: MarketEntry = { manifest, title, summary, authorId: user.id, authorName: user.name, authorAvatarUrl: user.avatarUrl, originalAppId: (manifest as ApplicationRelease & { originalAppId?: string }).originalAppId ?? null };
+        const entry: MarketEntry = { manifest, title, summary, authorId: user.id, authorName: user.name, authorAvatarUrl: user.avatarUrl, authorOfficial: user.id === OFFICIAL_ACCOUNT_ID, originalAppId: (manifest as ApplicationRelease & { originalAppId?: string }).originalAppId ?? null };
         await this.ctx.storage.put(`shared:${appId}`, entry);
         await this.ctx.storage.delete(`withdrawn:${appId}`);
         return json({ shared: entry, accepted: accepted ?? null, application }, 200);
