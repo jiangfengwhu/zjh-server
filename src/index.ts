@@ -77,6 +77,7 @@ async function readBlob(request: Request, env: Env, key: string): Promise<Respon
 
 async function putCatalog(request: Request, env: Env): Promise<Response> {
   if (!await authorized(request, env.PUBLISH_TOKEN) && !await authorized(request, env.OFFICIAL_PUBLISH_TOKEN)) return json({ error: "unauthorized" }, 401);
+  const maintainer = await authorized(request, env.OFFICIAL_PUBLISH_TOKEN);
   const text = await request.text();
   if (text.length > 8_000_000) return json({ error: "catalog too large" }, 413);
   let objects: CatalogObject[];
@@ -91,6 +92,7 @@ async function putCatalog(request: Request, env: Env): Promise<Response> {
     if (typeof item.key !== "string" || !DYNAMIC_JSON_KEY.test(item.key) || typeof item.body !== "string") {
       return json({ error: "catalog key" }, 400);
     }
+    if (!maintainer && !/^v1\/applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|releases\/[a-f0-9]{64})$/.test(item.key)) return json({ error: "application publisher cannot modify host catalog" }, 403);
     if (item.body.length > 8_000_000) return json({ error: "catalog object too large" }, 413);
     entries.push({ key: item.key, body: item.body });
   }
@@ -215,7 +217,7 @@ export class Workshop extends DurableObject<Env> {
   private async allocate(appId: string): Promise<number> {
     const existing = await this.ctx.storage.get<number>(`allocation:${appId}`); if (existing) return existing;
     const fixed: Record<string, number> = { jolly: 2000000, notepad: 2100000, pomodoro: 2200000 };
-    const prior = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/latest`, "json");
+    const prior = await this.candidate(appId);
     let base = fixed[appId] ?? prior?.modules.base;
     if (!base) {
       base = await this.ctx.storage.get<number>("allocation:next") ?? 2300000;
@@ -228,6 +230,13 @@ export class Workshop extends DurableObject<Env> {
     await this.ctx.storage.put(`application-range:${base}`, appId);
     await this.ctx.storage.put(`allocation:${appId}`, base); return base;
   }
+  private async candidate(appId: string): Promise<ApplicationRelease | null> {
+    const stored = await this.ctx.storage.get<ApplicationRelease>(`candidate:${appId}`);
+    if (stored) return stored;
+    const legacy = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/latest`, "json");
+    if (legacy) await this.ctx.storage.put(`candidate:${appId}`, legacy);
+    return legacy;
+  }
   private async applicationRelease(number: number, appId: string): Promise<ApplicationRelease> {
     let touched = false;
     for (let page = 1; page <= 30; page++) {
@@ -239,7 +248,7 @@ export class Workshop extends DurableObject<Env> {
       if (files.length < 100) break;
     }
     if (!touched) throw new Error("这份 PR 没有交付目标应用");
-    const app = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/latest`, "json");
+    const app = await this.candidate(appId);
     if (!app || app.source.repository !== "jiangfengwhu/zjh-plugin") throw new Error("这个应用还没有发布本轮作品");
     return app;
   }
@@ -294,11 +303,13 @@ export class Workshop extends DurableObject<Env> {
         if (!await authorized(request, this.env.PUBLISH_TOKEN) && !await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN)) return json({ error: "unauthorized" }, 401);
         const text = await request.clone().text();
         if (text.length > 8_000_000) return json({ error: "catalog too large" }, 413);
-        const { objects } = JSON.parse(text) as { objects?: CatalogObject[] };
+        const { objects, expectedReleases } = JSON.parse(text) as { objects?: CatalogObject[]; expectedReleases?: Record<string, string | null> };
+        const candidates = new Map<string, ApplicationRelease>();
+        const ranges = new Map<number, string>();
         for (const item of objects ?? []) {
           if (typeof item.key !== "string" || typeof item.body !== "string") continue;
           const match = item.key.match(/^v1\/applications\/([a-z][a-z0-9-]{0,63})\/(latest|releases\/[a-f0-9]{64})$/);
-          if (!match) continue;
+          if (!match) { if (!await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN)) return json({ error: "application publisher cannot modify host catalog" }, 403); continue; }
           const manifest = JSON.parse(item.body) as { appId: string; releaseId: string; source: { dirty: boolean }; modules: { base: number; size: number } };
           const base = manifest.modules?.base;
           if (manifest.appId !== match[1] || manifest.source?.dirty !== false || !/^[a-f0-9]{64}$/.test(manifest.releaseId) || !Number.isSafeInteger(base) || base < 2000000 || base % 100000 || manifest.modules.size !== 100000) return json({ error: "application manifest invalid" }, 400);
@@ -309,18 +320,31 @@ export class Workshop extends DurableObject<Env> {
           if (identity !== releaseId || document.format !== 1 || !/^[a-f0-9]{40}$/.test(document.source.commit) || !document.requires?.engineAbi || !document.requires?.sdk) return json({ error: "application integrity invalid" }, 400);
           const fixedOwners: Record<number, string> = { 2000000: "jolly", 2100000: "notepad", 2200000: "pomodoro" };
           if (fixedOwners[base] && fixedOwners[base] !== manifest.appId) return json({ error: "application module range reserved" }, 409);
-          const priorLatest = await this.env.CATALOG.get<{ modules: { base: number } }>(`v1/applications/${manifest.appId}/latest`, "json");
+          const priorLatest = await this.candidate(manifest.appId);
+          if (match[2] === "latest") {
+            if (candidates.has(manifest.appId)) return json({ error: "duplicate candidate pointer" }, 400);
+            if (!expectedReleases || !Object.hasOwn(expectedReleases, manifest.appId)) return json({ error: "expected candidate release is required; upgrade SDK" }, 409);
+            if ((priorLatest?.releaseId ?? null) !== expectedReleases[manifest.appId] && priorLatest?.releaseId !== manifest.releaseId) return json({ error: "candidate baseline changed; synchronize and republish" }, 409);
+            candidates.set(manifest.appId, document);
+          }
           if (priorLatest && priorLatest.modules.base !== base) return json({ error: "application module range cannot change" }, 409);
           const owner = await this.ctx.storage.get<string>(`application-range:${base}`);
           if (owner && owner !== manifest.appId) return json({ error: "application module range occupied" }, 409);
-          await this.ctx.storage.put(`application-range:${base}`, manifest.appId);
+          if (ranges.has(base) && ranges.get(base) !== manifest.appId) return json({ error: "duplicate module range" }, 409);
+          ranges.set(base, manifest.appId);
           if (match[2] !== "latest") {
             if (!match[2].endsWith(manifest.releaseId)) return json({ error: "application release identity mismatch" }, 400);
             const prior = await this.env.CATALOG.get(item.key);
             if (prior && prior !== item.body) return json({ error: "application release is immutable" }, 409);
           }
         }
-        return putCatalog(request, this.env);
+        const response = await putCatalog(request, this.env);
+        if (!response.ok) return response;
+        await this.ctx.storage.transaction(async storage => {
+          for (const [base, appId] of ranges) await storage.put(`application-range:${base}`, appId);
+          for (const [appId, manifest] of candidates) await storage.put(`candidate:${appId}`, manifest);
+        });
+        return response;
       }
 
       if (path === "/v1/official-release" && request.method === "POST") {
@@ -350,7 +374,7 @@ export class Workshop extends DurableObject<Env> {
         }
         const accepted = task?.accepted ?? await this.ctx.storage.get<{ releaseId: string }>(`accepted:${appId}`);
         const key = pointer === "accepted" ? accepted ? `releases/${accepted.releaseId}` : undefined : pointer === "candidate" ? "latest" : pointer;
-        const manifest = key ? await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/${key}`, "json") : null;
+        const manifest = key === "latest" ? await this.candidate(appId) : key ? await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/${key}`, "json") : null;
         return manifest ? json(manifest, 200) : json({ message: "没有对应版本" }, 404);
       }
       const input = await request.json() as { appId?: string; originalAppId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; applicationReleases?: Record<string, string> };
@@ -428,7 +452,7 @@ export class Workshop extends DurableObject<Env> {
           if (!response.ok) return response;
         }
         task.phase = "paused"; task.repair = true;
-        const latest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/latest`, "json");
+        const latest = await this.candidate(appId);
         task.previousCommit = latest?.source.commit ?? task.previousCommit;
         await this.ctx.storage.put(`task:${appId}`, task);
         return json({ stopped: true }, 200);
@@ -450,7 +474,7 @@ export class Workshop extends DurableObject<Env> {
         return json({ completed: true, merged: false, state: session.state, delivery: !delivery ? "unpublished" : !ready ? "blocked" : loaded ? "loaded" : "update", message: !delivery ? "等待本轮新 PR 和发包" : !ready ? delivery.message : loaded ? "正在运行本轮作品，可以确认收下" : "先加载本轮作品，体验后收下", ...(delivery ? { application: delivery.application, prUrl: delivery.url } : {}) }, 200);
       }
       if (input.action !== "confirm" || !ready || !loaded) return json({ message: "先加载并体验本轮作品，准备好后再收下" }, 409);
-      const latest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/latest`, "json");
+      const latest = await this.candidate(appId);
       if (latest?.releaseId !== delivery!.application.releaseId) return json({ message: "有新版本送到，请重新加载" }, 409);
       const pr = delivery!.pr;
       let merged;

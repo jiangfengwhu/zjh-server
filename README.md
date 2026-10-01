@@ -71,3 +71,7 @@ Jolly、记事本、番茄钟均归官方发布者。上传构建只更新候选
 `/v1/applications/<id>/candidate`（旧 `latest` 仅为私有候选别名）、`accepted`、`public` 分别表示候选、已收下和公开版本。候选/已收下/未公开的不可变清单读取需要发布凭证，或作者账号加 X-Workshop-Token。市场、应用列表、APK seed、客户端首次安装和兼容回退只读公开版本；缺少公开版本返回 404，不回退候选。包体仍使用不可变内容哈希地址。
 
 工坊确认收下更新 accepted，不更新 public；用户分享仅可选择 accepted。官方账号没有登录入口，维护者通过独立的 OFFICIAL_PUBLISH_TOKEN 调用 POST /v1/official-release，指定 appId/releaseId 明确收下并公开。云端的 PUBLISH_TOKEN 无权调用此操作。官方发布工具先确认源码提交已进入 zjh-plugin 的 origin/main；普通候选上传和直接写 KV 都不触发公开指针更新。
+
+### 发布权限与原子候选基线
+
+PUBLISH_TOKEN 只允许应用清单；宿主 v1/release、vendor 编号表须使用维护者 OFFICIAL_PUBLISH_TOKEN。候选上传须携带 expectedReleases（首次为 null），服务端在串行对象中比较并更新权威 candidate 指针；版本冲突返回 409，同版本重试允许。KV 的 latest 只作镜像，不用于已初始化候选的并发判定。SDK 1.1.3 自动提交基线，不允许候选工具绕过 API 直接写 KV。
