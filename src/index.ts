@@ -286,7 +286,7 @@ export class Workshop extends DurableObject<Env> {
       }
       if (path === "/v1/market" && request.method === "GET") {
         const entries = [...(await this.ctx.storage.list<MarketEntry>({ prefix: "shared:" })).values()];
-        for (const appId of ["jolly", "notepad", "pomodoro"]) if (!entries.some(entry => entry.manifest.appId === appId)) {
+        for (const appId of ["jolly", "notepad", "pomodoro"]) if (!entries.some(entry => entry.manifest.appId === appId) && !await this.ctx.storage.get(`withdrawn:${appId}`)) {
           const manifest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/latest`, "json");
           if (manifest) entries.push({ manifest, title: manifest.title, summary: manifest.summary, authorId: null, authorName: "社区创作者", originalAppId: null });
         }
@@ -348,15 +348,27 @@ export class Workshop extends DurableObject<Env> {
       }
       if (!task || (input.token ?? input.approvalToken) !== task.token) return json({ message: "这个应用的 session 凭据不匹配" }, 403);
       if (path === "/v1/market") {
+        const shared = await this.ctx.storage.get<MarketEntry>(`shared:${appId}`) ?? null;
         const accepted = task.accepted;
-        if (!accepted || input.releaseId !== accepted.releaseId) return json({ message: "只有已确认收下的版本可以分享，请先收下这次作品" }, 409);
-        const manifest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/releases/${accepted.releaseId}`, "json");
-        if (!manifest || manifest.source.commit !== accepted.commit) return json({ message: "收下的版本尚未送到，请稍后重试" }, 409);
-        const title = input.title?.trim() || manifest.title; const summary = input.summary?.trim() || manifest.summary;
-        if (title.length > 60 || summary.length > 300) return json({ message: "名称最多 60 字，介绍最多 300 字" }, 400);
-        const entry = { manifest, title, summary, authorId: null, authorName: "社区创作者", originalAppId: (manifest as ApplicationRelease & { originalAppId?: string }).originalAppId ?? null };
+        const application = accepted ? await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/releases/${accepted.releaseId}`, "json") : null;
+        if (input.action === "status") return json({ shared, accepted: accepted ?? null, application }, 200);
+        if (input.action === "withdraw") {
+          await this.ctx.storage.delete(`shared:${appId}`);
+          await this.ctx.storage.put(`withdrawn:${appId}`, true);
+          return json({ shared: null, accepted: accepted ?? null, application }, 200);
+        }
+        if (input.action && !["share", "edit"].includes(input.action)) return json({ message: "分享操作无效" }, 400);
+        if (input.action === "edit" && !shared) return json({ message: "这份作品尚未分享" }, 409);
+        if (input.action !== "edit" && (!accepted || input.releaseId !== accepted.releaseId)) return json({ message: "只能分享已收下的版本，请刷新作品状态后重试" }, 409);
+        const manifest = input.action === "edit" ? shared!.manifest : application;
+        if (!manifest || (input.action !== "edit" && manifest.source.commit !== accepted!.commit)) return json({ message: "收下的版本尚未送到，请稍后重试" }, 409);
+        const title = input.title?.trim() ?? shared?.title ?? manifest.title;
+        const summary = input.summary?.trim() ?? shared?.summary ?? manifest.summary;
+        if (!title || title.length > 60 || summary.length > 300) return json({ message: "名称不能为空且最多 60 字，介绍最多 300 字" }, 400);
+        const entry: MarketEntry = { manifest, title, summary, authorId: null, authorName: "社区创作者", originalAppId: (manifest as ApplicationRelease & { originalAppId?: string }).originalAppId ?? null };
         await this.ctx.storage.put(`shared:${appId}`, entry);
-        return json({ shared: true, releaseId: accepted.releaseId }, 200);
+        await this.ctx.storage.delete(`withdrawn:${appId}`);
+        return json({ shared: entry, accepted: accepted ?? null, application }, 200);
       }
       if (path === "/v1/jules") {
         const name = input.path?.match(/^\/v1alpha\/(sessions\/[A-Za-z0-9_-]+)/)?.[1];
@@ -388,7 +400,7 @@ export class Workshop extends DurableObject<Env> {
         return json({ stopped: true }, 200);
       }
       if (task.phase === "paused") return json({ completed: false, merged: false, state: "PAUSED", accepted: task.accepted, message: "已发送停止请求，可以继续这个应用" }, 200);
-      if (task.phase === "accepted") return json({ completed: true, merged: true, state: session.state, accepted: task.accepted, message: "这轮作品已收下，可继续修改同一个应用" }, 200);
+      if (task.phase === "accepted") return json({ completed: true, merged: true, state: session.state, accepted: task.accepted, application: await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/releases/${task.accepted!.releaseId}`, "json"), message: "这轮作品已收下，可继续修改同一个应用" }, 200);
       if (session.state !== "COMPLETED") return json({ completed: false, merged: false, state: session.state, delivery: "unpublished", message: "这轮作品仍在制作" }, 200);
       let delivery: Awaited<ReturnType<Workshop["delivery"]>>;
       try { delivery = await this.delivery(task, session); }
