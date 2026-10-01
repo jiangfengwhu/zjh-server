@@ -222,15 +222,32 @@ export class Workshop extends DurableObject<Env> {
     this.resetting = true;
     try {
       await Promise.allSettled([...this.writes]);
-      // Keep account identities, runtime/host catalogs and immutable blobs; discard workshop history.
+      // Keep only the current official Jolly release and infrastructure catalogs.
+      const jolly = await this.ctx.storage.get<MarketEntry>("shared:jolly");
+      if (!jolly) return json({ message: "请先发布官方 Jolly，再清理测试数据" }, 409);
+      const accountReset = await this.env.ACCOUNTS.getByName("accounts").fetch(new Request("https://account.internal/internal/development-reset", { method: "POST" }));
+      if (!accountReset.ok) return json({ message: "账户清理未完成，请重试" }, 503);
       let cursor: string | undefined; let count = 0;
+      const releaseKey = `v1/applications/jolly/releases/${jolly.manifest.releaseId}`;
       do {
         const page = await this.env.CATALOG.list({ prefix: "v1/applications/", cursor });
-        for (const key of page.keys) { await this.env.CATALOG.delete(key.name); count++; }
+        for (const key of page.keys) {
+          if (key.name === releaseKey) continue;
+          await this.env.CATALOG.delete(key.name); count++;
+        }
         cursor = page.list_complete ? undefined : page.cursor;
       } while (cursor);
+      await this.env.CATALOG.put(releaseKey, JSON.stringify(jolly.manifest));
+      await this.env.CATALOG.put("v1/applications/jolly/latest", JSON.stringify(jolly.manifest));
       await this.ctx.storage.deleteAll();
-      return json({ reset: true, deletedApplicationCatalogs: count }, 200);
+      await this.ctx.storage.put({
+        "shared:jolly": jolly,
+        "candidate:jolly": jolly.manifest,
+        [`published:jolly:${jolly.manifest.releaseId}`]: true,
+        "allocation:jolly": jolly.manifest.modules.base,
+        [`application-range:${jolly.manifest.modules.base}`]: "jolly",
+      });
+      return json({ reset: true, accounts: await accountReset.json(), deletedApplicationCatalogs: count, retainedApplications: ["jolly"] }, 200);
     } finally { this.resetting = false; }
   }
   private async write(request: Request, path: string): Promise<Response> {
@@ -305,7 +322,7 @@ export class Workshop extends DurableObject<Env> {
   }
   private async allocate(appId: string): Promise<number> {
     const existing = await this.ctx.storage.get<number>(`allocation:${appId}`); if (existing) return existing;
-    const fixed: Record<string, number> = { jolly: 2000000, notepad: 2100000, pomodoro: 2200000 };
+    const fixed: Record<string, number> = { jolly: 2000000 };
     const prior = await this.candidate(appId);
     return this.ctx.storage.transaction(async storage => {
       const allocated = await storage.get<number>(`allocation:${appId}`); if (allocated) return allocated;
@@ -420,7 +437,7 @@ export class Workshop extends DurableObject<Env> {
             const stored = await this.env.BLOBS.head(`v1/app/${blob.sha256}`);
             if (!stored || stored.size !== blob.bytes) return json({ error: "application blob not uploaded" }, 409);
           }
-          const fixedOwners: Record<number, string> = { 2000000: "jolly", 2100000: "notepad", 2200000: "pomodoro" };
+          const fixedOwners: Record<number, string> = { 2000000: "jolly" };
           if (fixedOwners[base] && fixedOwners[base] !== manifest.appId) return json({ error: "application module range reserved" }, 409);
           const priorLatest = await this.candidate(manifest.appId);
           if (match[2] === "latest") {

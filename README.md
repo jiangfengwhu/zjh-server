@@ -45,11 +45,11 @@ candidate（latest 为私有别名）→ 作者可选体验 → 作者主动上�
 
 GET /v1/applications/<id>/releases/<releaseId> 对已经公开过的快照保持可读，便于已安装应用在更新或撤回后继续运行；私有候选仍须鉴权。已安装公开快照允许离线启动。
 
-官方发布者固定 ID 为 00000000-0000-4000-8000-000000000001，昵称「紫金花官方」，email=null，无验证码登录入口。Jolly、notepad、pomodoro 为官方应用。维护者经 POST /v1/official-release 明确指定不可变版本公开；云端不能调用。authorOfficial 由服务端生成，改昵称不能获得官方身份。
+官方发布者固定 ID 为 00000000-0000-4000-8000-000000000001，昵称「紫金花官方」，email=null，无验证码登录入口。仅 Jolly 为内置官方应用。维护者经 POST /v1/official-release 明确指定不可变版本公开；云端不能调用。authorOfficial 由服务端生成，改昵称不能获得官方身份。
 
 升级须协调 SDK 固定 tarball、server、宿主和 Jolly，旧工具不兼容新授权接口。部署前停止旧任务，撤销历史云端共享 R2 凭据并从 Jules 环境移除；禁用新会话变量不能收回历史密钥，旧会话继续前须清除环境或迁移。完整顺序见 zjh-dynamic/docs/market-trust.md。
 
-开发清库：维护者以 POST /v1/development-reset 及 confirm=RESET_WORKSHOP_DEVELOPMENT_DATA 清除工坊任务、候选、分享和应用清单，保留账号、runtime/宿主清单及不可变产物。重置期间停止新请求并等待在途请求结束，然后重新发布官方应用。不支持历史仓库基线或匿名任务迁移。
+开发清库：维护者以 POST /v1/development-reset 及 confirm=RESET_WORKSHOP_DEVELOPMENT_DATA 清除普通账号、登录凭证、验证码、额度、工坊任务和非 Jolly 应用清单及分享；只保留官方身份、当前公开 Jolly 版本、runtime/宿主清单及不可变产物。重置期间拒绝新工坊请求并等待在途操作结束。清库后须重新登录。不支持历史仓库基线或匿名任务迁移。
 
 用户应用在 Jules 自动创建的分支长期迭代。平台从导出信息记录分支和可获取的源码提交，此信息读取失败不阻塞候选体验。main 只维护官方应用。Remix 创建新的应用 ID、owner 与独立分支，从原应用分支开始，并保留原作版本来源。
 

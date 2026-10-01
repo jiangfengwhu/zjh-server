@@ -3,7 +3,7 @@ import { KeyedQueue } from "./concurrency";
 
 type AccountEnv = Env & { RESEND_API_KEY?: string; MAIL_FROM?: string };
 export const OFFICIAL_ACCOUNT_ID = "00000000-0000-4000-8000-000000000001";
-export const OFFICIAL_APPLICATIONS = ["jolly", "notepad", "pomodoro"] as const;
+export const OFFICIAL_APPLICATIONS = ["jolly"] as const;
 export type User = { id: string; email: string | null; name: string; avatarUrl: string | null; createdAt: number };
 type Session = { userId: string; expiresAt: number };
 type Challenge = { salt: string; digest: string; expiresAt: number; attempts: number; sentAt: number };
@@ -41,7 +41,26 @@ export class Accounts extends DurableObject<AccountEnv> {
     });
   }
   private queue = new KeyedQueue();
+  private resetting = false;
+  private pending = new Set<Promise<unknown>>();
   async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname === "/internal/development-reset" && request.method === "POST") {
+      if (this.resetting) return json({ message: "账户正在重置" }, 409);
+      this.resetting = true;
+      try {
+        await Promise.allSettled([...this.pending]);
+        const official = await this.ctx.storage.get<User>(`user:${OFFICIAL_ACCOUNT_ID}`);
+        await this.ctx.storage.deleteAll();
+        await this.ctx.storage.deleteAlarm();
+        await this.ctx.storage.put(`user:${OFFICIAL_ACCOUNT_ID}`, official ?? { id: OFFICIAL_ACCOUNT_ID, email: null, name: "紫金花官方", avatarUrl: null, createdAt: Date.now() });
+        return json({ reset: true, retainedAccounts: [OFFICIAL_ACCOUNT_ID] });
+      } finally { this.resetting = false; }
+    }
+    if (this.resetting) return json({ message: "账户正在重置，请稍后重试" }, 503);
+    const operation = this.dispatch(request); this.pending.add(operation);
+    try { return await operation; } finally { this.pending.delete(operation); }
+  }
+  private async dispatch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     if (path.startsWith("/internal/") || request.method === "GET") return this.handle(request);
     if (["/v1/auth/code", "/v1/auth/verify"].includes(path)) {
@@ -138,7 +157,11 @@ export class Accounts extends DurableObject<AccountEnv> {
       return json({ message: "没有找到这个操作" }, 404);
     } catch (error) { return error instanceof InvalidInput ? json({ message: error.message }, 400) : json({ message: "账户操作暂未完成，请稍后重试" }, 503); }
   }
-  alarm(): Promise<void> { return this.cleanup(); }
+  async alarm(): Promise<void> {
+    if (this.resetting) return;
+    const operation = this.cleanup(); this.pending.add(operation);
+    try { await operation; } finally { this.pending.delete(operation); }
+  }
   private async cleanup() {
     for (const prefix of ["code:", "session:", "rate:"]) {
       let startAfter: string | undefined;
