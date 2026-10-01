@@ -33,7 +33,7 @@ POST /v1/workshop status 接回交付；confirm 由宿主确认后触发。运�
 
 Jules 只接受 sources/github/jiangfengwhu/zjh-plugin。新会话禁用共享环境变量，平台在私有任务提示中签发 HMAC 授权，绑定 appId、ownerId、制作轮次和 7 天有效期；手机返回的 session/活动文本隐藏授权。暂停、收下或开启新轮次撤销旧授权。云端不得取得服务端密钥或本机管理权限。
 
-SDK 1.1.6 的 authorize 将授权保存到 Git 元数据；PUT /v1/application-blobs/<id>/<sha256> 校验轮次、最大 40 MB 和内容哈希后写内容地址。PUT /v1/catalog 只允许该应用清单，携带 expectedReleases（首次 null），按应用串行比较权威 candidate 指针，冲突返回 409。KV latest 只作镜像；模块范围在写镜像前事务预留。不可变清单与候选须相同，包体须已上传。宿主 release/vendor 只用维护者凭据，/v1/runtime 不通过此接口修改。
+SDK 1.1.7 的 authorize 将授权保存到 Git 元数据；PUT /v1/application-blobs/<id>/<sha256> 校验轮次、最大 40 MB 和内容哈希后写内容地址。PUT /v1/catalog 只允许该应用清单，携带 expectedReleases（首次 null），按应用串行比较权威 candidate 指针，冲突返回 409。KV latest 只作镜像；模块范围在写镜像前事务预留。不可变清单与候选须相同，包体须已上传。宿主 release/vendor 只用维护者凭据，/v1/runtime 不通过此接口修改。
 
 原作复制绑定 originalAppId、originalReleaseId、originalCommit；初始化读取锁定 Git 提交的 src/assets 与纯 JS 依赖，不能改用 main 的新版源码。
 

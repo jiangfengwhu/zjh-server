@@ -281,7 +281,7 @@ export class Workshop extends DurableObject<Env> {
   }
   private async publisherInstruction(task: WorkshopTask) {
     const grant = await issuePublisherGrant({ appId: task.appId, ownerId: task.ownerId, epoch: task.publishEpoch! }, this.env.OFFICIAL_PUBLISH_TOKEN);
-    return `使用 SDK 1.1.6 或更新版本。发包前执行 npx zjh-app authorize ${task.appId} '${grant}'，只授权本应用本轮候选发布；不得输出授权、提交授权文件或使用环境里的旧全局发布凭据。`;
+    return `使用 SDK 1.1.7 或更新版本。发包前执行 npx zjh-app authorize ${task.appId} '${grant}'，只授权本应用本轮候选发布；不得输出授权、提交授权文件或使用环境里的旧全局发布凭据。`;
   }
   private async recoverSession(task: WorkshopTask): Promise<WorkshopTask> {
     if (task.session || !task.creationTitle) return task;
@@ -353,7 +353,7 @@ export class Workshop extends DurableObject<Env> {
       if (application.source.dirty) return { ready: false, message: "候选来自未提交改动，请提交源码后重新发包", application, pr, number, url };
       const commit = await this.github(`git/commits/${pr.head.sha}`);
       const sourceTree = commit.tree?.sha as string | undefined;
-      if (!sourceTree || (application.source.tree ? application.source.tree !== sourceTree : application.source.commit !== pr.head.sha)) return { ready: false, message: "候选源码与最终 PR 内容不一致，请使用 SDK 1.1.6 从当前源码重新发包", application, pr, number, url };
+      if (!sourceTree || (application.source.tree ? application.source.tree !== sourceTree : application.source.commit !== pr.head.sha)) return { ready: false, message: "候选源码与最终 PR 内容不一致，请使用 SDK 1.1.7 从当前源码重新发包", application, pr, number, url };
       // Unrelated applications can merge first. Only this app and shared lock conflicts block delivery.
       if (!pr.merged) {
         const comparison = await this.github(`compare/${pr.head.sha}...main`);
