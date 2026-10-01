@@ -7,7 +7,7 @@
   "compatibility_date": "2026-09-29",
   "compatibility_flags": ["nodejs_compat"],
   "secrets": {
-    "required": ["JULES_API_KEY", "PUBLISH_TOKEN", "GITHUB_MERGE_TOKEN"]
+    "required": ["JULES_API_KEY", "PUBLISH_TOKEN", "GITHUB_MERGE_TOKEN", "OFFICIAL_PUBLISH_TOKEN"]
   },
   "migrations": [
     { "tag": "v1-release-catalog", "new_sqlite_classes": ["ReleaseCatalog"] },

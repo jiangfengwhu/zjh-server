@@ -23,20 +23,8 @@ export default {
       if (/^\/v1\/(auth\/(?:code|verify|logout)|account(?:\/avatar)?)$/.test(url.pathname)) return env.ACCOUNTS.getByName("accounts").fetch(request);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/avatars\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readAvatar(request, env);
       if (request.method === "PUT" && url.pathname === "/v1/catalog") return env.WORKSHOP.getByName("dynamic").fetch(request);
-      if (url.pathname === "/v1/market" || /^\/v1\/application-allocation\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
-      if (request.method === "GET" && url.pathname === "/v1/applications") {
-        const manifests: unknown[] = [];
-        let cursor: string | undefined;
-        do {
-          const page = await env.CATALOG.list({ prefix: "v1/applications/", ...(cursor ? { cursor } : {}) });
-          for (const key of page.keys) if (key.name.endsWith("/latest")) {
-            const item = await env.CATALOG.get(key.name, "json");
-            if (item) manifests.push(item);
-          }
-          cursor = page.list_complete ? undefined : page.cursor;
-        } while (cursor);
-        return json({ applications: manifests }, 200);
-      }
+      if (/^\/v1\/applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|candidate|accepted|public|releases\/[a-f0-9]{64})$/.test(url.pathname) || url.pathname === "/v1/official-release" || url.pathname === "/v1/market" || /^\/v1\/application-allocation\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
+      if (request.method === "GET" && url.pathname === "/v1/applications") return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && url.pathname === "/v1/workshop") return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && url.pathname === "/v1/jules") {
         const operation = await request.clone().json() as { method?: string; path?: string };
@@ -88,7 +76,7 @@ async function readBlob(request: Request, env: Env, key: string): Promise<Respon
 }
 
 async function putCatalog(request: Request, env: Env): Promise<Response> {
-  if (!(await authorized(request, env.PUBLISH_TOKEN))) return json({ error: "unauthorized" }, 401);
+  if (!await authorized(request, env.PUBLISH_TOKEN) && !await authorized(request, env.OFFICIAL_PUBLISH_TOKEN)) return json({ error: "unauthorized" }, 401);
   const text = await request.text();
   if (text.length > 8_000_000) return json({ error: "catalog too large" }, 413);
   let objects: CatalogObject[];
@@ -282,39 +270,15 @@ export class Workshop extends DurableObject<Env> {
       if (path.startsWith("/v1/application-allocation/")) {
         const appId = path.split("/").pop()!;
         if (request.method === "POST") {
-          if (!await authorized(request, this.env.PUBLISH_TOKEN)) return json({ error: "unauthorized" }, 401);
+          if (!await authorized(request, this.env.PUBLISH_TOKEN) && !await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN)) return json({ error: "unauthorized" }, 401);
           return json({ appId, moduleBase: await this.allocate(appId) }, 200);
         }
         if (request.method !== "GET") return json({ error: "method" }, 405);
         const base = await this.ctx.storage.get<number>(`allocation:${appId}`);
         return base ? json({ appId, moduleBase: base }, 200) : json({ error: "请先在 Jolly 创建这个应用的心愿" }, 404);
       }
-      if (path === "/v1/market" && request.method === "GET") {
+      if ((path === "/v1/market" || path === "/v1/applications") && request.method === "GET") {
         const entries = [...(await this.ctx.storage.list<MarketEntry>({ prefix: "shared:" })).values()];
-        for (const appId of OFFICIAL_APPLICATIONS) if (!entries.some(entry => entry.manifest.appId === appId) && !await this.ctx.storage.get(`withdrawn:${appId}`)) {
-          const manifest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/latest`, "json");
-          if (manifest) entries.push({ manifest, title: manifest.title, summary: manifest.summary, authorId: OFFICIAL_ACCOUNT_ID, authorName: "紫金花官方", originalAppId: null });
-        }
-        // Local maintainer tools may publish directly through Wrangler KV instead of /v1/catalog.
-        // Resolve both paths from the same trusted catalog; user workshop builds never auto-share.
-        let cursor: string | undefined;
-        do {
-          const page = await this.env.CATALOG.list({ prefix: "v1/applications/", ...(cursor ? { cursor } : {}) });
-          for (const key of page.keys) {
-            const match = key.name.match(/^v1\/applications\/([a-z][a-z0-9-]{0,63})\/latest$/);
-            if (!match || await this.ctx.storage.get(`withdrawn:${match[1]}`)) continue;
-            const builtin = (OFFICIAL_APPLICATIONS as readonly string[]).includes(match[1]);
-            if (!builtin && await this.ctx.storage.get(`task:${match[1]}`)) continue;
-            const manifest = await this.env.CATALOG.get<ApplicationRelease & { originalAppId?: string }>(key.name, "json");
-            if (!manifest) continue;
-            const entry: MarketEntry = { manifest, title: manifest.title, summary: manifest.summary, authorId: OFFICIAL_ACCOUNT_ID, authorName: "紫金花官方", authorAvatarUrl: null, authorOfficial: true, originalAppId: manifest.originalAppId ?? null };
-            const prior = entries.findIndex(item => item.manifest.appId === manifest.appId);
-            if (prior >= 0) entries[prior] = entry; else entries.push(entry);
-            const stored = await this.ctx.storage.get<MarketEntry>(`shared:${manifest.appId}`);
-            if (stored?.authorId !== OFFICIAL_ACCOUNT_ID || stored.manifest.releaseId !== manifest.releaseId) await this.ctx.storage.put(`shared:${manifest.appId}`, entry);
-          }
-          cursor = page.list_complete ? undefined : page.cursor;
-        } while (cursor);
         for (const entry of entries) {
           if ((OFFICIAL_APPLICATIONS as readonly string[]).includes(entry.manifest.appId)) { entry.authorId = OFFICIAL_ACCOUNT_ID; entry.authorName = "紫金花官方"; entry.authorAvatarUrl = null; }
           entry.authorOfficial = entry.authorId === OFFICIAL_ACCOUNT_ID;
@@ -324,10 +288,10 @@ export class Workshop extends DurableObject<Env> {
           const profiles = await publicProfiles([...new Set(entries.map(entry => entry.authorId).filter((id): id is string => Boolean(id)))], this.env);
           for (const entry of entries) { const profile = entry.authorId ? profiles.get(entry.authorId) : undefined; if (profile) { entry.authorName = profile.name; entry.authorAvatarUrl = profile.avatarUrl; } }
         } catch { /* Keep published snapshots available if the account service is unavailable. */ }
-        return json({ applications: entries }, 200);
+        return json({ applications: path === "/v1/applications" ? entries.map(entry => entry.manifest) : entries }, 200);
       }
       if (new URL(request.url).pathname === "/v1/catalog") {
-        if (!await authorized(request, this.env.PUBLISH_TOKEN)) return json({ error: "unauthorized" }, 401);
+        if (!await authorized(request, this.env.PUBLISH_TOKEN) && !await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN)) return json({ error: "unauthorized" }, 401);
         const text = await request.clone().text();
         if (text.length > 8_000_000) return json({ error: "catalog too large" }, 413);
         const { objects } = JSON.parse(text) as { objects?: CatalogObject[] };
@@ -356,22 +320,39 @@ export class Workshop extends DurableObject<Env> {
             if (prior && prior !== item.body) return json({ error: "application release is immutable" }, 409);
           }
         }
-        const response = await putCatalog(request, this.env);
-        if (!response.ok) return response;
-        // Tool-published applications without a user workshop task belong to the official publisher.
-        // Workshop builds keep their owner and remain private until that owner explicitly shares.
-        for (const item of objects ?? []) {
-          if (typeof item.key !== "string" || typeof item.body !== "string") continue;
-          const match = item.key.match(/^v1\/applications\/([a-z][a-z0-9-]{0,63})\/latest$/);
-          if (!match || await this.ctx.storage.get(`task:${match[1]}`)) continue;
-          const manifest = JSON.parse(item.body) as ApplicationRelease & { originalAppId?: string };
-          const entry: MarketEntry = { manifest, title: manifest.title, summary: manifest.summary, authorId: OFFICIAL_ACCOUNT_ID, authorName: "紫金花官方", authorAvatarUrl: null, authorOfficial: true, originalAppId: manifest.originalAppId ?? null };
-          await this.ctx.storage.put(`shared:${manifest.appId}`, entry);
-          await this.ctx.storage.delete(`withdrawn:${manifest.appId}`);
-        }
-        return response;
+        return putCatalog(request, this.env);
       }
 
+      if (path === "/v1/official-release" && request.method === "POST") {
+        if (!await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN)) return json({ message: "官方公开发布需要维护者凭证" }, 403);
+        const { appId, releaseId } = await request.json() as { appId: string; releaseId: string };
+        if (!/^[a-z][a-z0-9-]{0,63}$/.test(appId) || !/^[a-f0-9]{64}$/.test(releaseId)) return json({ message: "请指定应用和不可变版本" }, 400);
+        if (await this.ctx.storage.get(`task:${appId}`)) return json({ message: "用户作品必须由作者收下并分享" }, 409);
+        const manifest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/releases/${releaseId}`, "json");
+        if (!manifest || manifest.appId !== appId || manifest.releaseId !== releaseId || manifest.source.dirty) return json({ message: "指定版本尚未上传或无效" }, 409);
+        const entry: MarketEntry = { manifest, title: manifest.title, summary: manifest.summary, authorId: OFFICIAL_ACCOUNT_ID, authorName: "紫金花官方", authorOfficial: true, originalAppId: null };
+        await this.ctx.storage.put({ [`accepted:${appId}`]: { releaseId }, [`shared:${appId}`]: entry });
+        await this.ctx.storage.delete(`withdrawn:${appId}`);
+        return json({ appId, accepted: releaseId, public: releaseId }, 200);
+      }
+      const versionRoute = path.match(/^\/v1\/applications\/([a-z][a-z0-9-]{0,63})\/(latest|candidate|accepted|public|releases\/[a-f0-9]{64})$/);
+      if (versionRoute && ["GET", "HEAD"].includes(request.method)) {
+        const [, appId, pointer] = versionRoute;
+        const shared = await this.ctx.storage.get<MarketEntry>(`shared:${appId}`);
+        const publicRelease = pointer === "public" || (pointer.startsWith("releases/") && pointer.slice(9) === shared?.manifest.releaseId);
+        if (publicRelease) return shared ? json(shared.manifest, 200) : json({ message: "应用还没有公开版本" }, 404);
+        const manager = await authorized(request, this.env.PUBLISH_TOKEN) || await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN);
+        const task = await this.ctx.storage.get<WorkshopTask>(`task:${appId}`);
+        if (!manager) {
+          const user = await authenticatedUser(request, this.env);
+          if (!user) return json({ message: "候选版本需要制作身份" }, 401);
+          if (!task || task.ownerId !== user.id || request.headers.get("X-Workshop-Token") !== task.token) return json({ message: "没有这个作品的制作权限" }, 403);
+        }
+        const accepted = task?.accepted ?? await this.ctx.storage.get<{ releaseId: string }>(`accepted:${appId}`);
+        const key = pointer === "accepted" ? accepted ? `releases/${accepted.releaseId}` : undefined : pointer === "candidate" ? "latest" : pointer;
+        const manifest = key ? await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/${key}`, "json") : null;
+        return manifest ? json(manifest, 200) : json({ message: "没有对应版本" }, 404);
+      }
       const input = await request.json() as { appId?: string; originalAppId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; applicationReleases?: Record<string, string> };
       const appId = input.appId;
       if (!appId || !/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return json({ message: "请指定目标应用" }, 400);
@@ -480,7 +461,7 @@ export class Workshop extends DurableObject<Env> {
       }
       if (!merged.merged) return json({ message: "合入尚未完成，请重试" }, 409);
       task.phase = "accepted"; task.accepted = { releaseId: latest.releaseId, commit: latest.source.commit, mergeCommit: merged.sha, pr: delivery!.number };
-      await this.ctx.storage.put(`task:${appId}`, task);
+      await this.ctx.storage.put({ [`task:${appId}`]: task, [`accepted:${appId}`]: { releaseId: task.accepted.releaseId } });
       return json({ merged: true, accepted: task.accepted }, 200);
     } catch (error) { return json({ message: error instanceof Error ? error.message : "工坊暂时不可用" }, 502); }
   }
