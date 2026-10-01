@@ -310,11 +310,16 @@ export class Workshop extends DurableObject<Env> {
     });
   }
   private async candidate(appId: string): Promise<ApplicationRelease | null> {
-    const stored = await this.ctx.storage.get<ApplicationRelease>(`candidate:${appId}`);
-    if (stored) return stored;
+    const stored = await this.ctx.storage.get<ApplicationRelease | null>(`candidate:${appId}`);
+    if (stored !== undefined) return stored;
     const legacy = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/latest`, "json");
-    if (legacy) await this.ctx.storage.put(`candidate:${appId}`, legacy);
-    return legacy;
+    return this.ctx.storage.transaction(async storage => {
+      const current = await storage.get<ApplicationRelease | null>(`candidate:${appId}`);
+      if (current !== undefined) return current;
+      // A tombstone prevents a partial first KV mirror from becoming a committed candidate.
+      await storage.put(`candidate:${appId}`, legacy ?? null);
+      return legacy;
+    });
   }
   private async applicationRelease(number: number, appId: string): Promise<ApplicationRelease> {
     let touched = false;
@@ -463,7 +468,7 @@ export class Workshop extends DurableObject<Env> {
         });
         const response = await putCatalog(request, this.env);
         if (!response.ok) return response;
-        await this.ctx.storage.put(Object.fromEntries([...candidates].map(([id, manifest]) => [`candidate:${id}`, manifest])));
+        if (candidates.size) await this.ctx.storage.put(Object.fromEntries([...candidates].map(([id, manifest]) => [`candidate:${id}`, manifest])));
         return response;
       }
 
@@ -554,6 +559,7 @@ export class Workshop extends DurableObject<Env> {
         const payload = JSON.parse(input.body ?? "{}");
         const prompt = typeof payload.prompt === "string" ? payload.prompt.trim() : "";
         if (!prompt) return json({ message: "请描述想做什么" }, 400);
+        if (prompt.length > 8000) return json({ message: "心愿最多 8000 个字符，请精简后再提交" }, 400);
         let original: ApplicationRelease | undefined;
         if (input.originalAppId) {
           const shared = await this.ctx.storage.get<MarketEntry>(`shared:${input.originalAppId}`);
@@ -615,6 +621,7 @@ export class Workshop extends DurableObject<Env> {
           if (!["COMPLETED", "PAUSED", "AWAITING_USER_FEEDBACK", "FAILED"].includes(current.state ?? "")) return json({ message: "这个应用正在制作，请等本轮完成" }, 409);
           if (current.state === "COMPLETED" && task.phase !== "accepted" && !task.repair) return json({ message: "请先加载并收下这轮作品，再修改这个应用" }, 409);
           const payload = JSON.parse(input.body ?? "{}");
+          if (typeof payload.prompt !== "string" || !payload.prompt.trim() || payload.prompt.length > 8000) return json({ message: "请提交 1 到 8000 个字符的修改需求" }, 400);
           if (!await this.quota(user.id, appId)) return json({ message: "制作额度已用完或同时制作作品过多，请稍后再试" }, 429);
           const previous = structuredClone(task);
           task.publishEpoch = crypto.randomUUID();
