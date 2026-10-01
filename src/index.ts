@@ -20,6 +20,15 @@ export default {
     const url = new URL(request.url);
     try {
       if (request.method === "PUT" && url.pathname === "/v1/catalog") return env.WORKSHOP.getByName("dynamic").fetch(request);
+      if (request.method === "GET" && url.pathname === "/v1/market") {
+        const applications = [];
+        // First release is curated. Workshop creations remain private until listed.
+        for (const id of ["jolly", "notepad", "pomodoro"]) {
+          const manifest = await env.CATALOG.get<Record<string, unknown>>(`v1/applications/${id}/latest`, "json");
+          if (manifest) applications.push({ manifest, authorId: null, authorName: "社区创作者", originalAppId: manifest.originalAppId ?? null });
+        }
+        return json({ applications }, 200);
+      }
       if (request.method === "GET" && url.pathname === "/v1/applications") {
         const manifests: unknown[] = [];
         let cursor: string | undefined;
