@@ -30,7 +30,11 @@ const friendlyName = () => {
 /** Account records are separate from workshop state and application business data. */
 export class Accounts extends DurableObject<AccountEnv> {
   private queue: Promise<unknown> = Promise.resolve();
-  fetch(request: Request): Promise<Response> { const next = this.queue.then(() => this.handle(request)); this.queue = next.catch(() => {}); return next; }
+  fetch(request: Request): Promise<Response> {
+    // Public profile reads must not wait for an outgoing login email.
+    if (new URL(request.url).pathname === "/internal/profiles") return this.handle(request);
+    const next = this.queue.then(() => this.handle(request)); this.queue = next.catch(() => {}); return next;
+  }
   private async session(request: Request): Promise<{ key: string; record: Session; user: User } | undefined> {
     const token = request.headers.get("Authorization")?.match(/^Bearer ([a-f0-9]{64})$/)?.[1]; if (!token) return;
     const key = `session:${await hash(token)}`; const record = await this.ctx.storage.get<Session>(key);
@@ -49,6 +53,12 @@ export class Accounts extends DurableObject<AccountEnv> {
   private async handle(request: Request): Promise<Response> {
     try {
       const path = new URL(request.url).pathname;
+      if (path === "/internal/authenticate") { const session = await this.session(request); return session ? json({ user: session.user }) : json({ message: "请先登录" }, 401); }
+      if (path === "/internal/profiles" && request.method === "POST") {
+        const { ids } = await request.json() as { ids: string[] };
+        const profiles = await Promise.all(ids.slice(0, 200).map(async id => { const user = await this.ctx.storage.get<User>(`user:${id}`); return user ? { id: user.id, name: user.name, avatarUrl: user.avatarUrl } : null; }));
+        return json({ profiles: profiles.filter(Boolean) });
+      }
       if (path === "/v1/auth/code" && request.method === "POST") {
         if (!this.env.RESEND_API_KEY || !this.env.MAIL_FROM) return json({ message: "登录邮件暂未开通，请稍后再试" }, 503);
         const body = await this.smallBody(request); const email = normalizeEmail(body.email);
@@ -126,4 +136,18 @@ export async function readAvatar(request: Request, env: Env): Promise<Response> 
   const object = await env.BLOBS.get(new URL(request.url).pathname.slice(1)); if (!object) return json({ message: "头像不存在" }, 404);
   const headers = new Headers(); object.writeHttpMetadata(headers); headers.set("X-Content-Type-Options", "nosniff"); headers.set("Cache-Control", "public,max-age=31536000,immutable"); headers.set("ETag", object.httpEtag);
   return new Response(request.method === "HEAD" ? null : object.body, { headers });
+}
+export async function authenticatedUser(request: Request, env: Env): Promise<User | null> {
+  const response = await env.ACCOUNTS.getByName("accounts").fetch(new Request("https://account.internal/internal/authenticate", { headers: { Authorization: request.headers.get("Authorization") || "" } }));
+  return response.ok ? ((await response.json()) as { user: User }).user : null;
+}
+export async function publicProfiles(ids: string[], env: Env): Promise<Map<string, Pick<User, "id" | "name" | "avatarUrl">>> {
+  const result = new Map<string, Pick<User, "id" | "name" | "avatarUrl">>();
+  for (let offset = 0; offset < ids.length; offset += 200) {
+    const response = await env.ACCOUNTS.getByName("accounts").fetch(new Request("https://account.internal/internal/profiles", { method: "POST", body: JSON.stringify({ ids: ids.slice(offset, offset + 200) }) }));
+    if (!response.ok) continue;
+    const { profiles } = await response.json() as { profiles: Pick<User, "id" | "name" | "avatarUrl">[] };
+    for (const profile of profiles) result.set(profile.id, profile);
+  }
+  return result;
 }
