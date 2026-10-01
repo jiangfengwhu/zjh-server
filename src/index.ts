@@ -201,9 +201,46 @@ function pathBeforeQuery(path: string): string {
 type ApplicationRelease = { appId: string; releaseId: string; title: string; summary: string; modules: { base: number }; source: { repository: string; commit: string; tree?: string; dirty: boolean } };
 type WorkshopTask = { branch?: string; branchCommit?: string; roundRelease?: string; dispatchVersion?: string; originalBranch?: string; ownerId: string; appId: string; session: string; token: string; phase: "working" | "ready" | "paused"; previousCommit?: string; repair?: boolean; publishEpoch?: string; requestId?: string; creationTitle?: string; creationRejected?: boolean; title?: string; wish?: string; originalAppId?: string; originalReleaseId?: string; originalCommit?: string; startedAt?: number };
 type CloudSession = { name?: string; state?: string; updateTime?: string; sourceContext?: { source?: string }; outputs?: { pullRequest?: { url?: string } }[] };
+type WorkSummary = { completed: boolean; state: string; delivery: string; message: string; application?: ApplicationRelease; stale?: boolean };
+function isRoundCandidate(task: WorkshopTask, application: ApplicationRelease | null): application is ApplicationRelease {
+  return Boolean(application && (task.roundRelease ? task.roundRelease === application.releaseId : application.source.commit !== task.previousCommit));
+}
+function summarizeWork(task: WorkshopTask, session: CloudSession, application: ApplicationRelease | null): WorkSummary {
+  if (task.phase === "paused") return { completed: false, state: "PAUSED", delivery: "unpublished", message: "已发送停止请求，可以继续这个应用" };
+  if (session.state !== "COMPLETED") return { completed: false, state: session.state ?? "QUEUED", delivery: "unpublished", message: ["FAILED", "PAUSED"].includes(session.state ?? "") ? "制作已暂停，可以继续处理" : "这轮作品仍在制作" };
+  const ready = isRoundCandidate(task, application);
+  return { completed: true, state: "COMPLETED", delivery: ready ? "update" : "unpublished", message: ready ? "作品已发布，可直接体验、继续修改或上架" : "等待本轮候选包发布", ...(ready ? { application } : {}) };
+}
 type MarketEntry = { manifest: ApplicationRelease; title: string; summary: string; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null; sourceCommit?: string; sourceBranch?: string };
 
 export class Workshop extends DurableObject<Env> {
+  private summaries = new Map<string, Promise<void>>();
+  private summarySlots = new KeyedQueue();
+  private summarySlot = 0;
+  private summaryKey(task: WorkshopTask, application: ApplicationRelease | null) { return JSON.stringify([task.appId, task.ownerId, task.session, task.publishEpoch, task.phase, task.previousCommit, task.roundRelease, application?.releaseId]); }
+  private refreshSummary(task: WorkshopTask, application: ApplicationRelease | null): Promise<void> {
+    const key = this.summaryKey(task, application);
+    const previous = this.summaries.get(key); if (previous) return previous;
+    const pending = this.summarySlots.run(`slot:${this.summarySlot++ % 4}`, async () => {
+      try {
+        if (!task.session) {
+          if (task.creationTitle) await this.queue.run(`app:${task.appId}`, async () => {
+            const current = await this.ctx.storage.get<WorkshopTask>(`task:${task.appId}`);
+            if (current?.ownerId === task.ownerId && !current.session) await this.recoverSession(current);
+          });
+          return;
+        }
+        const session = task.phase === "paused" ? { state: "PAUSED" } : await this.session(task.session);
+        await this.queue.run(`app:${task.appId}`, async () => {
+          const current = await this.ctx.storage.get<WorkshopTask>(`task:${task.appId}`);
+          const candidate = await this.candidate(task.appId);
+          if (!current || this.resetting || this.summaryKey(current, candidate) !== key) return;
+          await this.ctx.storage.put(`work-summary:${task.appId}`, { key, at: Date.now(), status: summarizeWork(current, session, candidate) });
+        });
+      } catch { /* Preserve the last result; the list marks expired data stale. */ }
+    }).finally(() => this.summaries.delete(key));
+    this.summaries.set(key, pending); return pending;
+  }
   private queue = new KeyedQueue();
   private resetting = false;
   private writes = new Set<Promise<Response>>();
@@ -303,7 +340,7 @@ export class Workshop extends DurableObject<Env> {
     if (task.session || !task.creationTitle) return task;
     let pageToken = "";
     for (let page = 0; page < 10; page++) {
-      const response = await fetch(`https://jules.googleapis.com/v1alpha/sessions?pageSize=100${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ""}`, { headers: { "X-Goog-Api-Key": this.env.JULES_API_KEY } });
+      const response = await fetch(`https://jules.googleapis.com/v1alpha/sessions?pageSize=100${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ""}`, { headers: { "X-Goog-Api-Key": this.env.JULES_API_KEY }, signal: AbortSignal.timeout(6000) });
       if (!response.ok) return task;
       const result = await response.json() as { sessions?: CloudSession[]; nextPageToken?: string };
       const found = result.sessions?.find(session => (session as CloudSession & { title?: string }).title === task.creationTitle && session.sourceContext?.source === PLUGIN_SOURCE);
@@ -314,7 +351,7 @@ export class Workshop extends DurableObject<Env> {
   }
   private async session(name: string): Promise<CloudSession> {
     if (!/^sessions\/[A-Za-z0-9_-]{1,128}$/.test(name)) throw new Error("Session 记录不完整");
-    const response = await fetch(`https://jules.googleapis.com/v1alpha/${name}`, { headers: { "X-Goog-Api-Key": this.env.JULES_API_KEY } });
+    const response = await fetch(`https://jules.googleapis.com/v1alpha/${name}`, { headers: { "X-Goog-Api-Key": this.env.JULES_API_KEY }, signal: AbortSignal.timeout(6000) });
     if (!response.ok) throw new Error("暂时无法连接这个应用的 session");
     const session = await response.json() as CloudSession;
     if (session.sourceContext?.source !== PLUGIN_SOURCE) throw new Error("Session 仓库不匹配");
@@ -344,6 +381,8 @@ export class Workshop extends DurableObject<Env> {
     return await this.ctx.storage.get<ApplicationRelease>(`candidate:${appId}`) ?? null;
   }
   private async recordBranch(task: WorkshopTask, session: CloudSession, application: ApplicationRelease) {
+    const proof = await this.ctx.storage.get<{ commit: string; tree?: string }>(`source-proof:${task.appId}:${application.releaseId}`);
+    if (task.branch && proof?.commit === task.branchCommit && (proof.commit === application.source.commit || Boolean(application.source.tree && proof.tree === application.source.tree))) return;
     const urls = session.outputs?.map(output => output.pullRequest?.url).filter((url): url is string => /^https:\/\/github\.com\/jiangfengwhu\/zjh-plugin\/pull\/[0-9]+$/.test(url ?? "")) ?? [];
     for (const url of urls.reverse()) {
       const pr = await this.github(`pulls/${Number(url.split("/").pop())}`);
@@ -357,7 +396,7 @@ export class Workshop extends DurableObject<Env> {
   }
   private async delivery(task: WorkshopTask, _session: CloudSession) {
     const application = await this.candidate(task.appId);
-    if (!application || (task.roundRelease ? task.roundRelease !== application.releaseId : application.source.commit === task.previousCommit)) return undefined;
+    if (!isRoundCandidate(task, application)) return undefined;
     try { await this.recordBranch(task, _session, application); } catch { /* A candidate is usable without PR metadata or GitHub availability. */ }
     return { ready: true, application, message: "" };
   }
@@ -522,10 +561,28 @@ export class Workshop extends DurableObject<Env> {
       if (path === "/v1/works" && request.method === "GET") {
         const user = await authenticatedUser(request, this.env); if (!user) return json({ message: "请先登录" }, 401);
         const tasks = [...(await this.ctx.storage.list<WorkshopTask>({ prefix: `owner:${user.id}:` })).values()];
-        for (let index = 0; index < tasks.length; index++) {
-          if (!tasks[index].session && tasks[index].creationTitle) tasks[index] = await this.queue.run(`app:${tasks[index].appId}`, async () => this.recoverSession((await this.ctx.storage.get<WorkshopTask>(`task:${tasks[index].appId}`))!));
+        const force = new URL(request.url).searchParams.get("refresh") === "1";
+        const entries = await Promise.all(tasks.filter(task => task.ownerId === user.id).map(async task => {
+          const [application, shared, cached] = await Promise.all([this.candidate(task.appId), this.ctx.storage.get<MarketEntry>(`shared:${task.appId}`), this.ctx.storage.get<{ key: string; at: number; status: WorkSummary }>(`work-summary:${task.appId}`)]);
+          const valid = cached?.key === this.summaryKey(task, application);
+          const fresh = valid && Date.now() - cached.at < (cached.status.completed && cached.status.application ? 300000 : 20000);
+          return { task, application, shared: shared?.authorId === user.id ? shared : null, cached: valid ? cached : undefined, pending: force || !fresh ? this.refreshSummary(task, application) : undefined };
+        }));
+        const pending = Promise.all(entries.map(entry => entry.pending)); this.ctx.waitUntil(pending);
+        // Bound the whole list wait, rather than spending a timeout on every work.
+        if (force || entries.some(entry => !entry.cached)) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          await Promise.race([pending, new Promise<void>(resolve => { timer = setTimeout(resolve, 6500); })]);
+          if (timer) clearTimeout(timer);
         }
-        return json({ works: tasks.map(task => ({ appId: task.appId, ownerId: task.ownerId, session: task.session, approvalToken: task.token, title: task.title ?? task.appId, wish: task.wish ?? "", startedAt: task.startedAt, originalAppId: task.originalAppId, originalReleaseId: task.originalReleaseId, originalCommit: task.originalCommit, branch: task.branch, phase: task.phase })) }, 200);
+        const works = await Promise.all(entries.map(async ({ task, application, shared, cached: previous }) => {
+          const cached = await this.ctx.storage.get<{ key: string; at: number; status: WorkSummary }>(`work-summary:${task.appId}`);
+          const valid = cached?.key === this.summaryKey(task, application);
+          const status = valid ? cached.status : summarizeWork(task, { state: task.phase === "ready" ? "COMPLETED" : "QUEUED" }, application);
+          const ttl = status.completed && status.application ? 300000 : 20000;
+          return { appId: task.appId, ownerId: task.ownerId, session: task.session, approvalToken: task.token, title: task.title ?? task.appId, wish: task.wish ?? "", startedAt: task.startedAt, originalAppId: task.originalAppId, originalReleaseId: task.originalReleaseId, originalCommit: task.originalCommit, branch: task.branch, phase: task.phase, status: { ...status, stale: !valid || Date.now() - cached.at >= ttl || force && cached.at === previous?.at }, sharing: { shared, application }, updatedAt: valid ? cached.at : null };
+        }));
+        const response = json({ works }, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
       }
       const input = await request.json() as { appId?: string; originalAppId?: string; originalReleaseId?: string; requestId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; applicationReleases?: Record<string, string> };
       const appId = input.appId;
