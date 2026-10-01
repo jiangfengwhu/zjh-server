@@ -7,6 +7,7 @@
 | 路径 | 职责 |
 | --- | --- |
 | src/index.ts | HTTP 路由、清单权限校验与 Jules 代理 |
+| src/accounts.ts | 邮箱验证码、登录凭证与个人资料 |
 | wrangler.jsonc | Worker、域名路由、KV/R2 绑定和迁移声明 |
 | worker-configuration.d.ts | Wrangler 生成的运行环境类型 |
 
@@ -35,3 +36,18 @@ Jules 代理仅暴露并允许 sources/github/jiangfengwhu/zjh-dynamic 会话。
 云端环境只注入动态上传凭证和清单发布 token，不注入 JULES_API_KEY、Cloudflare 管理 token 或本机 Wrangler 登录信息。通过 /v1/catalog 的动态发布 token 不能写 /v1/runtime；直接 R2/KV 管理凭证的权限需要维护者另外配置，不能把 API 的限制等同于管理凭证的限制。
 
 纯文档修改无需部署 Worker。
+
+## 邮箱登录（Resend）
+
+在 Resend 验证发件域名后，在本仓库终端分别执行以下命令，通过交互输入配置 Cloudflare Secret，不要将值写入代码或提交文件：
+
+```powershell
+npx wrangler secret put RESEND_API_KEY
+npx wrangler secret put MAIL_FROM
+```
+
+`MAIL_FROM` 格式为 `紫金花 <login@你的已验证域名>`。API Key 仅需发送邮件权限。缺少任一配置时，发送验证码接口返回服务暂未开通，不生成假验证码。
+
+`POST /v1/auth/code` 发送验证码；`POST /v1/auth/verify` 登录或自动创建账号，返回用户资料和 90 天有效的随机凭证。手机将凭证保存在 Keychain/Android Keystore 安全存储中。验证码有效期 10 分钟、最多尝试 5 次、重发间隔 60 秒，并限制每个邮箱、IP 和全局的发送频率。服务端只保存验证码摘要与凭证摘要。
+
+`GET/PATCH /v1/account` 读取资料或修改昵称；`PUT/DELETE /v1/account/avatar` 上传或恢复默认头像；`POST /v1/auth/logout` 撤销当前登录凭证。这些接口须提供 Bearer 凭证。昵称为 1–24 个字符，头像只接受不超过 1 MB 的 JPEG、PNG、WebP 图片，存入 R2 不可变地址。个人资料在账号存储中独立管理，应用数据与工坊任务仍保持现有管理方式。
