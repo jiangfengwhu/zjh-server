@@ -3,9 +3,8 @@ import { DurableObject } from "cloudflare:workers";
 /** 清单类的键：整套清单和 vendor 的模块编号表。格式变了就换前缀（v3/…），旧版本的手机继续读旧前缀。 */
 const JSON_KEY = /^v1\/(?:release|runtime|maps\/vendor\.json|applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|releases\/[a-f0-9]{64}))$/;
 const DYNAMIC_JSON_KEY = /^v1\/(?:release|maps\/vendor\.json|applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|releases\/[a-f0-9]{64}))$/;
-const DYNAMIC_SOURCE = "sources/github/jiangfengwhu/zjh-dynamic";
 const PLUGIN_SOURCE = "sources/github/jiangfengwhu/zjh-plugin";
-const allowedSource = (source?: string) => source === PLUGIN_SOURCE || source === DYNAMIC_SOURCE;
+const allowedSource = (source?: string) => source === PLUGIN_SOURCE;
 
 /** 包体的键：vendor、app、插件 DEX，全部按内容哈希命名，写入后不再改。 */
 const BLOB_KEY = /^v1\/(?:vendor|app|sdk)\/[a-f0-9]{64}$|^v1\/plugins\/[a-z0-9-]+\/[a-f0-9]{64}$/;
@@ -20,15 +19,7 @@ export default {
     const url = new URL(request.url);
     try {
       if (request.method === "PUT" && url.pathname === "/v1/catalog") return env.WORKSHOP.getByName("dynamic").fetch(request);
-      if (request.method === "GET" && url.pathname === "/v1/market") {
-        const applications = [];
-        // First release is curated. Workshop creations remain private until listed.
-        for (const id of ["jolly", "notepad", "pomodoro"]) {
-          const manifest = await env.CATALOG.get<Record<string, unknown>>(`v1/applications/${id}/latest`, "json");
-          if (manifest) applications.push({ manifest, authorId: null, authorName: "社区创作者", originalAppId: manifest.originalAppId ?? null });
-        }
-        return json({ applications }, 200);
-      }
+      if (url.pathname === "/v1/market" || /^\/v1\/application-allocation\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "GET" && url.pathname === "/v1/applications") {
         const manifests: unknown[] = [];
         let cursor: string | undefined;
@@ -44,8 +35,8 @@ export default {
       }
       if (request.method === "POST" && url.pathname === "/v1/workshop") return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && url.pathname === "/v1/jules") {
-        const operation = await request.clone().json() as { method?: string };
-        if (operation.method !== "GET") return env.WORKSHOP.getByName("dynamic").fetch(request);
+        const operation = await request.clone().json() as { method?: string; path?: string };
+        if (operation.path !== "/v1alpha/sources") return env.WORKSHOP.getByName("dynamic").fetch(request);
       }
       if (request.method === "POST" && url.pathname === "/v1/jules") return proxyJules(request, env);
       if (request.method !== "GET" && request.method !== "HEAD") return json({ error: "not found" }, 404);
@@ -180,7 +171,7 @@ function julesPathAllowed(method: string, path: string): boolean {
   if (query.length > 0 && !/^pageSize=[1-9][0-9]{0,2}$/.test(query)) return false;
   if (method === "GET" && bare === "/v1alpha/sources") return true;
   if (method === "POST" && bare === "/v1alpha/sessions" && query.length === 0) return true;
-  if (/^\/v1alpha\/sessions\/[A-Za-z0-9_-]{1,128}$/.test(bare) && query.length === 0 && (method === "GET" || method === "DELETE")) {
+  if (/^\/v1alpha\/sessions\/[A-Za-z0-9_-]{1,128}$/.test(bare) && query.length === 0 && method === "GET") {
     return true;
   }
   return /^\/v1alpha\/sessions\/[A-Za-z0-9_-]{1,128}:(approvePlan|sendMessage)$/.test(bare) && query.length === 0 && method === "POST";
@@ -209,71 +200,98 @@ function pathBeforeQuery(path: string): string {
   const index = path.indexOf("?");
   return index < 0 ? path : path.slice(0, index);
 }
-type WorkshopTask = { session: string; token: string; legacy?: boolean };
+type ApplicationRelease = { appId: string; releaseId: string; title: string; summary: string; modules: { base: number }; source: { repository: string; commit: string; dirty: boolean } };
+type Accepted = { releaseId: string; commit: string; mergeCommit: string; pr: number };
+type WorkshopTask = { appId: string; session: string; token: string; phase: "working" | "review" | "accepted" | "paused"; previousCommit?: string; repair?: boolean; accepted?: Accepted };
 type CloudSession = { name?: string; state?: string; sourceContext?: { source?: string }; outputs?: { pullRequest?: { url?: string } }[] };
-type WorkshopRelease = { id: string; source: { commit: string; dirty: boolean; buildId?: string } };
-type ApplicationRelease = { appId: string; releaseId: string; source: { repository?: string; commit: string; dirty: boolean } };
+type MarketEntry = { manifest: ApplicationRelease; title: string; summary: string; authorId: null; authorName: string; originalAppId: string | null };
 
-// 串行保存工坊心愿；合入权限只由用户的确认请求触发。
 export class Workshop extends DurableObject<Env> {
   private queue: Promise<unknown> = Promise.resolve();
-
   fetch(request: Request): Promise<Response> {
-    const next = this.queue.then(() => this.handle(request));
-    this.queue = next.catch(() => {});
-    return next;
+    const next = this.queue.then(() => this.handle(request)); this.queue = next.catch(() => {}); return next;
   }
-
   private async session(name: string): Promise<CloudSession> {
-    if (!/^sessions\/[A-Za-z0-9_-]{1,128}$/.test(name)) throw new Error("这份心愿的记录不完整");
+    if (!/^sessions\/[A-Za-z0-9_-]{1,128}$/.test(name)) throw new Error("Session 记录不完整");
     const response = await fetch(`https://jules.googleapis.com/v1alpha/${name}`, { headers: { "X-Goog-Api-Key": this.env.JULES_API_KEY } });
-    if (!response.ok) throw new Error("暂时接不上这份心愿，请稍后再试");
+    if (!response.ok) throw new Error("暂时无法连接这个应用的 session");
     const session = await response.json() as CloudSession;
-    if (!allowedSource(session.sourceContext?.source)) throw new Error("这份心愿不属于当前工坊");
+    if (session.sourceContext?.source !== PLUGIN_SOURCE) throw new Error("Session 仓库不匹配");
     return session;
   }
-
-  private async github(path: string, method = "GET", body?: unknown, repository = "jiangfengwhu/zjh-plugin"): Promise<any> {
-    if (!this.env.GITHUB_MERGE_TOKEN) throw new Error("工坊的收下功能还未配置好，请联系维护者");
-    const response = await fetch(`https://api.github.com/repos/${repository}/${path}`, {
-      method,
-      headers: { Authorization: `Bearer ${this.env.GITHUB_MERGE_TOKEN}`, Accept: "application/vnd.github+json", "User-Agent": "zijinhua-workshop", "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json" },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    if (!response.ok) throw new Error(response.status === 409 || response.status === 405 ? "这份心愿的代码有了变化，暂时不能收下，请联系维护者处理" : "暂时没能收下这份心愿，请稍后再试");
-    return response.json();
+  private async allocate(appId: string): Promise<number> {
+    const existing = await this.ctx.storage.get<number>(`allocation:${appId}`); if (existing) return existing;
+    const fixed: Record<string, number> = { jolly: 2000000, notepad: 2100000, pomodoro: 2200000 };
+    const prior = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/latest`, "json");
+    let base = fixed[appId] ?? prior?.modules.base;
+    if (!base) {
+      base = await this.ctx.storage.get<number>("allocation:next") ?? 2300000;
+      while (await this.ctx.storage.get<string>(`application-range:${base}`)) base += 100000;
+      if (base + 100000 >= 2 ** 31) throw new Error("应用模块范围已用尽");
+      await this.ctx.storage.put("allocation:next", base + 100000);
+    }
+    const owner = await this.ctx.storage.get<string>(`application-range:${base}`);
+    if (owner && owner !== appId) throw new Error("应用模块范围冲突");
+    await this.ctx.storage.put(`application-range:${base}`, appId);
+    await this.ctx.storage.put(`allocation:${appId}`, base); return base;
   }
-
-  private async release(): Promise<WorkshopRelease> {
-    const release = await this.env.CATALOG.get<WorkshopRelease>("v1/release", "json");
-    if (!release?.id) throw new Error("新作品还未送到，请稍后再试");
-    return release;
-  }
-
-  private async applicationRelease(number: string, repository: string): Promise<ApplicationRelease | undefined> {
-    const ids = new Set<string>();
+  private async applicationRelease(number: number, appId: string): Promise<ApplicationRelease> {
+    let touched = false;
     for (let page = 1; page <= 30; page++) {
-      const files = await this.github(`pulls/${number}/files?per_page=100&page=${page}`, "GET", undefined, repository) as Array<{ filename: string }>;
+      const files = await this.github(`pulls/${number}/files?per_page=100&page=${page}`) as Array<{ filename: string }>;
       for (const file of files) {
-        const id = file.filename.match(repository === "jiangfengwhu/zjh-plugin" ? /^apps\/([a-z][a-z0-9-]{0,63})\// : /^packages\/features\/([a-z][a-z0-9-]{0,63})\//)?.[1];
-        if (id && id !== "src" && id !== "avatars") ids.add(id);
+        if (file.filename.startsWith(`apps/${appId}/`)) touched = true;
+        else if (file.filename !== "package-lock.json") throw new Error("这份 PR 修改了目标应用之外的文件，请拆分交付");
       }
       if (files.length < 100) break;
     }
-    if (ids.size > 1) throw new Error("一次制作只能交付一个应用，请联系维护者拆分发布");
-    const id = [...ids][0];
-    if (!id) {
-      if (repository === "jiangfengwhu/zjh-plugin") throw new Error("这次制作没有交付应用，请联系维护者处理");
-      return undefined;
-    }
-    const application = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${id}/latest`, "json");
-    if (!application) return { appId: id, releaseId: "", source: { commit: "", dirty: true } };
-    if (application.source.repository && application.source.repository !== repository) throw new Error("应用发布仓库与交付记录不一致");
-    return application;
+    if (!touched) throw new Error("这份 PR 没有交付目标应用");
+    const app = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/latest`, "json");
+    if (!app || app.source.repository !== "jiangfengwhu/zjh-plugin") throw new Error("这个应用还没有发布本轮作品");
+    return app;
   }
-
+  private async delivery(task: WorkshopTask, session: CloudSession) {
+    const urls = session.outputs?.map(output => output.pullRequest?.url).filter((url): url is string => /^https:\/\/github\.com\/jiangfengwhu\/zjh-plugin\/pull\/[0-9]+$/.test(url ?? "")) ?? [];
+    for (const url of urls.reverse()) {
+      const number = Number(url.split("/").pop());
+      const pr = await this.github(`pulls/${number}`);
+      if (pr.head?.sha === task.previousCommit || (task.accepted && number === task.accepted.pr && task.phase !== "accepted")) continue;
+      const application = await this.applicationRelease(number, task.appId);
+      if (pr.base?.ref !== "main" || pr.head?.repo?.full_name !== "jiangfengwhu/zjh-plugin" || pr.draft || (!pr.merged && pr.state !== "open")) throw new Error("这份 PR 尚未准备好交付");
+      if (application.source.dirty || application.source.commit !== pr.head.sha) return { ready: false, message: "等待从当前 PR 提交重新发包", application, pr, number, url };
+      // Unrelated applications can merge first. Only this app and shared lock conflicts block delivery.
+      if (!pr.merged) {
+        const comparison = await this.github(`compare/${pr.head.sha}...main`);
+        if ((comparison.files ?? []).some((file: { filename: string }) => file.filename.startsWith(`apps/${task.appId}/`)) || pr.mergeable === false) {
+          task.repair = true; await this.ctx.storage.put(`task:${task.appId}`, task);
+          return { ready: false, message: "底稿有冲突，请在这个 session 继续：同步 main，处理冲突后重新发包", application, pr, number, url };
+        }
+      }
+      return { ready: true, application, pr, number, url, message: "" };
+    }
+    return undefined;
+  }
   private async handle(request: Request): Promise<Response> {
     try {
+      const path = new URL(request.url).pathname;
+      if (path.startsWith("/v1/application-allocation/")) {
+        const appId = path.split("/").pop()!;
+        if (request.method === "POST") {
+          if (!await authorized(request, this.env.PUBLISH_TOKEN)) return json({ error: "unauthorized" }, 401);
+          return json({ appId, moduleBase: await this.allocate(appId) }, 200);
+        }
+        if (request.method !== "GET") return json({ error: "method" }, 405);
+        const base = await this.ctx.storage.get<number>(`allocation:${appId}`);
+        return base ? json({ appId, moduleBase: base }, 200) : json({ error: "请先在 Jolly 创建这个应用的心愿" }, 404);
+      }
+      if (path === "/v1/market" && request.method === "GET") {
+        const entries = [...(await this.ctx.storage.list<MarketEntry>({ prefix: "shared:" })).values()];
+        for (const appId of ["jolly", "notepad", "pomodoro"]) if (!entries.some(entry => entry.manifest.appId === appId)) {
+          const manifest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/latest`, "json");
+          if (manifest) entries.push({ manifest, title: manifest.title, summary: manifest.summary, authorId: null, authorName: "社区创作者", originalAppId: null });
+        }
+        return json({ applications: entries }, 200);
+      }
       if (new URL(request.url).pathname === "/v1/catalog") {
         if (!await authorized(request, this.env.PUBLISH_TOKEN)) return json({ error: "unauthorized" }, 401);
         const text = await request.clone().text();
@@ -306,101 +324,101 @@ export class Workshop extends DurableObject<Env> {
         }
         return putCatalog(request, this.env);
       }
-      let task = await this.ctx.storage.get<WorkshopTask>("active");
-      const input = await request.clone().json() as { action?: string; session?: string; token?: string; buildId?: string; applicationReleases?: Record<string, string>; method?: string; path?: string; body?: string; approvalToken?: string };
-      if (new URL(request.url).pathname === "/v1/jules") {
-        if (input.method === "POST" && input.path === "/v1alpha/sessions") {
-          if (task) return json({ message: "先收下工坊里这份心愿，再开始下一个吧" }, 409);
-          const response = await proxyJules(request, this.env);
-          if (!response.ok) return response;
-          const session = await response.json() as CloudSession;
-          if (!session.name) return json({ message: "这份心愿暂时没有接好，请稍后再试" }, 502);
-          task = { session: session.name, token: crypto.randomUUID(), legacy: !input.buildId };
-          await this.ctx.storage.put("active", task);
-          return json({ ...session, approvalToken: task.token }, 200);
-        }
+
+      const input = await request.json() as { appId?: string; originalAppId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; applicationReleases?: Record<string, string> };
+      const appId = input.appId;
+      if (!appId || !/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return json({ message: "请指定目标应用" }, 400);
+      let task = await this.ctx.storage.get<WorkshopTask>(`task:${appId}`);
+      if (path === "/v1/jules" && input.method === "POST" && input.path === "/v1alpha/sessions") {
+        if (task && input.approvalToken !== task.token) return json({ message: "这个应用的 session 凭据不匹配" }, 403);
+        if (task?.session) return json({ message: "这个应用已有 session，请继续它；新应用才创建新 session" }, 409);
+        const moduleBase = await this.allocate(appId);
+        const payload = JSON.parse(input.body ?? "{}");
+        const prompt = typeof payload.prompt === "string" ? payload.prompt.trim() : "";
+        if (!prompt) return json({ message: "请描述想做什么" }, 400);
+        const origin = input.originalAppId && /^[a-z][a-z0-9-]{0,63}$/.test(input.originalAppId) ? `基于原作 ${input.originalAppId}：复制其 src 和 assets 到新应用目录，保持新 appId 和平台 moduleBase，application.json 记录 originalAppId=${input.originalAppId}，不修改原作。` : "";
+        payload.prompt = `目标应用：${appId}；只交付 apps/${appId}/。新建时执行 npm run init:application -- ${appId}，平台分配 moduleBase=${moduleBase}。既有应用就在该目录修改。${origin} 用户需求：\n${prompt}`;
+        const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
+        if (!response.ok) return response;
+        const session = await response.json() as CloudSession;
+        if (!session.name) return json({ message: "Jules 未返回 session" }, 502);
+        task = { ...task, appId, session: session.name, token: task?.token ?? crypto.randomUUID(), phase: "working", previousCommit: task?.accepted?.commit };
+        await this.ctx.storage.put(`task:${appId}`, task);
+        return json({ ...session, approvalToken: task.token }, 200);
+      }
+      if (!task || (input.token ?? input.approvalToken) !== task.token) return json({ message: "这个应用的 session 凭据不匹配" }, 403);
+      if (path === "/v1/market") {
+        const accepted = task.accepted;
+        if (!accepted || input.releaseId !== accepted.releaseId) return json({ message: "只有已确认收下的版本可以分享，请先收下这次作品" }, 409);
+        const manifest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/releases/${accepted.releaseId}`, "json");
+        if (!manifest || manifest.source.commit !== accepted.commit) return json({ message: "收下的版本尚未送到，请稍后重试" }, 409);
+        const title = input.title?.trim() || manifest.title; const summary = input.summary?.trim() || manifest.summary;
+        if (title.length > 60 || summary.length > 300) return json({ message: "名称最多 60 字，介绍最多 300 字" }, 400);
+        const entry = { manifest, title, summary, authorId: null, authorName: "社区创作者", originalAppId: (manifest as ApplicationRelease & { originalAppId?: string }).originalAppId ?? null };
+        await this.ctx.storage.put(`shared:${appId}`, entry);
+        return json({ shared: true, releaseId: accepted.releaseId }, 200);
+      }
+      if (path === "/v1/jules") {
         const name = input.path?.match(/^\/v1alpha\/(sessions\/[A-Za-z0-9_-]+)/)?.[1];
-        if (name && (!task || task.session !== name || input.approvalToken !== task.token)) return json({ message: "请从当前工坊继续这份心愿" }, 403);
-        if (name && input.method === "POST" && input.path?.endsWith(":sendMessage")) {
-          const session = await this.session(name);
-          if (session.state !== "AWAITING_USER_FEEDBACK" && session.state !== "PAUSED") return json({ message: "先体验并收下这份心愿，再开始下一个吧" }, 409);
+        if (name !== task.session) return json({ message: "Session 不属于这个应用" }, 403);
+        if (input.method === "POST" && input.path?.endsWith(":sendMessage")) {
+          const current = await this.session(task.session);
+          if (!["COMPLETED", "PAUSED", "AWAITING_USER_FEEDBACK", "FAILED"].includes(current.state ?? "")) return json({ message: "这个应用正在制作，请等本轮完成" }, 409);
+          if (current.state === "COMPLETED" && task.phase !== "accepted" && !task.repair) return json({ message: "请先加载并收下这轮作品，再修改这个应用" }, 409);
+          const payload = JSON.parse(input.body ?? "{}");
+          payload.prompt = `继续修改应用 ${appId}，只改 apps/${appId}/ 与所需根锁文件。已收下的 PR 不再续写：从 origin/main 同步后创建新的任务分支和 PR。修复交付冲突时同步 main 后重新发布当前 PR。用户需求：\n${payload.prompt ?? ""}`;
+          const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
+          if (response.ok) { task.previousCommit = task.phase === "accepted" ? task.accepted?.commit : task.previousCommit; task.phase = "working"; task.repair = false; await this.ctx.storage.put(`task:${appId}`, task); }
+          return response;
         }
-        if (name && input.method === "DELETE") {
-          const session = await this.session(name);
-          if (session.state === "COMPLETED") return json({ message: "这份心愿已做好，体验后收下才能开始下一个" }, 409);
+        return proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify(input) }), this.env);
+      }
+      if (input.session !== task.session) return json({ message: "Session 不属于这个应用" }, 403);
+      const session = await this.session(task.session);
+      if (input.action === "stop") {
+        if (session.state === "COMPLETED" && task.phase !== "accepted" && !task.repair) return json({ message: "请先收下这轮作品" }, 409);
+        if (!["COMPLETED", "PAUSED", "FAILED"].includes(session.state ?? "")) {
+          const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ method: "POST", path: `/v1alpha/${task.session}:sendMessage`, body: JSON.stringify({ prompt: "停止当前制作，不再修改、发布或创建 PR，等待我的下一条需求。" }) }) }), this.env);
+          if (!response.ok) return response;
         }
-        const response = await proxyJules(request, this.env);
-        if (response.ok && input.method === "DELETE") await this.ctx.storage.delete("active");
-        return response;
+        task.phase = "paused"; task.repair = true;
+        const latest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/latest`, "json");
+        task.previousCommit = latest?.source.commit ?? task.previousCommit;
+        await this.ctx.storage.put(`task:${appId}`, task);
+        return json({ stopped: true }, 200);
       }
-      if (!input.session) return json({ message: "这份心愿的记录不完整" }, 400);
-      const confirmed = await this.ctx.storage.get<WorkshopTask & { mergeCommit: string }>("confirmed");
-      if (confirmed?.session === input.session && confirmed.token === input.token) return json({ merged: true, mergeCommit: confirmed.mergeCommit }, 200);
-      const session = await this.session(input.session);
-      // 首次升级时接回已有会话；之后的会话由创建入口登记。
-      if (!task) {
-        if (input.action !== "status") return json({ message: "请先接回这份心愿" }, 409);
-        task = { session: input.session, token: crypto.randomUUID() };
-        await this.ctx.storage.put("active", task);
-      } else if (task.session === input.session && task.legacy && !input.token && input.action === "status") {
-        task.legacy = false;
-        await this.ctx.storage.put("active", task);
-      } else if (task.session !== input.session || task.token !== input.token) {
-        return json({ message: "工坊里还有另一份心愿，请先完成它" }, 409);
-      }
-      const repository = session.sourceContext?.source === PLUGIN_SOURCE ? "jiangfengwhu/zjh-plugin" : "jiangfengwhu/zjh-dynamic";
-      const prUrl = session.outputs?.map(output => output.pullRequest?.url).find(url => url?.startsWith(`https://github.com/${repository}/pull/`) && /^[0-9]+$/.test(url.split("/").pop() ?? ""));
+      if (task.phase === "paused") return json({ completed: false, merged: false, state: "PAUSED", accepted: task.accepted, message: "已发送停止请求，可以继续这个应用" }, 200);
+      if (task.phase === "accepted") return json({ completed: true, merged: true, state: session.state, accepted: task.accepted, message: "这轮作品已收下，可继续修改同一个应用" }, 200);
+      if (session.state !== "COMPLETED") return json({ completed: false, merged: false, state: session.state, delivery: "unpublished", message: "这轮作品仍在制作" }, 200);
+      const delivery = await this.delivery(task, session);
+      const ready = delivery?.ready === true;
+      if (!ready) { task.repair = true; await this.ctx.storage.put(`task:${appId}`, task); }
+      const loaded = ready && input.applicationReleases?.[appId] === delivery!.application.releaseId;
       if (input.action === "status") {
-        if (session.state === "FAILED") await this.ctx.storage.delete("active");
-        let delivery = "unpublished";
-        let message = "代码已完成，新作品尚未发布，请等待发布后再加载。";
-        if (session.state === "COMPLETED" && prUrl) {
-          const pr = await this.github(`pulls/${prUrl.split("/").pop()}`, "GET", undefined, repository);
-          const application = await this.applicationRelease(prUrl.split("/").pop()!, repository);
-          const release = application ? { id: application.releaseId, source: application.source } : await this.release();
-          if (pr.base?.ref !== "main" || pr.head?.repo?.full_name !== repository || (!pr.merged && (pr.state !== "open" || pr.draft))) {
-            delivery = "blocked";
-            message = "这份作品的交付记录未准备好，请联系维护者处理。";
-          } else if (!release.source.dirty && release.source.commit === pr.head?.sha) {
-            const comparison = pr.merged ? undefined : await this.github(`compare/main...${pr.head.sha}`, "GET", undefined, repository);
-            if (comparison && comparison.status !== "ahead" && comparison.status !== "identical") {
-              delivery = "blocked";
-              message = "工坊的底稿有了更新，请联系维护者同步后重新发布。";
-            } else {
-              delivery = application
-                ? input.applicationReleases?.[application.appId] === application.releaseId ? "loaded" : "update"
-                : input.buildId && (release.source as WorkshopRelease["source"]).buildId === input.buildId ? "loaded" : "update";
-              message = delivery === "loaded" ? "正在运行这次作品，体验满意后可以确认收下。" : "这次作品已发布，请加载后体验，再确认收下。";
-              return json({ state: session.state, token: task.token, completed: true, prUrl, merged: false, delivery, message, ...(application ? { application } : {}) }, 200);
-            }
-          }
-        }
-        return json({ state: session.state, token: task.token, completed: session.state === "COMPLETED", prUrl: prUrl ?? "", merged: false, delivery, message }, 200);
+        task.phase = "review"; await this.ctx.storage.put(`task:${appId}`, task);
+        return json({ completed: true, merged: false, state: session.state, delivery: !delivery ? "unpublished" : !ready ? "blocked" : loaded ? "loaded" : "update", message: !delivery ? "等待本轮新 PR 和发包" : !ready ? delivery.message : loaded ? "正在运行本轮作品，可以确认收下" : "先加载本轮作品，体验后收下", ...(delivery ? { application: delivery.application, prUrl: delivery.url } : {}) }, 200);
       }
-      if (input.action !== "confirm" || !input.token || input.token !== task.token) return json({ message: "请从工坊亲自收下这份心愿" }, 403);
-      if (session.state !== "COMPLETED" || !prUrl) return json({ message: "这份心愿还在收尾，请稍后再来收下" }, 409);
-      const number = prUrl.split("/").pop();
-      const pr = await this.github(`pulls/${number}`, "GET", undefined, repository);
-      const application = await this.applicationRelease(number!, repository);
-      const release = application ? { id: application.releaseId, source: application.source } : await this.release();
-      const running = application ? input.applicationReleases?.[application.appId] === application.releaseId : input.buildId && (release.source as WorkshopRelease["source"]).buildId === input.buildId;
-      if (!running) return json({ message: "新作品还没打开。先加载最新内容，体验后再收下吧", needsUpdate: true }, 409);
-      if (pr.base?.ref !== "main" || pr.head?.repo?.full_name !== repository) return json({ message: "这份作品的交付记录不匹配，请联系维护者" }, 409);
-      if (release.source.dirty || release.source.commit !== pr.head?.sha) return json({ message: "正在体验的作品与待收下的代码不一致，请联系维护者重新发布" }, 409);
-      if (!pr.merged) {
-        if (pr.state !== "open" || pr.draft) return json({ message: "这份心愿还未准备好收下" }, 409);
-        const comparison = await this.github(`compare/main...${pr.head.sha}`, "GET", undefined, repository);
-        if (comparison.status !== "ahead" && comparison.status !== "identical") return json({ message: "工坊的底稿有了更新，请联系维护者同步后重新发布" }, 409);
-      }
-      const latestId = application ? (await this.applicationRelease(number!, repository))?.releaseId : (await this.release()).id;
-      if (latestId !== release.id) return json({ message: "又有新内容送到了，加载后再收下吧", needsUpdate: true }, 409);
-      const result = pr.merged ? { merged: true, sha: pr.merge_commit_sha } : await this.github(`pulls/${number}/merge`, "PUT", { sha: pr.head.sha, merge_method: "merge" }, repository);
-      if (!result.merged) return json({ message: "暂时没能收下这份心愿，请稍后再试" }, 409);
-      await this.ctx.storage.put("confirmed", { ...task, mergeCommit: result.sha });
-      await this.ctx.storage.delete("active");
-      return json({ merged: true, mergeCommit: result.sha }, 200);
-    } catch (error) {
-      return json({ message: error instanceof Error ? error.message : "工坊暂时没有接好，请稍后再试" }, 502);
-    }
+      if (input.action !== "confirm" || !ready || !loaded) return json({ message: "先加载并体验本轮作品，准备好后再收下" }, 409);
+      const latest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/latest`, "json");
+      if (latest?.releaseId !== delivery!.application.releaseId) return json({ message: "有新版本送到，请重新加载" }, 409);
+      const pr = delivery!.pr;
+      const merged = pr.merged ? { merged: true, sha: pr.merge_commit_sha } : await this.github(`pulls/${delivery!.number}/merge`, "PUT", { sha: pr.head.sha, merge_method: "merge" });
+      if (!merged.merged) return json({ message: "合入尚未完成，请重试" }, 409);
+      task.phase = "accepted"; task.accepted = { releaseId: latest.releaseId, commit: latest.source.commit, mergeCommit: merged.sha, pr: delivery!.number };
+      await this.ctx.storage.put(`task:${appId}`, task);
+      return json({ merged: true, accepted: task.accepted }, 200);
+    } catch (error) { return json({ message: error instanceof Error ? error.message : "工坊暂时不可用" }, 502); }
   }
+  private async github(path: string, method = "GET", body?: unknown, repository = "jiangfengwhu/zjh-plugin"): Promise<any> {
+    if (!this.env.GITHUB_MERGE_TOKEN) throw new Error("工坊的收下功能还未配置好，请联系维护者");
+    const response = await fetch(`https://api.github.com/repos/${repository}/${path}`, {
+      method,
+      headers: { Authorization: `Bearer ${this.env.GITHUB_MERGE_TOKEN}`, Accept: "application/vnd.github+json", "User-Agent": "zijinhua-workshop", "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(response.status === 409 || response.status === 405 ? "这份心愿的代码有了变化，暂时不能收下，请联系维护者处理" : "暂时没能收下这份心愿，请稍后再试");
+    return response.json();
+  }
+
+
 }
