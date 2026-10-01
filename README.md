@@ -1,77 +1,50 @@
 # 紫金花服务端
 
-独立维护 Cloudflare Worker：动态清单读写、R2 产物读取和 Jules 会话代理。Android 在 [zjh-android](https://github.com/jiangfengwhu/zjh-android)，RN 在 [zjh-dynamic](https://github.com/jiangfengwhu/zjh-dynamic)。本仓库由服务端当前快照建立独立历史，不携带客户端源码。
-
-本仓库由本地维护者管理，不向云端 Agent 开放。云端只使用 zjh-dynamic，不需要服务端源码；服务端变更由用户交给本地维护者处理。
-
-| 路径 | 职责 |
-| --- | --- |
-| src/index.ts | HTTP 路由、清单权限校验与 Jules 代理 |
-| src/accounts.ts | 邮箱验证码、登录凭证与个人资料 |
-| wrangler.jsonc | Worker、域名路由、KV/R2 绑定和迁移声明 |
-| worker-configuration.d.ts | Wrangler 生成的运行环境类型 |
+独立维护 Cloudflare Worker：账号、应用清单、R2 产物和 Jules 工坊代理。Android 在 zjh-android，SDK/宿主在 zjh-dynamic，应用与云端任务在 zjh-plugin。本仓库只供本地维护者使用。
 
 ## 开发与部署
 
-1. `npm ci` 安装工具。
-2. `npm run typecheck` 检查类型。
-3. `npm run deploy` 发布到既有 zijinhua Worker。
+执行 npm ci、npm run typecheck 和 npx wrangler deploy --dry-run；协调升级后执行 npm run deploy。保留现有 Worker、zijinhua.297782.xyz 域名、CATALOG KV、BLOBS R2、WORKSHOP/ACCOUNTS Durable Object 与数据。纯文档修改无需部署。
 
-保留 zijinhua.297782.xyz 域名、CATALOG KV 和 BLOBS R2，继续使用现有线上数据与 Secrets。JULES_API_KEY、PUBLISH_TOKEN 和 GITHUB_MERGE_TOKEN 由 Cloudflare Secrets 管理；本地调试可用忽略的 .dev.vars，不提交凭证。GitHub 合入凭证仅保留在本地维护者与服务端，部署时应使用只允许 zjh-dynamic 内容与 PR 写入的凭证，不下发手机或 Jules。
+JULES_API_KEY、GITHUB_MERGE_TOKEN、OFFICIAL_PUBLISH_TOKEN 只保留在服务端及维护者安全环境。GitHub/Jules 集成仅开放 zjh-plugin；合入 token 仅需该仓库内容与 PR 权限。旧 PUBLISH_TOKEN 不再允许发布。本地 .dev.vars 忽略，不提交凭证和缓存。
 
-## 工坊确认
+## 邮箱登录
 
-WORKSHOP Durable Object 串行管理一份活动心愿，记录会话确认凭证。新建会话会占用工坊；制作完成仍保留，只有用户确认合入或制作中止才能释放。不允许并行制作或向已完成会话追加任务。
+在 Resend 验证发件域名后，用交互输入配置 Secrets，不将值放进代码或命令文本：
 
-POST /v1/workshop 的 status 接回状态，confirm 由用户点击触发。确认必须持有会话凭证，并核对正在运行代码的 buildId 等于最新清单 source.buildId、源码已提交且清单 commit 等于该会话 PR head、PR 属于 zjh-dynamic 并以 main 为目标、底稿没有遗漏 main 的改动。确认使用普通 merge 和预期 head SHA，重复请求可返回已经收好的结果；失败保留当前心愿。
-
-发布仅表示作品可体验，不自动合入。升级前已有会话在首次接回时登记，旧包或与 PR 不对应的包仍不能确认。
-
-## 权限边界
-
-/v1/runtime 仅供动态构建读取，动态发布接口只能写 release 与 vendor 编号表。SDK 和包体按 SHA-256 不可变地址读取。运行时契约由 Android 壳维护者的管理权限发布。
-
-Jules 代理仅暴露并允许 sources/github/jiangfengwhu/zjh-dynamic 会话。维护者须在用于云端 Agent 的 GitHub/Jules 集成授权中仅开放 zjh-dynamic，代理过滤不能代替账户授权。
-
-云端环境只注入动态上传凭证和清单发布 token，不注入 JULES_API_KEY、Cloudflare 管理 token 或本机 Wrangler 登录信息。通过 /v1/catalog 的动态发布 token 不能写 /v1/runtime；直接 R2/KV 管理凭证的权限需要维护者另外配置，不能把 API 的限制等同于管理凭证的限制。
-
-纯文档修改无需部署 Worker。
-
-## 邮箱登录（Resend）
-
-在 Resend 验证发件域名后，在本仓库终端分别执行以下命令，通过交互输入配置 Cloudflare Secret，不要将值写入代码或提交文件：
-
-```powershell
+~~~powershell
 npx wrangler secret put RESEND_API_KEY
 npx wrangler secret put MAIL_FROM
-```
+~~~
 
-`MAIL_FROM` 格式为 `紫金花 <login@你的已验证域名>`。API Key 仅需发送邮件权限。缺少任一配置时，发送验证码接口返回服务暂未开通，不生成假验证码。
+MAIL_FROM 格式为「紫金花 <login@你的已验证域名>」。缺配置时返回 503，不生成假验证码。POST /v1/auth/code 发送验证码；POST /v1/auth/verify 登录或创建账号，签发 90 天随机凭据，手机保存到 Keychain/Keystore。服务端只保存验证码及登录凭据摘要；验证码有效 10 分钟、最多 5 次验证、60 秒重发间隔，并限制邮箱、IP 和全局发送频率。按邮箱串行，网络发信不阻塞其他邮箱或内部身份读取，限额事务更新。
 
-`POST /v1/auth/code` 发送验证码；`POST /v1/auth/verify` 登录或自动创建账号，返回用户资料和 90 天有效的随机凭证。手机将凭证保存在 Keychain/Android Keystore 安全存储中。验证码有效期 10 分钟、最多尝试 5 次、重发间隔 60 秒，并限制每个邮箱、IP 和全局的发送频率。服务端只保存验证码摘要与凭证摘要。
+GET/PATCH /v1/account 读取资料或修改 1–24 字昵称；PUT/DELETE /v1/account/avatar 管理头像，接受不超过 1 MB 的 JPEG/PNG/WebP 并存入 R2 不可变地址；POST /v1/auth/logout 撤销当前登录凭据。以上要求账号 Bearer。公开市场昵称头像不包含邮箱或登录凭据。
 
-`GET/PATCH /v1/account` 读取资料或修改昵称；`PUT/DELETE /v1/account/avatar` 上传或恢复默认头像；`POST /v1/auth/logout` 撤销当前登录凭证。这些接口须提供 Bearer 凭证。昵称为 1–24 个字符，头像只接受不超过 1 MB 的 JPEG、PNG、WebP 图片，存入 R2 不可变地址。个人资料在账号存储中独立管理，应用数据与工坊任务仍保持现有管理方式。
+## 作品与确认
 
-## 应用市场身份边界
+创建、修改、停止、收下、分享、编辑和撤回都核对账号归属与作品 token。GET /v1/works 仅为当前账号返回作品、session 和作品凭据，换机可接回；无 ownerId 的历史任务不自动认领。创建携带稳定 requestId，在请求 Jules 前记录任务及唯一标题；结果不明确时恢复同一会话，不重复创建。
 
-市场浏览、搜索、应用详情、安装和公共包体读取不要求登录。创建云端应用、修改、收下、暂停任务，以及分享、编辑分享和撤回分享必须携带账号 Bearer 凭证。任务创建时由服务端写入 `ownerId`，后续操作同时核对账号归属与作品凭据，不能通过提交作者字段更换所有者。自动接回私有任务状态也需要身份，但未登录时不主动弹出登录页。
+WORKSHOP 按应用串行，公开读取不等待云端请求；不同应用可并行，同应用收下后继续 session 的新轮次。默认每账号每天 10 轮、同时最多 3 个制作任务，短事务预留额度。模块范围由事务分配，既有 appId 与范围保持稳定。
 
-分享的 `authorId`、昵称和头像取自服务端账号；市场只返回公开资料，不返回邮箱或登录凭证。市场读取公开昵称、头像时不校验访客身份，资料服务异常时保留发布时的展示快照。平台默认应用继续显示默认作者。构建发布凭证与用户登录凭证相互独立，云端打包工具的发布流程保持不变。
+POST /v1/workshop status 接回交付；confirm 由宿主确认后触发。运行 releaseId 等于本轮候选、source.dirty=false、source.commit 等于最终 PR head；PR 属于 zjh-plugin、指向 main、仅改目标应用与必要根锁文件，并保留 main 的应用改动。普通 merge 核对预期 head SHA，失败保留任务，不自动分享。
 
-早期无账号归属的旧任务不自动认领，不进行数据迁移。新建作品使用全新应用 ID，已有 ID 和平台预装应用不能通过创建任务抢占。
+## 发布授权
 
-## 官方发布者
+Jules 只接受 sources/github/jiangfengwhu/zjh-plugin。新会话禁用共享环境变量，平台在私有任务提示中签发 HMAC 授权，绑定 appId、ownerId、制作轮次和 7 天有效期；手机返回的 session/活动文本隐藏授权。暂停、收下或开启新轮次撤销旧授权。云端不得取得服务端密钥或本机管理权限。
 
-账号存储保留固定发布者 `00000000-0000-4000-8000-000000000001`，昵称为「紫金花官方」，邮箱为 `null`，没有验证码登录入口。它只用于平台开发者通过现有管理凭证发布应用，不提供客户端注册或身份升级接口。
+SDK 1.1.4 的 authorize 将授权保存到 Git 元数据；PUT /v1/application-blobs/<id>/<sha256> 校验轮次、最大 40 MB 和内容哈希后写内容地址。PUT /v1/catalog 只允许该应用清单，携带 expectedReleases（首次 null），按应用串行比较权威 candidate 指针，冲突返回 409。KV latest 只作镜像；模块范围在写镜像前事务预留。不可变清单与候选须相同，包体须已上传。宿主 release/vendor 只用维护者凭据，/v1/runtime 不通过此接口修改。
 
-Jolly、记事本、番茄钟均归官方发布者。上传构建只更新候选版本，不自动上架。官方应用由维护者指定不可变 releaseId 收下并公开；用户工坊的构建仍归创建者，须由本人收下后主动分享。`authorOfficial` 根据服务端作者 ID 生成，客户端提交同名字段或将昵称改成「紫金花官方」不会获得官方标记。
+原作复制绑定 originalAppId、originalReleaseId、originalCommit；初始化读取锁定 Git 提交的 src/assets 与纯 JS 依赖，不能改用 main 的新版源码。
 
-## 版本指针
+## 市场版本审核
 
-`/v1/applications/<id>/candidate`（旧 `latest` 仅为私有候选别名）、`accepted`、`public` 分别表示候选、已收下和公开版本。候选/已收下/未公开的不可变清单读取需要发布凭证，或作者账号加 X-Workshop-Token。市场、应用列表、APK seed、客户端首次安装和兼容回退只读公开版本；缺少公开版本返回 404，不回退候选。包体仍使用不可变内容哈希地址。
+应用共用 RN/JS 环境，appId 不构成恶意代码沙箱。信任边界为维护者逐版本审核与宿主确认制作操作。
 
-工坊确认收下更新 accepted，不更新 public；用户分享仅可选择 accepted。官方账号没有登录入口，维护者通过独立的 OFFICIAL_PUBLISH_TOKEN 调用 POST /v1/official-release，指定 appId/releaseId 明确收下并公开。云端的 PUBLISH_TOKEN 无权调用此操作。官方发布工具先确认源码提交已进入 zjh-plugin 的 origin/main；普通候选上传和直接写 KV 都不触发公开指针更新。
+candidate（latest 为私有别名）→ 作者体验 → 收下并合入 → accepted → 作者提交审核 → 维护者批准 → public。审核期间保留旧公开版本。候选、accepted、未公开清单仅允许该轮发布授权或账号加 X-Workshop-Token；市场、应用列表、APK seed、安装和回退只读审核通过的 public。包体内容地址保持可读，不得将业务隐私资料打进包。
 
-### 发布权限与原子候选基线
+GET /v1/application-review 返回维护者审核队列；POST 指定 appId/releaseId/approved 批准或撤销批准，绑定不可变清单、bundle 哈希和源码提交。GET /v1/applications/<id>/execution/<releaseId> 返回执行审核结果，宿主据此安装，曾批准的缓存包允许离线启动。历史官方公开快照视为已维护，社区版本须重新审核。
 
-PUBLISH_TOKEN 只允许应用清单；宿主 v1/release、vendor 编号表须使用维护者 OFFICIAL_PUBLISH_TOKEN。候选上传须携带 expectedReleases（首次为 null），服务端在串行对象中比较并更新权威 candidate 指针；版本冲突返回 409，同版本重试允许。KV 的 latest 只作镜像，不用于已初始化候选的并发判定。SDK 1.1.3 自动提交基线，不允许候选工具绕过 API 直接写 KV。
+官方发布者固定 ID 为 00000000-0000-4000-8000-000000000001，昵称「紫金花官方」，email=null，无验证码登录入口。Jolly、notepad、pomodoro 为官方应用。维护者经 POST /v1/official-release 明确指定不可变版本收下、批准并公开；云端不能调用。authorOfficial 由服务端生成，改昵称不能获得官方身份。
+
+升级须协调 SDK 固定 tarball、server、宿主和 Jolly，旧工具不兼容新授权接口。部署前停止旧任务，撤销历史云端共享 R2 凭据并从 Jules 环境移除；禁用新会话变量不能收回历史密钥，旧会话继续前须清除环境或迁移。完整顺序见 zjh-dynamic/docs/market-trust.md。

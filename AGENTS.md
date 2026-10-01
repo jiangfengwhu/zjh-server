@@ -2,11 +2,11 @@
 
 只维护服务端源码和部署配置，客户端分别由 zjh-android 与 zjh-dynamic 维护。
 
-本仓库仅供本地维护者使用，不向云端 Agent 开放。云端唯一仓库为 zjh-dynamic；不向云端环境提供服务端源码、JULES_API_KEY、Cloudflare 管理凭证或 Wrangler 登录信息。
+本仓库仅供本地维护者使用，不向云端 Agent 开放。云端唯一仓库为 zjh-plugin；不向云端环境提供服务端源码、JULES_API_KEY、Cloudflare 管理凭证或 Wrangler 登录信息。
 
 保持现有 Worker 名称、路由、KV/R2 绑定、数据和 Secrets，不因迁移新建生产存储。
 
-动态发布接口不得写运行时契约；Jules 会话必须限制到 zjh-dynamic。
+动态发布接口不得写运行时契约；Jules 会话必须限制到 zjh-plugin。每轮云端授权只能发布目标应用，不使用共享 R2 或全局发布凭据。市场执行版本须维护者逐版本审核；候选、收下与公开指针分开。
 
 涉及权限调整时，同时区分 API 校验、集成仓库授权和存储凭证权限；不能用来源过滤代替真实授权，也不能将本机管理权限作为云端发布方案。
 

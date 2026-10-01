@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { KeyedQueue } from "./concurrency";
 
 type AccountEnv = Env & { RESEND_API_KEY?: string; MAIL_FROM?: string };
 export const OFFICIAL_ACCOUNT_ID = "00000000-0000-4000-8000-000000000001";
@@ -39,11 +40,18 @@ export class Accounts extends DurableObject<AccountEnv> {
       await ctx.storage.put(`user:${OFFICIAL_ACCOUNT_ID}`, user);
     });
   }
-  private queue: Promise<unknown> = Promise.resolve();
-  fetch(request: Request): Promise<Response> {
-    // Public profile reads must not wait for an outgoing login email.
-    if (new URL(request.url).pathname === "/internal/profiles") return this.handle(request);
-    const next = this.queue.then(() => this.handle(request)); this.queue = next.catch(() => {}); return next;
+  private queue = new KeyedQueue();
+  async fetch(request: Request): Promise<Response> {
+    const path = new URL(request.url).pathname;
+    if (path.startsWith("/internal/") || request.method === "GET") return this.handle(request);
+    if (["/v1/auth/code", "/v1/auth/verify"].includes(path)) {
+      try {
+        const body = await this.smallBody(request.clone() as unknown as Request);
+        return this.queue.run(`email:${normalizeEmail(body.email)}`, () => this.handle(request));
+      } catch { return json({ message: "请求格式不正确" }, 400); }
+    }
+    const session = await this.session(request);
+    return this.queue.run(`user:${session?.user.id ?? "anonymous"}`, () => this.handle(request));
   }
   private async session(request: Request): Promise<{ key: string; record: Session; user: User } | undefined> {
     const token = request.headers.get("Authorization")?.match(/^Bearer ([a-f0-9]{64})$/)?.[1]; if (!token) return;
@@ -53,9 +61,11 @@ export class Accounts extends DurableObject<AccountEnv> {
     const user = await this.ctx.storage.get<User>(`user:${record.userId}`); if (user) return { key, record, user };
   }
   private async limited(key: string, limit: number, duration: number): Promise<boolean> {
-    const prior = await this.ctx.storage.get<Counter>(key); const counter = prior && prior.expiresAt > Date.now() ? prior : { count: 0, expiresAt: Date.now() + duration };
+    return this.ctx.storage.transaction(async storage => {
+    const prior = await storage.get<Counter>(key); const counter = prior && prior.expiresAt > Date.now() ? prior : { count: 0, expiresAt: Date.now() + duration };
     if (counter.count >= limit) return true;
-    counter.count++; await this.ctx.storage.put(key, counter); return false;
+    counter.count++; await storage.put(key, counter); return false;
+    });
   }
   private async smallBody(request: Request): Promise<Record<string, unknown>> {
     try { const value = JSON.parse(new TextDecoder().decode(await boundedBody(request, 4096))); if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(); return value; }
@@ -128,7 +138,7 @@ export class Accounts extends DurableObject<AccountEnv> {
       return json({ message: "没有找到这个操作" }, 404);
     } catch (error) { return error instanceof InvalidInput ? json({ message: error.message }, 400) : json({ message: "账户操作暂未完成，请稍后重试" }, 503); }
   }
-  alarm(): Promise<void> { const next = this.queue.then(() => this.cleanup()); this.queue = next.catch(() => {}); return next; }
+  alarm(): Promise<void> { return this.cleanup(); }
   private async cleanup() {
     for (const prefix of ["code:", "session:", "rate:"]) {
       let startAfter: string | undefined;
@@ -136,7 +146,8 @@ export class Accounts extends DurableObject<AccountEnv> {
         const records = await this.ctx.storage.list<{ expiresAt: number }>({ prefix, startAfter, limit: 128 });
         if (!records.size) break;
         const expired = [...records].filter(([, record]) => record.expiresAt <= Date.now()).map(([key]) => key);
-        startAfter = [...records.keys()].at(-1); if (expired.length) await this.ctx.storage.delete(expired);
+        startAfter = [...records.keys()].at(-1);
+        if (expired.length) await this.ctx.storage.transaction(async storage => { for (const key of expired) { const current = await storage.get<{ expiresAt: number }>(key); if (current && current.expiresAt <= Date.now()) await storage.delete(key); } });
         if (records.size < 128) break;
       }
     }
