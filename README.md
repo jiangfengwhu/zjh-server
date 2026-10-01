@@ -23,15 +23,15 @@ GET/PATCH /v1/account 读取资料或修改 1–24 字昵称；PUT/DELETE /v1/ac
 
 ## 作品与确认
 
-创建、修改、停止、收下、分享、编辑和撤回都核对账号归属与作品 token。GET /v1/works 仅为当前账号返回作品、session 和作品凭据，换机可接回。创建携带稳定 requestId，在请求 Jules 前记录任务及唯一标题；结果不明确时恢复同一会话，不重复创建。
+创建、修改、停止、分享、编辑和撤回都核对账号归属与作品 token。GET /v1/works 仅为当前账号返回作品、session 和作品凭据，换机可接回。创建携带稳定 requestId，在请求 Jules 前记录任务及唯一标题；结果不明确时恢复同一会话，不重复创建。
 
-WORKSHOP 按应用串行，公开读取不等待云端请求；不同应用可并行，同应用收下后继续 session 的新轮次。默认每账号每天 10 轮、同时最多 3 个制作任务，短事务预留额度。模块范围由事务分配，既有 appId 与范围保持稳定。
+WORKSHOP 按应用串行，公开读取不等待云端请求；不同应用可并行，同应用本轮完成后直接继续 session 的新轮次。默认每账号每天 10 轮、同时最多 3 个制作任务，短事务预留额度。模块范围由事务分配，既有 appId 与范围保持稳定。
 
-POST /v1/workshop status 接回候选交付；confirm 由宿主确认后触发。服务端核对正在运行的 releaseId 等于本轮候选，收下只记录该不可变版本，不检查 PR 状态、main 内容或调用合并接口。作者主动分享后才更新市场公开版本。
+POST /v1/workshop status 接回候选交付，不再提供 confirm 操作。作品完成后可以直接体验或继续修改，作者主动上架指定的最新候选 releaseId，才会更新市场公开版本；旧公开版本不会随发包自动改变。
 
 ## 发布授权
 
-Jules 只接受 sources/github/jiangfengwhu/zjh-plugin。新会话禁用共享环境变量，平台在私有任务提示中签发 HMAC 授权，绑定 appId、ownerId、制作轮次和 7 天有效期；手机返回的 session/活动文本隐藏授权。暂停、收下或开启新轮次撤销旧授权。云端不得取得服务端密钥或本机管理权限。
+Jules 只接受 sources/github/jiangfengwhu/zjh-plugin。新会话禁用共享环境变量，平台在私有任务提示中签发 HMAC 授权，绑定 appId、ownerId、制作轮次和 7 天有效期；手机返回的 session/活动文本隐藏授权。暂停、交付完成或开启新轮次撤销旧授权。云端不得取得服务端密钥或本机管理权限。
 
 SDK 1.1.7 的 authorize 将授权保存到 Git 元数据；PUT /v1/application-blobs/<id>/<sha256> 校验轮次、最大 40 MB 和内容哈希后写内容地址。PUT /v1/catalog 只允许该应用清单，携带 expectedReleases（首次 null），按应用串行比较权威 candidate 指针，冲突返回 409。KV latest 只作镜像；模块范围在写镜像前事务预留。不可变清单与候选须相同，包体须已上传。宿主 release/vendor 只用维护者凭据，/v1/runtime 不通过此接口修改。
 
@@ -41,16 +41,16 @@ SDK 1.1.7 的 authorize 将授权保存到 Git 元数据；PUT /v1/application-b
 
 应用共用 RN/JS 环境，appId 不构成恶意代码沙箱。开发阶段由开发者决定上架，制作和市场变更由宿主确认；当前不做恶意代码审核，未来 AI 检测另行建设。
 
-candidate（latest 为私有别名）→ 作者体验 → 收下并合入 → accepted → 作者主动上架 → public。后续候选发布保留旧公开版本。候选、accepted、未公开清单仅允许该轮发布授权或账号加 X-Workshop-Token；市场、应用列表、APK seed、安装和回退只读开发者上架的 public。包体内容地址保持可读，不得将业务隐私资料打进包。
+candidate（latest 为私有别名）→ 作者可选体验 → 作者主动上架 → public。后续候选发布保留旧公开版本。候选和未公开清单仅允许该轮发布授权或账号加 X-Workshop-Token；市场、应用列表、APK seed、安装和回退只读开发者上架的 public。包体内容地址保持可读，不得将业务隐私资料打进包。
 
 GET /v1/applications/<id>/releases/<releaseId> 对已经公开过的快照保持可读，便于已安装应用在更新或撤回后继续运行；私有候选仍须鉴权。已安装公开快照允许离线启动。
 
-官方发布者固定 ID 为 00000000-0000-4000-8000-000000000001，昵称「紫金花官方」，email=null，无验证码登录入口。Jolly、notepad、pomodoro 为官方应用。维护者经 POST /v1/official-release 明确指定不可变版本收下并公开；云端不能调用。authorOfficial 由服务端生成，改昵称不能获得官方身份。
+官方发布者固定 ID 为 00000000-0000-4000-8000-000000000001，昵称「紫金花官方」，email=null，无验证码登录入口。Jolly、notepad、pomodoro 为官方应用。维护者经 POST /v1/official-release 明确指定不可变版本公开；云端不能调用。authorOfficial 由服务端生成，改昵称不能获得官方身份。
 
 升级须协调 SDK 固定 tarball、server、宿主和 Jolly，旧工具不兼容新授权接口。部署前停止旧任务，撤销历史云端共享 R2 凭据并从 Jules 环境移除；禁用新会话变量不能收回历史密钥，旧会话继续前须清除环境或迁移。完整顺序见 zjh-dynamic/docs/market-trust.md。
 
 开发清库：维护者以 POST /v1/development-reset 及 confirm=RESET_WORKSHOP_DEVELOPMENT_DATA 清除工坊任务、候选、分享和应用清单，保留账号、runtime/宿主清单及不可变产物。重置期间停止新请求并等待在途请求结束，然后重新发布官方应用。不支持历史仓库基线或匿名任务迁移。
 
-用户应用在 Jules 自动创建的分支长期迭代。平台从导出信息记录分支和可获取的源码提交，此信息读取失败不阻塞候选体验和收下。main 只维护官方应用。Remix 创建新的应用 ID、owner 与独立分支，从原应用分支开始，并保留原作版本来源。
+用户应用在 Jules 自动创建的分支长期迭代。平台从导出信息记录分支和可获取的源码提交，此信息读取失败不阻塞候选体验。main 只维护官方应用。Remix 创建新的应用 ID、owner 与独立分支，从原应用分支开始，并保留原作版本来源。
 
-同一应用的写操作串行执行；制作轮次变更使旧发布授权失效。sendMessage 记录 Jules 状态版本，拒绝多设备重复提交同一轮。SDK 1.1.8 移除应用发布的提交祖先检查，仍保留授权、CAS、包体完整性和运行时兼容校验。
+同一应用的写操作串行执行；制作轮次变更使旧发布授权失效。sendMessage 记录 Jules 状态版本，拒绝多设备重复提交同一轮。SDK 1.1.9 移除应用发布的提交祖先检查，仍保留授权、CAS、包体完整性和运行时兼容校验。
