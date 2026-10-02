@@ -342,7 +342,7 @@ export class Workshop extends DurableObject<Env> {
   }
   private async publisherInstruction(task: WorkshopTask) {
     const grant = await issuePublisherGrant({ appId: task.appId, ownerId: task.ownerId, epoch: task.publishEpoch! }, this.env.OFFICIAL_PUBLISH_TOKEN);
-    return `使用 SDK 1.2.1 或更新版本；已有分支如工具过旧，执行 npm install --save-dev @zijinhua/app-sdk@https://zjh-cdn.297782.xyz/v1/sdk/212085a9d104457a49e283373152307d893b62d8448a0f1ed04c034fa57eb7df，只更新根 SDK 依赖与锁文件，不同步 main。先阅读 SDK 包内 dist/libraries.md 和 dist/platform.json，使用其中公开入口与 getAppContext 能力；不要另装共享 RN 库。发包前执行 npx zjh-app authorize ${task.appId} '${grant}'，只授权本应用本轮候选发布；不得输出授权、提交授权文件或使用环境里的旧全局发布凭据。`;
+    return `使用 SDK 1.2.3 或更新版本；已有分支如工具过旧，执行 npm install --save-dev @zijinhua/app-sdk@https://zjh-cdn.297782.xyz/v1/sdk/c6e37891c1a2ff49db4233267f72f76531a8d28cfcfcba471ef85f2e1f67f6fe，只更新根 SDK 依赖与锁文件，不同步 main。先阅读 SDK 包内 dist/libraries.md 和 dist/platform.json，使用其中公开入口与 getAppContext 能力；不要另装共享 RN 库。发包前执行 npx zjh-app authorize ${task.appId} '${grant}'，只授权本应用本轮候选发布；不得输出授权、提交授权文件或使用环境里的旧全局发布凭据。`;
   }
   private async recoverSession(task: WorkshopTask): Promise<WorkshopTask> {
     if (task.session || !task.creationTitle) return task;
