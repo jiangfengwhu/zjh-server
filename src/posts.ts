@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { authenticatedUser, publicProfiles, type User } from "./accounts";
+import { authenticatedUser, publicProfiles, OFFICIAL_ACCOUNT_ID, type User } from "./accounts";
 import { KeyedQueue } from "./concurrency";
 
 type Author = Pick<User, "id" | "name" | "avatarUrl">;
@@ -48,11 +48,29 @@ export class Posts extends DurableObject<Env> {
       }
       if (url.pathname === "/v1/posts" && request.method === "GET") {
         const cursor = url.searchParams.get("cursor") || undefined;
+        const authorId = url.searchParams.get("authorId") || undefined;
+        if (authorId && !uuid.test(authorId)) throw new InputError("作者标识无效");
         if (cursor && !/^post:\d{13}:[a-f0-9]{64}$/.test(cursor)) throw new InputError("分页标记无效");
-        const entries = await this.ctx.storage.list<Post>({ prefix: "post:", startAfter: cursor, limit: 51 });
-        const page = [...entries].slice(0, 50); const profiles = await publicProfiles([...new Set(page.map(([, post]) => post.author.id))], this.env);
+        const limit = authorId ? 500 : 50;
+        const entries = await this.ctx.storage.list<Post>({ prefix: "post:", startAfter: cursor, limit: limit + 1 });
+        const scanned = [...entries].slice(0, limit);
+        const matching = authorId ? scanned.filter(([, post]) => post.author.id === authorId) : scanned;
+        const page = matching.slice(0, 50); const profiles = await publicProfiles([...new Set(page.map(([, post]) => post.author.id))], this.env);
         const viewer = request.headers.has("Authorization") ? await authenticatedUser(request, this.env) : null;
-        return json({ posts: await Promise.all(page.map(async ([, post]) => this.decorate({ ...post, author: profiles.get(post.author.id) ?? post.author }, viewer))), nextCursor: entries.size > 50 ? page.at(-1)![0] : null });
+        return json({ posts: await Promise.all(page.map(async ([, post]) => this.decorate({ ...post, author: profiles.get(post.author.id) ?? post.author }, viewer))), nextCursor: matching.length > 50 ? page.at(-1)![0] : entries.size > limit ? scanned.at(-1)![0] : null });
+      }
+      const profileId = url.pathname.match(/^\/v1\/profiles\/([a-f0-9-]{36})$/)?.[1];
+      if (profileId && request.method === "GET") {
+        if (!uuid.test(profileId)) throw new InputError("作者标识无效");
+        const [profiles, market, timeline] = await Promise.all([
+          publicProfiles([profileId], this.env),
+          this.env.WORKSHOP.getByName("dynamic").fetch(new Request(`https://workshop.internal/v1/market?authorId=${profileId}`)),
+          this.handle(new Request(`https://posts.internal/v1/posts?authorId=${profileId}`, { headers: request.headers })),
+        ]);
+        const author = profiles.get(profileId); if (!author) throw new InputError("这位作者不存在", 404);
+        if (!market.ok || !timeline.ok) throw new InputError("作者主页暂时不可用，请重试", 503);
+        const applications = await market.json() as { applications: unknown[] }; const posts = await timeline.json() as { posts: unknown[]; nextCursor: string | null };
+        return json({ author: { ...author, official: profileId === OFFICIAL_ACCOUNT_ID }, applications: applications.applications, ...posts });
       }
       const target = url.pathname.match(/^\/v1\/posts\/([a-f0-9]{64})(?:\/(like|comments)(?:\/([a-f0-9]{64}))?)?$/);
       if (target && request.method === "GET" && target[2] !== "like" && !target[3]) {

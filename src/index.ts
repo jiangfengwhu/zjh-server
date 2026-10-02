@@ -26,6 +26,7 @@ export default {
     try {
       if (/^\/v1\/(auth\/(?:code|verify|logout)|account(?:\/avatar)?)$/.test(url.pathname)) return env.ACCOUNTS.getByName("accounts").fetch(request);
       if (/^\/v1\/(posts(?:\/[a-f0-9]{64}(?:\/(?:like|comments)(?:\/[a-f0-9]{64})?)?)?|post-media)$/.test(url.pathname)) return env.POSTS.getByName("timeline").fetch(request);
+      if (/^\/v1\/profiles\/[a-f0-9-]{36}$/.test(url.pathname)) return env.POSTS.getByName("timeline").fetch(request);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/posts\/[a-f0-9]{64}$/.test(url.pathname)) return readSharedPost(request, env);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/post-images\/[a-f0-9-]{36}\/[a-f0-9-]{36}$/.test(url.pathname)) return readPostImage(request, env);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/avatars\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readAvatar(request, env);
@@ -451,6 +452,8 @@ export class Workshop extends DurableObject<Env> {
       }
       if ((path === "/v1/market" || path === "/v1/applications") && request.method === "GET") {
         const appId = new URL(request.url).searchParams.get("appId");
+        const authorId = new URL(request.url).searchParams.get("authorId");
+        if (authorId && !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(authorId)) return json({ error: "author id invalid" }, 400);
         if (appId && !/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return json({ error: "application id invalid" }, 400);
         const selected = appId ? await this.ctx.storage.get<MarketEntry>(`shared:${appId}`) : undefined;
         const entries = appId ? selected ? [selected] : [] : [...(await this.ctx.storage.list<MarketEntry>({ prefix: "shared:" })).values()];
@@ -458,12 +461,13 @@ export class Workshop extends DurableObject<Env> {
           if ((OFFICIAL_APPLICATIONS as readonly string[]).includes(entry.manifest.appId)) { entry.authorId = OFFICIAL_ACCOUNT_ID; entry.authorName = "紫金花官方"; entry.authorAvatarUrl = null; }
           entry.authorOfficial = entry.authorId === OFFICIAL_ACCOUNT_ID;
         }
+        const visible = authorId ? entries.filter(entry => entry.authorId === authorId) : entries;
         // Public browsing never authenticates the visitor. Profile lookup is optional enrichment.
         try {
-          const profiles = await publicProfiles([...new Set(entries.map(entry => entry.authorId).filter((id): id is string => Boolean(id)))], this.env);
-          for (const entry of entries) { const profile = entry.authorId ? profiles.get(entry.authorId) : undefined; if (profile) { entry.authorName = profile.name; entry.authorAvatarUrl = profile.avatarUrl; } }
+          const profiles = await publicProfiles([...new Set(visible.map(entry => entry.authorId).filter((id): id is string => Boolean(id)))], this.env);
+          for (const entry of visible) { const profile = entry.authorId ? profiles.get(entry.authorId) : undefined; if (profile) { entry.authorName = profile.name; entry.authorAvatarUrl = profile.avatarUrl; } }
         } catch { /* Keep published snapshots available if the account service is unavailable. */ }
-        return json({ applications: path === "/v1/applications" ? entries.map(entry => entry.manifest) : entries }, 200);
+        return json({ applications: path === "/v1/applications" ? visible.map(entry => entry.manifest) : visible }, 200);
       }
       if (new URL(request.url).pathname === "/v1/catalog") {
         if (!await readPublisherGrant(request, this.env.OFFICIAL_PUBLISH_TOKEN) && !await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN)) return json({ error: "unauthorized" }, 401);
