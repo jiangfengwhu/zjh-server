@@ -3,6 +3,8 @@ import { authenticatedUser, OFFICIAL_ACCOUNT_ID, OFFICIAL_APPLICATIONS, publicPr
 import { KeyedQueue } from "./concurrency";
 import { issuePublisherGrant, readPublisherGrant, redactPublisherGrants } from "./publisher";
 export { Accounts } from "./accounts";
+export { Posts } from "./posts";
+import { readPostImage } from "./posts";
 
 /** 清单类的键：整套清单和 vendor 的模块编号表。格式变了就换前缀（v3/…），旧版本的手机继续读旧前缀。 */
 const JSON_KEY = /^v1\/(?:release|runtime|maps\/vendor\.json|applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|releases\/[a-f0-9]{64}))$/;
@@ -23,6 +25,8 @@ export default {
     const url = new URL(request.url);
     try {
       if (/^\/v1\/(auth\/(?:code|verify|logout)|account(?:\/avatar)?)$/.test(url.pathname)) return env.ACCOUNTS.getByName("accounts").fetch(request);
+      if (/^\/v1\/(posts(?:\/[a-f0-9]{64})?|post-media)$/.test(url.pathname)) return env.POSTS.getByName("timeline").fetch(request);
+      if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/post-images\/[a-f0-9-]{36}\/[a-f0-9-]{36}$/.test(url.pathname)) return readPostImage(request, env);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/avatars\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readAvatar(request, env);
       if (request.method === "PUT" && url.pathname === "/v1/catalog") return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "PUT" && /^\/v1\/application-blobs\/[a-z][a-z0-9-]{0,63}\/[a-f0-9]{64}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
@@ -272,6 +276,8 @@ export class Workshop extends DurableObject<Env> {
       if (!jolly) return json({ message: "请先发布官方 Jolly，再清理测试数据" }, 409);
       const accountReset = await this.env.ACCOUNTS.getByName("accounts").fetch(new Request("https://account.internal/internal/development-reset", { method: "POST" }));
       if (!accountReset.ok) return json({ message: "账户清理未完成，请重试" }, 503);
+      const postsReset = await this.env.POSTS.getByName("timeline").fetch(new Request("https://posts.internal/internal/development-reset", { method: "POST" }));
+      if (!postsReset.ok) return json({ message: "用户动态清理未完成，请重试" }, 503);
       let cursor: string | undefined; let count = 0;
       const releaseKey = `v1/applications/jolly/releases/${jolly.manifest.releaseId}`;
       do {
