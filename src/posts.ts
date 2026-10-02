@@ -8,6 +8,7 @@ type ApplicationLink = { appId: string; releaseId: string; title: string; summar
 type Post = { id: string; author: Author; body: string; images: Array<{ id: string; url: string }>; createdAt: number; application?: ApplicationLink };
 type Comment = { id: string; postId: string; author: Author; body: string; createdAt: number; replyTo?: { id: string; name: string } };
 type Stats = { likes: number; comments: number };
+type Notice = { id: string; actor: Author; postId: string; commentId: string; body: string; postPreview: string; kind: "comment" | "reply"; createdAt: number; read: boolean };
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { "cache-control": "no-store" } });
 class InputError extends Error { constructor(message: string, readonly status = 400) { super(message); } }
 async function bodyBytes(request: Request, limit: number) {
@@ -57,7 +58,7 @@ export class Posts extends DurableObject<Env> {
         const matching = authorId ? scanned.filter(([, post]) => post.author.id === authorId) : scanned;
         const page = matching.slice(0, 50); const profiles = await publicProfiles([...new Set(page.map(([, post]) => post.author.id))], this.env);
         const viewer = request.headers.has("Authorization") ? await authenticatedUser(request, this.env) : null;
-        return json({ posts: await Promise.all(page.map(async ([, post]) => this.decorate({ ...post, author: profiles.get(post.author.id) ?? post.author }, viewer))), nextCursor: matching.length > 50 ? page.at(-1)![0] : entries.size > limit ? scanned.at(-1)![0] : null });
+        return json({ posts: await Promise.all(page.map(async ([, post]) => this.decorate({ ...post, author: profiles.get(post.author.id) ?? post.author }, viewer))), nextCursor: matching.length > 50 ? page.at(-1)![0] : entries.size > limit ? scanned.at(-1)![0] : null, unreadCount: viewer ? await this.ctx.storage.get<number>(`notice-unread:${viewer.id}`) ?? 0 : 0 });
       }
       const profileId = url.pathname.match(/^\/v1\/profiles\/([a-f0-9-]{36})$/)?.[1];
       if (profileId && request.method === "GET") {
@@ -75,13 +76,18 @@ export class Posts extends DurableObject<Env> {
       const target = url.pathname.match(/^\/v1\/posts\/([a-f0-9]{64})(?:\/(like|comments)(?:\/([a-f0-9]{64}))?)?$/);
       if (target && request.method === "GET" && target[2] !== "like" && !target[3]) {
         const post = await this.findPost(target[1]);
-        const page = await this.comments(target[1], url.searchParams.get("cursor") || undefined);
+        const commentId = url.searchParams.get("commentId"); let start: string | undefined;
+        if (commentId) { if (!/^[a-f0-9]{64}$/.test(commentId)) throw new InputError("评论标识无效"); start = await this.ctx.storage.get<string>(`comment-id:${target[1]}:${commentId}`); if (!start) throw new InputError("这条评论已删除", 404); }
+        const page = await this.comments(target[1], url.searchParams.get("cursor") || undefined, start);
         const viewer = request.headers.has("Authorization") ? await authenticatedUser(request, this.env) : null;
         const profiles = await publicProfiles([post.author.id, ...page.comments.map(item => item.author.id)], this.env);
         return json({ post: await this.decorate({ ...post, author: profiles.get(post.author.id) ?? post.author }, viewer), comments: page.comments.map(item => ({ ...item, author: profiles.get(item.author.id) ?? item.author })), nextCursor: page.nextCursor });
       }
       const user = await authenticatedUser(request, this.env); if (!user) return json({ message: "请先登录后再发动态" }, 401);
+      if (url.pathname === "/v1/notifications" && request.method === "GET") return this.notices(url, user);
+      if (url.pathname === "/v1/notifications/unread" && request.method === "GET") return json({ unreadCount: await this.ctx.storage.get<number>(`notice-unread:${user.id}`) ?? 0 });
       return await this.queue.run(user.id, async () => {
+        if (url.pathname === "/v1/notifications/read" && request.method === "POST") return this.readNotices(request, user);
         if (url.pathname === "/v1/post-media" && request.method === "PUT") return this.upload(request, user);
         if (url.pathname === "/v1/posts" && request.method === "POST") return this.publish(request, user);
         const match = url.pathname.match(/^\/v1\/posts\/([a-f0-9]{64})$/);
@@ -92,6 +98,46 @@ export class Posts extends DurableObject<Env> {
         return json({ message: "操作不存在" }, 404);
       });
     } catch (error) { return json({ message: error instanceof InputError ? error.message : "动态操作未完成，请稍后重试" }, error instanceof InputError ? error.status : 503); }
+  }
+  private async notices(url: URL, user: User) {
+    const prefix = `notice:${user.id}:`; const cursor = url.searchParams.get("cursor") || undefined;
+    if (cursor && (!cursor.startsWith(prefix) || !/^notice:[a-f0-9-]{36}:\d{13}:[a-f0-9]{64}$/.test(cursor))) throw new InputError("通知分页标记无效");
+    const records = await this.ctx.storage.list<Notice>({ prefix, startAfter: cursor, limit: 51 }); const entries = [...records].slice(0, 50);
+    const profiles = await publicProfiles([...new Set(entries.map(([, item]) => item.actor.id))], this.env);
+    return json({ notices: entries.map(([, item]) => ({ ...item, actor: profiles.get(item.actor.id) ?? item.actor })), nextCursor: records.size > 50 ? entries.at(-1)![0] : null, unreadCount: await this.ctx.storage.get<number>(`notice-unread:${user.id}`) ?? 0 });
+  }
+  private async readNotices(request: Request, user: User) {
+    let input: { ids?: unknown };
+    try { input = JSON.parse(new TextDecoder().decode(await bodyBytes(request, 8192))); } catch { throw new InputError("通知请求无效"); }
+    if (!input || typeof input !== "object" || (input.ids !== undefined && (!Array.isArray(input.ids) || input.ids.length > 100 || input.ids.some(id => typeof id !== "string" || !/^[a-f0-9]{64}$/.test(id))))) throw new InputError("通知标识无效");
+    const before = Date.now(); const ids = input.ids as string[] | undefined;
+    const mark = async (keys: string[]) => this.ctx.storage.transaction(async storage => {
+      let unread = await storage.get<number>(`notice-unread:${user.id}`) ?? 0;
+      for (const key of keys) { const notice = await storage.get<Notice>(key); if (notice && !notice.read && notice.createdAt <= before) { await storage.put(key, { ...notice, read: true }); unread = Math.max(0, unread - 1); } }
+      await storage.put(`notice-unread:${user.id}`, unread);
+    });
+    if (ids) {
+      const keys = await Promise.all([...new Set(ids)].map(id => this.ctx.storage.get<string>(`notice-id:${user.id}:${id}`))); await mark(keys.filter((key): key is string => !!key));
+    } else {
+      let cursor: string | undefined;
+      while (true) { const records = await this.ctx.storage.list<Notice>({ prefix: `notice:${user.id}:`, startAfter: cursor, limit: 128 }); if (!records.size) break; await mark([...records.keys()]); cursor = [...records.keys()].at(-1); }
+    }
+    return json({ unreadCount: await this.ctx.storage.get<number>(`notice-unread:${user.id}`) ?? 0, before });
+  }
+  private async clearCommentNotices(postId: string, commentId: string) {
+    const targetsKey = `notice-targets:${postId}:${commentId}`;
+    await this.ctx.storage.transaction(async storage => {
+      const recipients = await storage.get<string[]>(targetsKey) ?? [];
+      for (const recipient of recipients) {
+        const index = `notice-id:${recipient}:${commentId}`; const key = await storage.get<string>(index); const notice = key ? await storage.get<Notice>(key) : undefined;
+        if (notice && !notice.read) await storage.put(`notice-unread:${recipient}`, Math.max(0, (await storage.get<number>(`notice-unread:${recipient}`) ?? 0) - 1));
+        if (key) await storage.delete(key); await storage.delete(index);
+      }
+      await storage.delete(targetsKey);
+    });
+  }
+  private async clearPostNotices(id: string) {
+    while (true) { const records = await this.ctx.storage.list({ prefix: `notice-targets:${id}:`, limit: 128 }); if (!records.size) return; for (const key of records.keys()) await this.clearCommentNotices(id, key.split(":").at(-1)!); }
   }
   private async findPost(id: string): Promise<Post> {
     const key = await this.ctx.storage.get<string>(`id:${id}`); const post = key ? await this.ctx.storage.get<Post>(key) : undefined;
@@ -112,10 +158,10 @@ export class Posts extends DurableObject<Env> {
     });
     return json({ post: await this.decorate(post, user) });
   }
-  private async comments(id: string, cursor?: string) {
+  private async comments(id: string, cursor?: string, start?: string) {
     const prefix = `comment:${id}:`;
     if (cursor && (!cursor.startsWith(prefix) || !/^comment:[a-f0-9]{64}:\d{13}:[a-f0-9]{64}$/.test(cursor))) throw new InputError("评论分页标记无效");
-    const records = await this.ctx.storage.list<Comment>({ prefix, startAfter: cursor, limit: 51 }); const entries = [...records].slice(0, 50);
+    const records = await this.ctx.storage.list<Comment>({ prefix, ...(cursor ? { startAfter: cursor } : start ? { start } : {}), limit: 51 }); const entries = [...records].slice(0, 50);
     return { comments: entries.map(([, value]) => value), nextCursor: records.size > 50 ? entries.at(-1)![0] : null };
   }
   private async comment(id: string, request: Request, user: User) {
@@ -129,17 +175,28 @@ export class Posts extends DurableObject<Env> {
     if (prior) { const comment = await this.ctx.storage.get<Comment>(prior.key); if (!comment || prior.fingerprint !== fingerprint) throw new InputError("这次评论已处理，请重新评论", 409); return json({ comment, post: await this.decorate(post, user) }); }
     await this.rate(user.id, "comment", 20);
     let replyTo: Comment["replyTo"];
-    if (input.replyTo) { const key = await this.ctx.storage.get<string>(`comment-id:${id}:${input.replyTo}`); const target = key ? await this.ctx.storage.get<Comment>(key) : undefined; if (!target) throw new InputError("回复的评论已删除"); replyTo = { id: target.id, name: target.author.name }; }
+    let replyOwner: string | undefined;
+    if (input.replyTo) { const key = await this.ctx.storage.get<string>(`comment-id:${id}:${input.replyTo}`); const target = key ? await this.ctx.storage.get<Comment>(key) : undefined; if (!target) throw new InputError("回复的评论已删除"); replyTo = { id: target.id, name: target.author.name }; replyOwner = target.author.id; }
     const comment: Comment = { id: await digest(`${id}:${user.id}:${input.requestId}`), postId: id, author: { id: user.id, name: user.name, avatarUrl: user.avatarUrl }, body, createdAt: Date.now(), ...(replyTo ? { replyTo } : {}) };
     const key = `comment:${id}:${String(comment.createdAt).padStart(13, "0")}:${comment.id}`;
-    await this.ctx.storage.transaction(async storage => { const stats = await storage.get<Stats>(`stats:${id}`) ?? { likes: 0, comments: 0 }; stats.comments++; await storage.put(key, comment); await storage.put(`comment-id:${id}:${comment.id}`, key); await storage.put(requestKey, { key, fingerprint }); await storage.put(`stats:${id}`, stats); });
+    const recipients = [...new Set([post.author.id, replyOwner].filter((value): value is string => !!value && value !== user.id))];
+    await this.ctx.storage.transaction(async storage => {
+      const stats = await storage.get<Stats>(`stats:${id}`) ?? { likes: 0, comments: 0 }; stats.comments++; await storage.put(key, comment); await storage.put(`comment-id:${id}:${comment.id}`, key); await storage.put(requestKey, { key, fingerprint }); await storage.put(`stats:${id}`, stats);
+      for (const recipient of recipients) {
+        const notice: Notice = { id: comment.id, actor: comment.author, postId: id, commentId: comment.id, body: body.slice(0, 240), postPreview: (post.body || post.application?.title || "图片动态").slice(0, 100), kind: recipient === replyOwner ? "reply" : "comment", createdAt: comment.createdAt, read: false };
+        const noticeKey = `notice:${recipient}:${String(9999999999999 - notice.createdAt).padStart(13, "0")}:${notice.id}`;
+        await storage.put(noticeKey, notice); await storage.put(`notice-id:${recipient}:${notice.id}`, noticeKey); await storage.put(`notice-unread:${recipient}`, (await storage.get<number>(`notice-unread:${recipient}`) ?? 0) + 1);
+      }
+      if (recipients.length) await storage.put(`notice-targets:${id}:${comment.id}`, recipients);
+    });
     return json({ comment, post: await this.decorate(post, user) }, 201);
   }
   private async removeComment(id: string, commentId: string, user: User) {
     const post = await this.findPost(id); const key = await this.ctx.storage.get<string>(`comment-id:${id}:${commentId}`); const comment = key ? await this.ctx.storage.get<Comment>(key) : undefined;
-    if (!comment) return json({ deleted: true, post: await this.decorate(post, user) });
+    if (!comment) { await this.clearCommentNotices(id, commentId); return json({ deleted: true, post: await this.decorate(post, user) }); }
     if (comment.author.id !== user.id) throw new InputError("只能删除自己的评论", 403);
     await this.ctx.storage.transaction(async storage => { const stats = await storage.get<Stats>(`stats:${id}`) ?? { likes: 0, comments: 0 }; stats.comments = Math.max(0, stats.comments - 1); await storage.delete(key!); await storage.delete(`comment-id:${id}:${commentId}`); await storage.put(`stats:${id}`, stats); });
+    await this.clearCommentNotices(id, commentId);
     return json({ deleted: true, post: await this.decorate(post, user) });
   }
   private async deletePrefix(prefix: string) {
@@ -196,9 +253,10 @@ export class Posts extends DurableObject<Env> {
   }
   private async remove(id: string, user: User) {
     const key = await this.ctx.storage.get<string>(`id:${id}`); const post = key ? await this.ctx.storage.get<Post>(key) : undefined;
-    if (!post) return json({ deleted: true });
+    if (!post) { await this.clearPostNotices(id); return json({ deleted: true }); }
     if (post.author.id !== user.id) throw new InputError("只能删除自己的动态", 403);
     await this.ctx.storage.transaction(async storage => { await storage.delete(key!); await storage.delete(`id:${id}`); for (const image of post.images) { const media = await storage.get<Media>(`media:${image.id}`); if (media) await storage.put(`media:${image.id}`, { ...media, postId: undefined, createdAt: 0 }); } });
+    await this.clearPostNotices(id);
     for (const prefix of [`like:${id}:`, `comment:${id}:`, `comment-id:${id}:`, `comment-request:${id}:`]) await this.deletePrefix(prefix);
     await this.ctx.storage.delete(`stats:${id}`);
     for (const image of post.images) { const media = await this.ctx.storage.get<Media>(`media:${image.id}`); if (media) { await this.env.BLOBS.delete(media.key); await this.ctx.storage.delete(`media:${image.id}`); } }
