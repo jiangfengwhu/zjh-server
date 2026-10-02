@@ -4,7 +4,8 @@ import { KeyedQueue } from "./concurrency";
 
 type Author = Pick<User, "id" | "name" | "avatarUrl">;
 type Media = { id: string; ownerId: string; key: string; url: string; createdAt: number; postId?: string };
-type Post = { id: string; author: Author; body: string; images: Array<{ id: string; url: string }>; createdAt: number };
+type ApplicationLink = { appId: string; releaseId: string; title: string; summary: string; mark: string; accent: string };
+type Post = { id: string; author: Author; body: string; images: Array<{ id: string; url: string }>; createdAt: number; application?: ApplicationLink };
 type Comment = { id: string; postId: string; author: Author; body: string; createdAt: number; replyTo?: { id: string; name: string } };
 type Stats = { likes: number; comments: number };
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { "cache-control": "no-store" } });
@@ -145,18 +146,30 @@ export class Posts extends DurableObject<Env> {
     return json({ image: { id, url: media.url } }, 201);
   }
   private async publish(request: Request, user: User) {
-    let input: { body?: unknown; imageIds?: unknown; requestId?: unknown };
+    let input: { body?: unknown; imageIds?: unknown; requestId?: unknown; application?: { appId?: unknown; releaseId?: unknown } };
     try { input = JSON.parse(new TextDecoder().decode(await bodyBytes(request, 16384))); } catch (error) { if (error instanceof InputError) throw error; throw new InputError("请求格式不正确"); }
     if (!input || typeof input !== "object" || typeof input.body !== "string" || typeof input.requestId !== "string" || !/^[a-zA-Z0-9-]{8,100}$/.test(input.requestId)) throw new InputError("动态内容无效");
     const body = input.body.trim(); const ids = input.imageIds;
-    if (Array.from(body).length > 2000 || !Array.isArray(ids) || ids.length > 4 || ids.some(id => typeof id !== "string" || !uuid.test(id)) || new Set(ids).size !== ids.length || (!body && !ids.length)) throw new InputError("动态需有文字或图片，最多 2000 字、4 张图");
-    const fingerprint = await digest(JSON.stringify({ body, ids })); const requestKey = `request:${user.id}:${input.requestId}`;
+    const selection = input.application;
+    if (selection != null && (typeof selection !== "object" || typeof selection.appId !== "string" || !/^[a-z][a-z0-9-]{0,63}$/.test(selection.appId) || typeof selection.releaseId !== "string" || !/^[a-f0-9]{64}$/.test(selection.releaseId))) throw new InputError("附带应用无效");
+    if (Array.from(body).length > 2000 || !Array.isArray(ids) || ids.length > 4 || ids.some(id => typeof id !== "string" || !uuid.test(id)) || new Set(ids).size !== ids.length || (!body && !ids.length && !selection)) throw new InputError("动态需有文字、图片或应用，最多 2000 字、4 张图");
+    const fingerprint = await digest(JSON.stringify({ body, ids, ...(selection ? { application: { appId: selection.appId, releaseId: selection.releaseId } } : {}) })); const requestKey = `request:${user.id}:${input.requestId}`;
     const prior = await this.ctx.storage.get<{ key: string; fingerprint: string }>(requestKey);
     if (prior) { const post = await this.ctx.storage.get<Post>(prior.key); if (prior.fingerprint !== fingerprint || !post) throw new InputError("这次发布已处理，请新建动态", 409); return json({ post: await this.decorate(post, user) }); }
     await this.rate(user.id, "publish", 5);
+    let application: ApplicationLink | undefined;
+    if (selection) {
+      const response = await this.env.WORKSHOP.getByName("dynamic").fetch(new Request(`https://workshop.internal/v1/market?appId=${selection.appId}`));
+      if (!response.ok) throw new InputError("应用市场暂时不可用，请重试", 503);
+      const result = await response.json() as { applications: Array<{ authorId: string | null; title?: string; summary?: string; manifest: ApplicationLink }> };
+      const entry = result.applications[0];
+      if (!entry || entry.authorId !== user.id) throw new InputError("只能附带自己已上架的应用", 403);
+      if (entry.manifest.releaseId !== selection.releaseId) throw new InputError("公开版本已变化，请重新选择应用", 409);
+      application = { appId: entry.manifest.appId, releaseId: entry.manifest.releaseId, title: (entry.title || entry.manifest.title).slice(0, 60), summary: (entry.summary ?? entry.manifest.summary ?? "").slice(0, 300), mark: entry.manifest.mark || "应", accent: /^#[a-f0-9]{6}$/i.test(entry.manifest.accent) ? entry.manifest.accent : "#A77C45" };
+    }
     const media = await Promise.all(ids.map(id => this.ctx.storage.get<Media>(`media:${id}`)));
     if (media.some(item => !item || item.ownerId !== user.id || item.postId || Date.now() - item.createdAt > 86400000)) throw new InputError("图片已失效，请重新选择");
-    const post: Post = { id: await digest(`${user.id}:${input.requestId}`), author: { id: user.id, name: user.name, avatarUrl: user.avatarUrl }, body, images: media.map(item => ({ id: item!.id, url: item!.url })), createdAt: Date.now() };
+    const post: Post = { id: await digest(`${user.id}:${input.requestId}`), author: { id: user.id, name: user.name, avatarUrl: user.avatarUrl }, body, images: media.map(item => ({ id: item!.id, url: item!.url })), createdAt: Date.now(), ...(application ? { application } : {}) };
     await this.ctx.storage.transaction(async storage => {
       await storage.put(postKey(post), post); await storage.put(`id:${post.id}`, postKey(post)); await storage.put(requestKey, { key: postKey(post), fingerprint });
       for (const item of media) await storage.put(`media:${item!.id}`, { ...item!, postId: post.id });
@@ -204,6 +217,7 @@ export async function readSharedPost(request: Request, env: Env) {
   const data = await response.json() as { post?: Post };
   const post = data.post;
   const content = post ? `<h2>${escape(post.author.name)}</h2><p class="date">${escape(new Date(post.createdAt).toISOString().replace("T", " ").slice(0, 16))} UTC</p><p class="body">${escape(post.body)}</p><div class="images">${post.images.map(image => `<img src="${escape(image.url)}" alt="动态图片" loading="lazy">`).join("")}</div>` : "<p>这条动态已删除或暂时无法查看。</p>";
-  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(post ? post.author.name + "的动态" : "动态不存在")} · 紫金花</title><style>body{margin:0;background:#faf8f5;color:#25221f;font:16px/1.7 system-ui,sans-serif}main{max-width:620px;margin:0 auto;padding:28px 20px}h1{font-size:18px;color:#9c7437}h2{margin-bottom:0;font-size:18px}.date{font-size:12px;color:#888}.body{white-space:pre-wrap;overflow-wrap:anywhere}.images{display:grid;gap:10px}img{width:100%;border-radius:14px}</style></head><body><main><h1>紫金花</h1>${content}</main></body></html>`;
+  const app = post?.application ? `<section><h2>应用 · ${escape(post.application.title)}</h2><p>${escape(post.application.summary)}</p><p class="date">在紫金花应用市场搜索此应用，即可查看当前公开版本。</p></section>` : "";
+  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(post ? post.author.name + "的动态" : "动态不存在")} · 紫金花</title><style>body{margin:0;background:#faf8f5;color:#25221f;font:16px/1.7 system-ui,sans-serif}main{max-width:620px;margin:0 auto;padding:28px 20px}h1{font-size:18px;color:#9c7437}h2{margin-bottom:0;font-size:18px}.date{font-size:12px;color:#888}.body{white-space:pre-wrap;overflow-wrap:anywhere}.images{display:grid;gap:10px}img{width:100%;border-radius:14px}section{margin-top:20px;padding:16px;background:white;border-radius:14px}</style></head><body><main><h1>紫金花</h1>${content}${app}</main></body></html>`;
   return new Response(request.method === "HEAD" ? null : html, { status: response.status, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; img-src https:; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'", "x-content-type-options": "nosniff" } });
 }

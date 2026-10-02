@@ -450,7 +450,10 @@ export class Workshop extends DurableObject<Env> {
         return base ? json({ appId, moduleBase: base, ...origin }, 200) : json({ error: "请先在 Jolly 创建这个应用的心愿" }, 404);
       }
       if ((path === "/v1/market" || path === "/v1/applications") && request.method === "GET") {
-        const entries = [...(await this.ctx.storage.list<MarketEntry>({ prefix: "shared:" })).values()];
+        const appId = new URL(request.url).searchParams.get("appId");
+        if (appId && !/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return json({ error: "application id invalid" }, 400);
+        const selected = appId ? await this.ctx.storage.get<MarketEntry>(`shared:${appId}`) : undefined;
+        const entries = appId ? selected ? [selected] : [] : [...(await this.ctx.storage.list<MarketEntry>({ prefix: "shared:" })).values()];
         for (const entry of entries) {
           if ((OFFICIAL_APPLICATIONS as readonly string[]).includes(entry.manifest.appId)) { entry.authorId = OFFICIAL_ACCOUNT_ID; entry.authorName = "紫金花官方"; entry.authorAvatarUrl = null; }
           entry.authorOfficial = entry.authorId === OFFICIAL_ACCOUNT_ID;
