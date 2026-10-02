@@ -30,6 +30,8 @@ export default {
       if (/^\/v1\/notifications(?:\/(?:unread|read))?$/.test(url.pathname)) return env.POSTS.getByName("timeline").fetch(request);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/posts\/[a-f0-9]{64}$/.test(url.pathname)) return readSharedPost(request, env);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/post-images\/[a-f0-9-]{36}\/[a-f0-9-]{36}$/.test(url.pathname)) return readPostImage(request, env);
+      if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/market-images\/[a-z][a-z0-9-]{0,63}\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readPostImage(request, env);
+      if (request.method === "PUT" && /^\/v1\/market-media\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/avatars\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readAvatar(request, env);
       if (request.method === "PUT" && url.pathname === "/v1/catalog") return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "PUT" && /^\/v1\/application-blobs\/[a-z][a-z0-9-]{0,63}\/[a-f0-9]{64}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
@@ -218,7 +220,8 @@ function summarizeWork(task: WorkshopTask, session: CloudSession, application: A
   const ready = isRoundCandidate(task, application);
   return { completed: true, state: "COMPLETED", delivery: ready ? "update" : "unpublished", message: ready ? "作品已发布，可直接体验、继续修改或上架" : "等待本轮候选包发布", ...(ready ? { application } : {}) };
 }
-type MarketEntry = { manifest: ApplicationRelease; title: string; summary: string; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null; sourceCommit?: string; sourceBranch?: string };
+const MARKET_CATEGORIES = ["tools", "productivity", "life", "creative", "other"];
+type MarketEntry = { manifest: ApplicationRelease; title: string; summary: string; category?: string; screenshots?: string[]; publishedAt?: number; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null; sourceCommit?: string; sourceBranch?: string };
 
 export class Workshop extends DurableObject<Env> {
   private activityPages = new Map<string, { version: string; at: number; page: { activities: unknown[]; nextPageToken?: string } }>();
@@ -306,6 +309,7 @@ export class Workshop extends DurableObject<Env> {
     } finally { this.resetting = false; }
   }
   private async write(request: Request, path: string): Promise<Response> {
+    if (path.startsWith("/v1/market-media/")) return this.queue.run(`app:${path.split("/").at(-1)}`, () => this.handle(request));
     if (path.startsWith("/v1/application-blobs/")) {
       const appId = path.split("/")[3];
       if (!await this.publisher(request, appId)) return json({ message: "本轮发布授权已失效" }, 403);
@@ -447,6 +451,36 @@ export class Workshop extends DurableObject<Env> {
   private async handle(request: Request): Promise<Response> {
     try {
       const path = new URL(request.url).pathname;
+      if (path.startsWith("/v1/market-media/") && request.method === "PUT") {
+        const appId = path.split("/").at(-1)!;
+        const user = await authenticatedUser(request, this.env);
+        if (!user) return json({ message: "请先登录" }, 401);
+        const task = await this.ctx.storage.get<WorkshopTask>(`task:${appId}`);
+        if (!task || task.ownerId !== user.id || request.headers.get("X-Workshop-Token") !== task.token) return json({ message: "只能上传自己作品的截图" }, 403);
+        const day = Math.floor(Date.now() / 86400000); const rateKey = `market-media-rate:${user.id}`;
+        const rate = await this.ctx.storage.get<{ day: number; count: number }>(rateKey);
+        const count = rate?.day === day ? rate.count : 0;
+        if (count >= 60) return json({ message: "今天上传的截图较多，请明天再试" }, 429);
+        // Reserve the account-wide quota atomically across different application queues.
+        const reserved = await this.ctx.storage.transaction(async storage => {
+          const prior = await storage.get<{ day: number; count: number }>(rateKey);
+          const value = prior?.day === day ? prior.count : 0;
+          if (value >= 60) return false;
+          await storage.put(rateKey, { day, count: value + 1 }); return true;
+        });
+        if (!reserved) return json({ message: "今天上传的截图较多，请明天再试" }, 429);
+        const maximum = 2 * 1024 * 1024;
+        if (Number(request.headers.get("Content-Length")) > maximum) return json({ message: "截图需小于 2 MB" }, 413);
+        const reader = request.body?.getReader(); if (!reader) return json({ message: "没有截图文件" }, 400);
+        const chunks: Uint8Array[] = []; let size = 0;
+        while (true) { const next = await reader.read(); if (next.done) break; size += next.value.byteLength; if (size > maximum) { await reader.cancel(); return json({ message: "截图需小于 2 MB" }, 413); } chunks.push(next.value); }
+        const bytes = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+        if (size < 32 || bytes[0] !== 255 || bytes[1] !== 216 || bytes[2] !== 255) return json({ message: "截图需为 JPEG 图片" }, 400);
+        const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(value => value.toString(16).padStart(2, "0")).join("");
+        const key = `v1/market-images/${appId}/${user.id}/${hash}`;
+        await this.env.BLOBS.put(key, bytes, { httpMetadata: { contentType: "image/jpeg", cacheControl: "public,max-age=31536000,immutable" } });
+        return json({ url: `${new URL(request.url).origin}/${key}` }, 200);
+      }
       const upload = path.match(/^\/v1\/application-blobs\/([a-z][a-z0-9-]{0,63})\/([a-f0-9]{64})$/);
       if (upload && request.method === "PUT") {
         if (!await this.publisher(request, upload[1])) return json({ message: "本轮发布授权已失效" }, 403);
@@ -479,8 +513,10 @@ export class Workshop extends DurableObject<Env> {
         return base ? json({ appId, moduleBase: base, ...origin }, 200) : json({ error: "请先在 Jolly 创建这个应用的心愿" }, 404);
       }
       if ((path === "/v1/market" || path === "/v1/applications") && request.method === "GET") {
-        const appId = new URL(request.url).searchParams.get("appId");
-        const authorId = new URL(request.url).searchParams.get("authorId");
+        const params = new URL(request.url).searchParams;
+        const appId = params.get("appId"); const authorId = params.get("authorId");
+        const category = params.get("category") || ""; const query = (params.get("q") || "").trim().toLowerCase();
+        if (category && !MARKET_CATEGORIES.includes(category) || query.length > 80) return json({ message: "市场筛选无效" }, 400);
         if (authorId && !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(authorId)) return json({ error: "author id invalid" }, 400);
         if (appId && !/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return json({ error: "application id invalid" }, 400);
         const selected = appId ? await this.ctx.storage.get<MarketEntry>(`shared:${appId}`) : undefined;
@@ -489,13 +525,28 @@ export class Workshop extends DurableObject<Env> {
           if ((OFFICIAL_APPLICATIONS as readonly string[]).includes(entry.manifest.appId)) { entry.authorId = OFFICIAL_ACCOUNT_ID; entry.authorName = "紫金花官方"; entry.authorAvatarUrl = null; }
           entry.authorOfficial = entry.authorId === OFFICIAL_ACCOUNT_ID;
         }
-        const visible = authorId ? entries.filter(entry => entry.authorId === authorId) : entries;
+        const filtered = entries.filter(entry => (!authorId || entry.authorId === authorId) && (!category || (entry.category || "other") === category) && (!query || `${entry.title} ${entry.summary}`.toLowerCase().includes(query)));
+        filtered.sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0) || a.manifest.appId.localeCompare(b.manifest.appId));
+        // Explicit pagination keeps author-profile/internal callers on their existing full-list contract.
+        const paged = params.has("limit") || params.has("cursor");
+        const limit = Number(params.get("limit") || "24");
+        if (paged && (!Number.isInteger(limit) || limit < 1 || limit > 50)) return json({ message: "分页大小无效" }, 400);
+        let after: { at: number; id: string } | undefined;
+        if (params.has("cursor")) {
+          try { const parsed = JSON.parse(atob(params.get("cursor")!)); if (parsed.filter !== JSON.stringify([category, encodeURIComponent(query), authorId, appId]) || !Number.isSafeInteger(parsed.at) || parsed.at < 0 || !/^[a-z][a-z0-9-]{0,63}$/.test(parsed.id)) throw new Error(); after = parsed; }
+          catch { return json({ message: "分页游标无效，请刷新列表" }, 400); }
+        }
+        const remaining = after ? filtered.filter(entry => (entry.publishedAt || 0) < after!.at || (entry.publishedAt || 0) === after!.at && entry.manifest.appId.localeCompare(after!.id) > 0) : filtered;
+        const visible = paged ? remaining.slice(0, limit) : remaining;
+        const last = visible.at(-1);
+        const nextCursor = paged && last && remaining.length > limit ? btoa(JSON.stringify({ at: last.publishedAt || 0, id: last.manifest.appId, filter: JSON.stringify([category, encodeURIComponent(query), authorId, appId]) })) : undefined;
         // Public browsing never authenticates the visitor. Profile lookup is optional enrichment.
         try {
           const profiles = await publicProfiles([...new Set(visible.map(entry => entry.authorId).filter((id): id is string => Boolean(id)))], this.env);
           for (const entry of visible) { const profile = entry.authorId ? profiles.get(entry.authorId) : undefined; if (profile) { entry.authorName = profile.name; entry.authorAvatarUrl = profile.avatarUrl; } }
         } catch { /* Keep published snapshots available if the account service is unavailable. */ }
-        return json({ applications: path === "/v1/applications" ? visible.map(entry => entry.manifest) : visible }, 200);
+        const response = json({ applications: path === "/v1/applications" ? visible.map(entry => entry.manifest) : visible, nextCursor }, 200);
+        response.headers.set("Cache-Control", "no-store"); return response;
       }
       if (new URL(request.url).pathname === "/v1/catalog") {
         if (!await readPublisherGrant(request, this.env.OFFICIAL_PUBLISH_TOKEN) && !await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN)) return json({ error: "unauthorized" }, 401);
@@ -578,7 +629,8 @@ export class Workshop extends DurableObject<Env> {
         if (await this.ctx.storage.get(`task:${appId}`)) return json({ message: "用户作品必须由作者决定上架" }, 409);
         const manifest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/releases/${releaseId}`, "json");
         if (!manifest || manifest.appId !== appId || manifest.releaseId !== releaseId || manifest.source.dirty) return json({ message: "指定版本尚未上传或无效" }, 409);
-        const entry: MarketEntry = { manifest, title: manifest.title, summary: manifest.summary, authorId: OFFICIAL_ACCOUNT_ID, authorName: "紫金花官方", authorOfficial: true, originalAppId: null };
+        const prior = await this.ctx.storage.get<MarketEntry>(`shared:${appId}`);
+        const entry: MarketEntry = { manifest, title: manifest.title, summary: manifest.summary, category: prior?.category || (appId === "jolly" ? "creative" : "other"), screenshots: prior?.screenshots || [], publishedAt: prior?.manifest.releaseId === releaseId ? prior.publishedAt || Date.now() : Date.now(), authorId: OFFICIAL_ACCOUNT_ID, authorName: "紫金花官方", authorOfficial: true, originalAppId: null };
         await this.ctx.storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${releaseId}`]: true });
         await this.ctx.storage.delete(`withdrawn:${appId}`);
         return json({ appId, public: releaseId }, 200);
@@ -637,7 +689,7 @@ export class Workshop extends DurableObject<Env> {
         }));
         const response = json({ works: works.filter(Boolean) }, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
       }
-      const input = await request.json() as { appId?: string; originalAppId?: string; originalReleaseId?: string; requestId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; applicationReleases?: Record<string, string>; pageToken?: string };
+      const input = await request.json() as { appId?: string; originalAppId?: string; originalReleaseId?: string; requestId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; category?: string; screenshots?: string[]; applicationReleases?: Record<string, string>; pageToken?: string };
       const appId = input.appId;
       if (!appId || !/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return json({ message: "请指定目标应用" }, 400);
       const user = await authenticatedUser(request, this.env);
@@ -705,7 +757,14 @@ export class Workshop extends DurableObject<Env> {
         const title = input.title?.trim() ?? shared?.title ?? manifest.title;
         const summary = input.summary?.trim() ?? shared?.summary ?? manifest.summary;
         if (!title || title.length > 60 || summary.length > 300) return json({ message: "名称不能为空且最多 60 字，介绍最多 300 字" }, 400);
-        const entry: MarketEntry = { manifest, title, summary, authorId: user.id, authorName: user.name, authorAvatarUrl: user.avatarUrl, authorOfficial: user.id === OFFICIAL_ACCOUNT_ID, originalAppId: (manifest as ApplicationRelease & { originalAppId?: string }).originalAppId ?? null, sourceCommit: input.action === "edit" ? shared!.sourceCommit : proof?.commit ?? manifest.source.commit, sourceBranch: input.action === "edit" ? shared!.sourceBranch : task.branch };
+        const category = input.category ?? shared?.category ?? "other"; const screenshots = input.screenshots ?? shared?.screenshots ?? [];
+        if (!MARKET_CATEGORIES.includes(category) || !Array.isArray(screenshots) || screenshots.length > 6 || new Set(screenshots).size !== screenshots.length) return json({ message: "请选择分类，截图最多六张且不能重复" }, 400);
+        for (const screenshot of screenshots) {
+          if (typeof screenshot !== "string") return json({ message: "截图格式无效" }, 400);
+          const prefix = `${new URL(request.url).origin}/v1/market-images/${appId}/${user.id}/`;
+          if (!screenshot.startsWith(prefix) || !/^[a-f0-9]{64}$/.test(screenshot.slice(prefix.length)) || !await this.env.BLOBS.head(screenshot.slice(new URL(request.url).origin.length + 1))) return json({ message: "截图未上传或不属于这个作品" }, 400);
+        }
+        const entry: MarketEntry = { manifest, title, summary, category, screenshots, publishedAt: input.action === "edit" ? shared!.publishedAt || 0 : shared?.manifest.releaseId === manifest.releaseId ? shared.publishedAt || Date.now() : Date.now(), authorId: user.id, authorName: user.name, authorAvatarUrl: user.avatarUrl, authorOfficial: user.id === OFFICIAL_ACCOUNT_ID, originalAppId: (manifest as ApplicationRelease & { originalAppId?: string }).originalAppId ?? null, sourceCommit: input.action === "edit" ? shared!.sourceCommit : proof?.commit ?? manifest.source.commit, sourceBranch: input.action === "edit" ? shared!.sourceBranch : task.branch };
         await this.ctx.storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${manifest.releaseId}`]: true });
         await this.ctx.storage.delete(`withdrawn:${appId}`);
         return json({ shared: entry, application }, 200);
