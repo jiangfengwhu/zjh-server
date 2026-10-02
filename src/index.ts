@@ -380,7 +380,7 @@ export class Workshop extends DurableObject<Env> {
     if (pageToken) query.set("pageToken", pageToken);
     const response = await fetch(`https://jules.googleapis.com/v1alpha/${name}/activities?${query}`, { headers: { "X-Goog-Api-Key": this.env.JULES_API_KEY, "X-Goog-FieldMask": ACTIVITY_MASK }, signal: AbortSignal.timeout(6000) });
     if (!response.ok) throw new Error("制作记录暂时无法同步，请重试");
-    return response.json() as Promise<{ activities?: unknown[]; nextPageToken?: string }>;
+    return JSON.parse(redactPublisherGrants(await response.text())) as { activities?: unknown[]; nextPageToken?: string };
   }
   private async recentActivities(session: CloudSession) {
     const name = session.name!; const version = `${session.state}:${session.updateTime || ""}`;
@@ -757,7 +757,7 @@ export class Workshop extends DurableObject<Env> {
           status.delivery = input.applicationReleases?.[appId] === status.application.releaseId ? "loaded" : "update";
           this.ctx.waitUntil(this.queue.run(`app:${appId}`, async () => {
             const current = await this.ctx.storage.get<WorkshopTask>(`task:${appId}`);
-            if (current?.publishEpoch === task.publishEpoch) await this.recordBranch(current, session, status.application!);
+            if (!this.resetting && current && current.publishEpoch === task.publishEpoch) await this.recordBranch(current, session, status.application!);
           }));
         }
         const response = json({ session: { state: session.state, url: session.url, title: task.title, createTime: session.createTime, updateTime: session.updateTime }, status, sharing: { shared: shared?.authorId === user.id ? shared : null, application }, ...activityResult }, 200);
