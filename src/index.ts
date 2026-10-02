@@ -36,7 +36,7 @@ export default {
       if (request.method === "PUT" && url.pathname === "/v1/catalog") return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "PUT" && /^\/v1\/application-blobs\/[a-z][a-z0-9-]{0,63}\/[a-f0-9]{64}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (/^\/v1\/applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|candidate|public|releases\/[a-f0-9]{64})$/.test(url.pathname) || ["/v1/official-release", "/v1/development-reset", "/v1/works", "/v1/market"].includes(url.pathname) || /^\/v1\/application-allocation\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
-      if (request.method === "GET" && url.pathname === "/v1/applications") return env.WORKSHOP.getByName("dynamic").fetch(request);
+      if (request.method === "GET" && ["/v1/applications", "/v1/application-updates"].includes(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && url.pathname === "/v1/workshop") return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && url.pathname === "/v1/jules") {
         const operation = await request.clone().json() as { method?: string; path?: string };
@@ -451,6 +451,13 @@ export class Workshop extends DurableObject<Env> {
   private async handle(request: Request): Promise<Response> {
     try {
       const path = new URL(request.url).pathname;
+      if (path === "/v1/application-updates" && request.method === "GET") {
+        const ids = [...new Set((new URL(request.url).searchParams.get("ids") || "").split(","))];
+        if (!ids.length || ids.length > 100 || ids.some(id => !/^[a-z][a-z0-9-]{0,63}$/.test(id))) return json({ message: "应用列表无效" }, 400);
+        const entries = await this.ctx.storage.get<MarketEntry>(ids.map(id => `shared:${id}`));
+        const response = json({ applications: ids.map(appId => ({ appId, manifest: entries.get(`shared:${appId}`)?.manifest ?? null })) }, 200);
+        response.headers.set("Cache-Control", "no-store"); return response;
+      }
       if (path.startsWith("/v1/market-media/") && request.method === "PUT") {
         const appId = path.split("/").at(-1)!;
         const user = await authenticatedUser(request, this.env);
