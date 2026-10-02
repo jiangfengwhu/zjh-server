@@ -31,6 +31,8 @@ export default {
       if ((request.method === "GET" || request.method === "HEAD") && /^\/posts\/[a-f0-9]{64}$/.test(url.pathname)) return readSharedPost(request, env);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/post-images\/[a-f0-9-]{36}\/[a-f0-9-]{36}$/.test(url.pathname)) return readPostImage(request, env);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/market-images\/[a-z][a-z0-9-]{0,63}\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readPostImage(request, env);
+      if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/feedback-images\/[a-z][a-z0-9-]{0,63}\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readPostImage(request, env);
+      if (request.method === "PUT" && /^\/v1\/feedback-media\/[a-z][a-z0-9-]{0,63}\/[a-f0-9]{64}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "PUT" && /^\/v1\/market-media\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/avatars\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readAvatar(request, env);
       if (request.method === "PUT" && url.pathname === "/v1/catalog") return env.WORKSHOP.getByName("dynamic").fetch(request);
@@ -309,7 +311,7 @@ export class Workshop extends DurableObject<Env> {
     } finally { this.resetting = false; }
   }
   private async write(request: Request, path: string): Promise<Response> {
-    if (path.startsWith("/v1/market-media/")) return this.queue.run(`app:${path.split("/").at(-1)}`, () => this.handle(request));
+    if (path.startsWith("/v1/market-media/") || path.startsWith("/v1/feedback-media/")) return this.queue.runAll([`app:${path.split("/")[3]}`, "media-buffer"], () => this.handle(request));
     if (path.startsWith("/v1/application-blobs/")) {
       const appId = path.split("/")[3];
       if (!await this.publisher(request, appId)) return json({ message: "本轮发布授权已失效" }, 403);
@@ -458,12 +460,19 @@ export class Workshop extends DurableObject<Env> {
         const response = json({ applications: ids.map(appId => ({ appId, manifest: entries.get(`shared:${appId}`)?.manifest ?? null })) }, 200);
         response.headers.set("Cache-Control", "no-store"); return response;
       }
-      if (path.startsWith("/v1/market-media/") && request.method === "PUT") {
-        const appId = path.split("/").at(-1)!;
+      if ((path.startsWith("/v1/market-media/") || path.startsWith("/v1/feedback-media/")) && request.method === "PUT") {
+        const feedback = path.startsWith("/v1/feedback-media/");
+        const appId = path.split("/")[3]; const releaseId = feedback ? path.split("/")[4] : undefined;
         const user = await authenticatedUser(request, this.env);
         if (!user) return json({ message: "请先登录" }, 401);
         const task = await this.ctx.storage.get<WorkshopTask>(`task:${appId}`);
-        if (!task || task.ownerId !== user.id || request.headers.get("X-Workshop-Token") !== task.token) return json({ message: "只能上传自己作品的截图" }, 403);
+        if (feedback) {
+          const owned = task?.ownerId === user.id;
+          const publicVersion = await this.ctx.storage.get<boolean>(`published:${appId}:${releaseId}`);
+          if (!owned && !publicVersion) return json({ message: "只能为自己的作品或公开版本附带反馈截图" }, 403);
+          const candidate = await this.candidate(appId);
+          if (candidate?.releaseId !== releaseId && !await this.env.CATALOG.get(`v1/applications/${appId}/releases/${releaseId}`)) return json({ message: "体验版本不存在，请重新打开应用" }, 404);
+        } else if (!task || task.ownerId !== user.id || request.headers.get("X-Workshop-Token") !== task.token) return json({ message: "只能上传自己作品的截图" }, 403);
         const day = Math.floor(Date.now() / 86400000); const rateKey = `market-media-rate:${user.id}`;
         const rate = await this.ctx.storage.get<{ day: number; count: number }>(rateKey);
         const count = rate?.day === day ? rate.count : 0;
@@ -484,7 +493,7 @@ export class Workshop extends DurableObject<Env> {
         const bytes = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
         if (size < 32 || bytes[0] !== 255 || bytes[1] !== 216 || bytes[2] !== 255) return json({ message: "截图需为 JPEG 图片" }, 400);
         const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(value => value.toString(16).padStart(2, "0")).join("");
-        const key = `v1/market-images/${appId}/${user.id}/${hash}`;
+        const key = `v1/${feedback ? "feedback-images" : "market-images"}/${appId}/${user.id}/${hash}`;
         await this.env.BLOBS.put(key, bytes, { httpMetadata: { contentType: "image/jpeg", cacheControl: "public,max-age=31536000,immutable" } });
         return json({ url: `${new URL(request.url).origin}/${key}` }, 200);
       }
