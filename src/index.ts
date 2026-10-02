@@ -207,13 +207,13 @@ function pathBeforeQuery(path: string): string {
 }
 type ApplicationRelease = { appId: string; releaseId: string; title: string; summary: string; modules: { base: number }; source: { repository: string; commit: string; tree?: string; dirty: boolean } };
 type WorkshopTask = { branch?: string; branchCommit?: string; roundRelease?: string; dispatchVersion?: string; originalBranch?: string; ownerId: string; appId: string; session: string; token: string; phase: "working" | "ready" | "paused"; previousCommit?: string; repair?: boolean; publishEpoch?: string; requestId?: string; creationTitle?: string; creationRejected?: boolean; title?: string; wish?: string; originalAppId?: string; originalReleaseId?: string; originalCommit?: string; startedAt?: number };
-type CloudSession = { name?: string; state?: string; updateTime?: string; sourceContext?: { source?: string }; outputs?: { pullRequest?: { url?: string } }[] };
+type CloudSession = { name?: string; state?: string; url?: string; title?: string; createTime?: string; updateTime?: string; sourceContext?: { source?: string }; outputs?: { pullRequest?: { url?: string } }[] };
 type WorkSummary = { completed: boolean; state: string; delivery: string; message: string; application?: ApplicationRelease; stale?: boolean };
 function isRoundCandidate(task: WorkshopTask, application: ApplicationRelease | null): application is ApplicationRelease {
   return Boolean(application && (task.roundRelease ? task.roundRelease === application.releaseId : application.source.commit !== task.previousCommit));
 }
 function summarizeWork(task: WorkshopTask, session: CloudSession, application: ApplicationRelease | null): WorkSummary {
-  if (task.phase === "paused") return { completed: false, state: "PAUSED", delivery: "unpublished", message: "已发送停止请求，可以继续这个应用" };
+  if (task.phase === "paused") return { completed: false, state: session.state === "FAILED" ? "FAILED" : "PAUSED", delivery: "unpublished", message: session.state === "FAILED" ? "制作失败，可以在当前作品继续处理" : "制作已暂停，可以继续这个应用" };
   if (session.state !== "COMPLETED") return { completed: false, state: session.state ?? "QUEUED", delivery: "unpublished", message: ["FAILED", "PAUSED"].includes(session.state ?? "") ? "制作已暂停，可以继续处理" : "这轮作品仍在制作" };
   const ready = isRoundCandidate(task, application);
   return { completed: true, state: "COMPLETED", delivery: ready ? "update" : "unpublished", message: ready ? "作品已发布，可直接体验、继续修改或上架" : "等待本轮候选包发布", ...(ready ? { application } : {}) };
@@ -221,6 +221,7 @@ function summarizeWork(task: WorkshopTask, session: CloudSession, application: A
 type MarketEntry = { manifest: ApplicationRelease; title: string; summary: string; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null; sourceCommit?: string; sourceBranch?: string };
 
 export class Workshop extends DurableObject<Env> {
+  private activityPages = new Map<string, { version: string; at: number; page: { activities: unknown[]; nextPageToken?: string } }>();
   private summaries = new Map<string, Promise<void>>();
   private summarySlots = new KeyedQueue();
   private summarySlot = 0;
@@ -373,6 +374,32 @@ export class Workshop extends DurableObject<Env> {
     const session = await response.json() as CloudSession;
     if (session.sourceContext?.source !== PLUGIN_SOURCE) throw new Error("Session 仓库不匹配");
     return session;
+  }
+  private async activities(name: string, pageToken = "") {
+    const query = new URLSearchParams({ pageSize: "100" });
+    if (pageToken) query.set("pageToken", pageToken);
+    const response = await fetch(`https://jules.googleapis.com/v1alpha/${name}/activities?${query}`, { headers: { "X-Goog-Api-Key": this.env.JULES_API_KEY, "X-Goog-FieldMask": ACTIVITY_MASK }, signal: AbortSignal.timeout(6000) });
+    if (!response.ok) throw new Error("制作记录暂时无法同步，请重试");
+    return response.json() as Promise<{ activities?: unknown[]; nextPageToken?: string }>;
+  }
+  private async recentActivities(session: CloudSession) {
+    const name = session.name!; const version = `${session.state}:${session.updateTime || ""}`;
+    const cached = this.activityPages.get(name);
+    if (cached?.version === version && Date.now() - cached.at < 30000) return { ...cached.page, stale: false };
+    const activities: unknown[] = []; let nextPageToken: string | undefined;
+    // Jules exposes pagination but no documented ordering/filter. Preserve the
+    // existing four-page bound; remaining records are explicitly pageable.
+    try {
+      for (let index = 0; index < 4; index++) {
+        const page = await this.activities(name, nextPageToken);
+        activities.push(...page.activities || []); nextPageToken = page.nextPageToken;
+        if (!nextPageToken) break;
+      }
+      const page = { activities, nextPageToken };
+      if (this.activityPages.size >= 32) this.activityPages.delete(this.activityPages.keys().next().value!);
+      this.activityPages.set(name, { version, at: Date.now(), page });
+      return { ...page, stale: false };
+    } catch { return { ...(cached?.page ?? { activities }), stale: true }; }
   }
   private async allocate(appId: string): Promise<number> {
     const existing = await this.ctx.storage.get<number>(`allocation:${appId}`); if (existing) return existing;
@@ -610,7 +637,7 @@ export class Workshop extends DurableObject<Env> {
         }));
         const response = json({ works: works.filter(Boolean) }, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
       }
-      const input = await request.json() as { appId?: string; originalAppId?: string; originalReleaseId?: string; requestId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; applicationReleases?: Record<string, string> };
+      const input = await request.json() as { appId?: string; originalAppId?: string; originalReleaseId?: string; requestId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; applicationReleases?: Record<string, string>; pageToken?: string };
       const appId = input.appId;
       if (!appId || !/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return json({ message: "请指定目标应用" }, 400);
       const user = await authenticatedUser(request, this.env);
@@ -708,6 +735,34 @@ export class Workshop extends DurableObject<Env> {
         return proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify(input) }), this.env);
       }
       if (input.session !== task.session) return json({ message: "Session 不属于这个应用" }, 403);
+      if (input.action === "activities") {
+        if (typeof input.pageToken !== "string" || !input.pageToken || input.pageToken.length > 4096) return json({ message: "制作记录游标无效" }, 400);
+        const response = json(await this.activities(task.session, input.pageToken), 200);
+        response.headers.set("Cache-Control", "private,no-store"); return response;
+      }
+      if (input.action === "detail") {
+        const [session, application, shared] = await Promise.all([
+          this.session(task.session), this.candidate(appId), this.ctx.storage.get<MarketEntry>(`shared:${appId}`),
+        ]);
+        const activityResult = await this.recentActivities({ ...session, name: task.session });
+        const status = summarizeWork(task, session, application);
+        // A stopped round must not be resumed merely because Jules still reports work.
+        if (task.phase === "paused" && session.state !== "FAILED") session.state = "PAUSED";
+        if (task.phase !== "paused" && ["FAILED", "PAUSED"].includes(session.state || "")) { task.phase = "paused"; task.repair = true; }
+        if (status.completed) { task.phase = status.application ? "ready" : "working"; task.repair = !status.application; }
+        if (status.application?.title) task.title = status.application.title;
+        await this.saveTask(task);
+        await this.ctx.storage.put(`work-summary:${appId}`, { key: this.summaryKey(task, application), at: Date.now(), status });
+        if (status.application) {
+          status.delivery = input.applicationReleases?.[appId] === status.application.releaseId ? "loaded" : "update";
+          this.ctx.waitUntil(this.queue.run(`app:${appId}`, async () => {
+            const current = await this.ctx.storage.get<WorkshopTask>(`task:${appId}`);
+            if (current?.publishEpoch === task.publishEpoch) await this.recordBranch(current, session, status.application!);
+          }));
+        }
+        const response = json({ session: { state: session.state, url: session.url, title: task.title, createTime: session.createTime, updateTime: session.updateTime }, status, sharing: { shared: shared?.authorId === user.id ? shared : null, application }, ...activityResult }, 200);
+        response.headers.set("Cache-Control", "private,no-store"); return response;
+      }
       const session = await this.session(task.session);
       if (task.dispatchVersion && task.dispatchVersion !== `${session.state}:${session.updateTime ?? ""}`) { task.dispatchVersion = undefined; await this.saveTask(task); }
       if (input.action === "stop") {
