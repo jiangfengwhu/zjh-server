@@ -770,7 +770,7 @@ export class Posts extends DurableObject<Env> {
       new Set(ids).size !== ids.length ||
       (!body && !ids.length && !selection && !content)
     )
-      throw new InputError("动态需有文字、图片或应用，最多 2000 字、4 张图");
+      throw new InputError("动态需有文字、HTML、图片或应用，正文最多 2000 字、4 张图");
     const fingerprint = await digest(
       JSON.stringify({
         body,
