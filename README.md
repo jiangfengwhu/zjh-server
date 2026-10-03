@@ -1,56 +1,28 @@
 # 紫金花服务端
 
-独立维护 Cloudflare Worker：账号、应用清单、R2 产物和 Jules 工坊代理。Android 在 zjh-android，SDK/宿主在 zjh-dynamic，应用与云端任务在 zjh-plugin。本仓库只供本地维护者使用。
+Cloudflare Worker 提供账号、动态互动、应用清单、产物读取与 Jules 制作代理。SDK/宿主在 zjh-dynamic，APK 在 zjh-android，应用源码和云端 Agent 规则在 zjh-plugin。
 
-## 开发与部署
+## 安装与部署
 
-执行 npm ci、npm run typecheck 和 npx wrangler deploy --dry-run；协调升级后执行 npm run deploy。保留现有 Worker、zijinhua.297782.xyz 域名、CATALOG KV、BLOBS R2、WORKSHOP/ACCOUNTS Durable Object 与数据。纯文档修改无需部署。
+在仓库根目录执行 npm ci；需部署时，维护者登录 Cloudflare Wrangler 后运行 npm run deploy。保留 wrangler.jsonc 中现有资源绑定，不另建生产存储。纯文档修改不部署。
 
-JULES_API_KEY、GITHUB_MERGE_TOKEN、OFFICIAL_PUBLISH_TOKEN 只保留在服务端及维护者安全环境。GitHub/Jules 集成仅开放 zjh-plugin；现有 GITHUB_MERGE_TOKEN 仅用于读取该仓库分支与导出信息，交付流程不调用 merge。旧 PUBLISH_TOKEN 不再允许发布。本地 .dev.vars 忽略，不提交凭证和缓存。
+Secrets 通过 npx wrangler secret put <NAME> 交互配置，不把值写入代码或命令文本：
 
-## 邮箱登录
+- JULES_API_KEY：制作服务。
+- GITHUB_MERGE_TOKEN：读取插件仓库分支和导出信息，交付流程不合入 PR。
+- OFFICIAL_PUBLISH_TOKEN：维护者发布及本轮应用授权签发，不提供给云端。
+- RESEND_API_KEY、MAIL_FROM：验证码邮件；MAIL_FROM 使用 Resend 已验证域名的发件邮箱。
 
-在 Resend 验证发件域名后，用交互输入配置 Secrets，不将值放进代码或命令文本：
+本地 .dev.vars 不提交。GitHub/Jules 集成仅开放 zjh-plugin，云端没有 R2、Wrangler 或全局发布权限。
 
-~~~powershell
-npx wrangler secret put RESEND_API_KEY
-npx wrangler secret put MAIL_FROM
-~~~
+## 接口边界
 
-MAIL_FROM 格式为「紫金花 <login@你的已验证域名>」。缺配置时返回 503，不生成假验证码。POST /v1/auth/code 发送验证码；POST /v1/auth/verify 登录或创建账号，签发 90 天随机凭据，手机保存到 Keychain/Keystore。服务端只保存验证码及登录凭据摘要；验证码有效 10 分钟、最多 5 次验证、60 秒重发间隔，并限制邮箱、IP 和全局发送频率。按邮箱串行，网络发信不阻塞其他邮箱或内部身份读取，限额事务更新。
+- /v1/auth/*、/v1/account：验证码登录与资料；账号凭证仅由宿主保管。
+- /v1/posts、/v1/notifications、/v1/profiles：动态、互动与公开身份。
+- /v1/workshop、/v1/works、/v1/jules：按账号和 appId 管理制作；同应用复用 session，同轮写操作串行，不同应用可并行。
+- /v1/application-blobs/<id>/<sha256>、/v1/catalog：校验本轮授权、包哈希及 expectedReleases 原子基线，冲突返回 409。candidate 为权威候选，latest 为私有镜像，不检查应用提交祖先。
+- /v1/market、应用 public：只提供作者主动公开的版本。体验候选可选，后续发包不改变已有公开版本；已公开快照仍可供已安装应用读取。
+- /v1/official-release：维护者指定官方公开版本，官方身份由服务端生成，无邮箱登录。
+- /v1/runtime：配套 APK 的运行时契约，普通应用发布不能修改。
 
-GET/PATCH /v1/account 读取资料或修改 1–24 字昵称；PUT/DELETE /v1/account/avatar 管理头像，接受不超过 1 MB 的 JPEG/PNG/WebP 并存入 R2 不可变地址；POST /v1/auth/logout 撤销当前登录凭据。以上要求账号 Bearer。公开市场昵称头像不包含邮箱或登录凭据。
-
-## 作品与确认
-
-创建、修改、停止、分享、编辑和撤回都核对账号归属与作品 token。GET /v1/works 仅为当前账号返回作品、session 和作品凭据，换机可接回。创建携带稳定 requestId，在请求 Jules 前记录任务及唯一标题；结果不明确时恢复同一会话，不重复创建。
-
-WORKSHOP 按应用串行，公开读取不等待云端请求；不同应用可并行，同应用本轮完成后直接继续 session 的新轮次。默认每账号每天 10 轮、同时最多 3 个制作任务，短事务预留额度。模块范围由事务分配，既有 appId 与范围保持稳定。
-
-POST /v1/workshop status 接回候选交付，不再提供 confirm 操作。作品完成后可以直接体验或继续修改，作者主动上架指定的最新候选 releaseId，才会更新市场公开版本；旧公开版本不会随发包自动改变。
-
-## 发布授权
-
-Jules 只接受 sources/github/jiangfengwhu/zjh-plugin。新会话禁用共享环境变量，平台在私有任务提示中签发 HMAC 授权，绑定 appId、ownerId、制作轮次和 7 天有效期；手机返回的 session/活动文本隐藏授权。暂停、交付完成或开启新轮次撤销旧授权。云端不得取得服务端密钥或本机管理权限。
-
-SDK 1.1.7 的 authorize 将授权保存到 Git 元数据；PUT /v1/application-blobs/<id>/<sha256> 校验轮次、最大 40 MB 和内容哈希后写内容地址。PUT /v1/catalog 只允许该应用清单，携带 expectedReleases（首次 null），按应用串行比较权威 candidate 指针，冲突返回 409。KV latest 只作镜像；模块范围在写镜像前事务预留。不可变清单与候选须相同，包体须已上传。宿主 release/vendor 只用维护者凭据，/v1/runtime 不通过此接口修改。
-
-原作复制绑定 originalAppId、originalReleaseId、originalCommit；初始化读取锁定 Git 提交的 src/assets 与纯 JS 依赖，不能改用 main 的新版源码。
-
-## 开发者上架
-
-应用共用 RN/JS 环境，appId 不构成恶意代码沙箱。开发阶段由开发者决定上架，制作和市场变更由宿主确认；当前不做恶意代码审核，未来 AI 检测另行建设。
-
-candidate（latest 为私有别名）→ 作者可选体验 → 作者主动上架 → public。后续候选发布保留旧公开版本。候选和未公开清单仅允许该轮发布授权或账号加 X-Workshop-Token；市场、应用列表、APK seed、安装和回退只读开发者上架的 public。包体内容地址保持可读，不得将业务隐私资料打进包。
-
-GET /v1/applications/<id>/releases/<releaseId> 对已经公开过的快照保持可读，便于已安装应用在更新或撤回后继续运行；私有候选仍须鉴权。已安装公开快照允许离线启动。
-
-官方发布者固定 ID 为 00000000-0000-4000-8000-000000000001，昵称「紫金花官方」，email=null，无验证码登录入口。仅 Jolly 为内置官方应用。维护者经 POST /v1/official-release 明确指定不可变版本公开；云端不能调用。authorOfficial 由服务端生成，改昵称不能获得官方身份。
-
-升级须协调 SDK 固定 tarball、server、宿主和 Jolly，旧工具不兼容新授权接口。部署前停止旧任务，撤销历史云端共享 R2 凭据并从 Jules 环境移除；禁用新会话变量不能收回历史密钥，旧会话继续前须清除环境或迁移。完整顺序见 zjh-dynamic/docs/market-trust.md。
-
-开发清库：维护者以 POST /v1/development-reset 及 confirm=RESET_WORKSHOP_DEVELOPMENT_DATA 清除普通账号、登录凭证、验证码、额度、工坊任务和非 Jolly 应用清单及分享；只保留官方身份、当前公开 Jolly 版本、runtime/宿主清单及不可变产物。重置期间拒绝新工坊请求并等待在途操作结束。清库后须重新登录。不支持历史仓库基线或匿名任务迁移。
-
-用户应用在 Jules 自动创建的分支长期迭代。平台从导出信息记录分支和可获取的源码提交，此信息读取失败不阻塞候选体验。main 只维护官方应用。Remix 创建新的应用 ID、owner 与独立分支，从原应用分支开始，并保留原作版本来源。
-
-同一应用的写操作串行执行；制作轮次变更使旧发布授权失效。sendMessage 记录 Jules 状态版本，拒绝多设备重复提交同一轮。SDK 1.1.9 移除应用发布的提交祖先检查，仍保留授权、CAS、包体完整性和运行时兼容校验。
+制作提示由服务端注入本轮授权与任务上下文；Jolly 只整理用户需求，通用开发与发包规则引用插件及 SDK 文档。Remix 锁定原作 releaseId/commit，为新应用分配独立身份和模块范围。共享 JS 环境不是恶意代码沙箱。

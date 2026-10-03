@@ -358,7 +358,7 @@ export class Workshop extends DurableObject<Env> {
   }
   private async publisherInstruction(task: WorkshopTask) {
     const grant = await issuePublisherGrant({ appId: task.appId, ownerId: task.ownerId, epoch: task.publishEpoch! }, this.env.OFFICIAL_PUBLISH_TOKEN);
-    return `使用 SDK 1.2.3 或更新版本；已有分支如工具过旧，执行 npm install --save-dev @zijinhua/app-sdk@https://zjh-cdn.297782.xyz/v1/sdk/c6e37891c1a2ff49db4233267f72f76531a8d28cfcfcba471ef85f2e1f67f6fe，只更新根 SDK 依赖与锁文件，不同步 main。先阅读 SDK 包内 dist/libraries.md 和 dist/platform.json，使用其中公开入口与 getAppContext 能力；不要另装共享 RN 库。发包前执行 npx zjh-app authorize ${task.appId} '${grant}'，只授权本应用本轮候选发布；不得输出授权、提交授权文件或使用环境里的旧全局发布凭据。`;
+    return `先阅读仓库 AGENTS.md 和已安装 SDK 的 README.md，按文档完成安装后保存本轮授权：npx --no-install zjh-app authorize ${task.appId} '${grant}'。`;
   }
   private async recoverSession(task: WorkshopTask): Promise<WorkshopTask> {
     if (task.session || !task.creationTitle) return task;
@@ -743,8 +743,8 @@ export class Workshop extends DurableObject<Env> {
         payload.title = task.creationTitle;
         payload.sourceContext = { source: PLUGIN_SOURCE, githubRepoContext: { startingBranch: originalBranch ?? "main" }, environmentVariablesEnabled: false };
         await this.saveTask(task);
-        const origin = original ? `从原作分支 ${originalBranch ?? "main"} 新建属于本作者的独立分支，禁止修改原作分支。原作 ${original.appId} 的版本 ${original.releaseId}、源码提交 ${originalCommit} 已锁定，init 工具会从这个提交复制 src/assets；不得改用 main 的新版。` : "";
-        payload.prompt = `目标应用：${appId}；只交付 apps/${appId}/。${await this.publisherInstruction(task)} Jules 自动创建的工作分支就是本应用的长期分支；不合入或同步 main。新建时执行 npm run init:application -- ${appId}，平台分配 moduleBase=${moduleBase}。${origin} 用户需求：\n${prompt}`;
+        const origin = original ? `Remix 来源：应用 ${original.appId}，分支 ${originalBranch ?? "main"}，版本 ${original.releaseId}，源码提交 ${originalCommit}；init 使用此锁定提交。` : "";
+        payload.prompt = `创建应用 ${appId}，目录 apps/${appId}/，平台分配 moduleBase=${moduleBase}；使用本 session 自动创建的应用分支。${await this.publisherInstruction(task)} ${origin} 用户需求：\n${prompt}`;
         const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
         if (!response.ok) { task.phase = "paused"; task.creationRejected = response.status >= 400 && response.status < 500; await this.saveTask(task); return response; }
         const session = await response.json() as CloudSession;
@@ -802,7 +802,7 @@ export class Workshop extends DurableObject<Env> {
           task.phase = "working"; task.repair = false; task.wish = String(payload.prompt ?? ""); task.startedAt = Date.now();
           // Persist the new round before upstream work starts; ambiguous timeouts can still deliver.
           await this.saveTask(task);
-          payload.prompt = `继续修改应用 ${appId}，只改 apps/${appId}/ 与所需根锁文件。${await this.publisherInstruction(task)} ${task.branch ? `在应用专属分支 ${task.branch} 继续迭代，git fetch origin 后 checkout 该分支。` : "继续使用这个 session 自动创建的应用分支。"} 不同步或合入 main，不新建迭代 PR；提交并发包即可交付。 用户需求：\n${payload.prompt ?? ""}`;
+          payload.prompt = `继续修改应用 ${appId}，目录 apps/${appId}/。${task.branch ? `目标分支：${task.branch}，git fetch origin 后 checkout 该分支。` : "目标分支：本 session 自动创建的应用分支。"} ${await this.publisherInstruction(task)} 用户需求：\n${payload.prompt ?? ""}`;
           const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
           if (!response.ok && response.status < 500) await this.saveTask(previous);
           return response;
