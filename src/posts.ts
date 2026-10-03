@@ -153,30 +153,60 @@ export class Posts extends DurableObject<Env> {
         return json({ reset: true });
       }
       if (url.pathname === "/v1/posts" && request.method === "GET") {
+        const following = url.searchParams.get("feed") === "following";
+        const viewer = request.headers.has("Authorization")
+          ? await authenticatedUser(request, this.env)
+          : null;
+        if (following && !viewer) return json({ posts: [], nextCursor: null });
+        const followed = following ? new Set<string>() : null;
+        if (followed) {
+          let after: string | undefined;
+          while (true) {
+            const records = await this.ctx.storage.list<boolean>({
+              prefix: `follow:${viewer!.id}:`,
+              startAfter: after,
+              limit: 500,
+            });
+            for (const key of records.keys()) followed.add(key.split(":")[2]);
+            if (records.size < 500) break;
+            after = [...records.keys()].at(-1);
+          }
+          if (!followed.size) return json({ posts: [], nextCursor: null });
+        }
         const cursor = url.searchParams.get("cursor") || undefined;
         const authorId = url.searchParams.get("authorId") || undefined;
         if (authorId && !uuid.test(authorId))
           throw new InputError("作者标识无效");
         if (cursor && !/^post:\d{13}:[a-f0-9]{64}$/.test(cursor))
           throw new InputError("分页标记无效");
-        const limit = authorId ? 500 : 50;
-        const entries = await this.ctx.storage.list<Post>({
-          prefix: "post:",
-          startAfter: cursor,
-          limit: limit + 1,
-        });
-        const scanned = [...entries].slice(0, limit);
-        const matching = authorId
-          ? scanned.filter(([, post]) => post.author.id === authorId)
-          : scanned;
+        const limit = authorId || following ? 500 : 51;
+        const matching: Array<[string, Post]> = [];
+        let after = cursor;
+        let hasMore = false;
+        let scannedCount = 0;
+        do {
+          const entries = await this.ctx.storage.list<Post>({
+            prefix: "post:",
+            startAfter: after,
+            limit,
+          });
+          for (const entry of entries) {
+            after = entry[0];
+            scannedCount++;
+            if (
+              (!authorId || entry[1].author.id === authorId) &&
+              (!followed || followed.has(entry[1].author.id))
+            )
+              matching.push(entry);
+            if (matching.length > 50) break;
+          }
+          hasMore = entries.size === limit;
+        } while (matching.length <= 50 && hasMore && scannedCount < 5000);
         const page = matching.slice(0, 50);
         const profiles = await publicProfiles(
           [...new Set(page.map(([, post]) => post.author.id))],
           this.env
         );
-        const viewer = request.headers.has("Authorization")
-          ? await authenticatedUser(request, this.env)
-          : null;
         return json({
           posts: await Promise.all(
             page.map(async ([, post]) =>
@@ -190,11 +220,7 @@ export class Posts extends DurableObject<Env> {
             )
           ),
           nextCursor:
-            matching.length > 50
-              ? page.at(-1)![0]
-              : entries.size > limit
-              ? scanned.at(-1)![0]
-              : null,
+            matching.length > 50 ? page.at(-1)![0] : hasMore ? after : null,
           unreadCount: viewer
             ? (await this.ctx.storage.get<number>(
                 `notice-unread:${viewer.id}`
@@ -232,7 +258,11 @@ export class Posts extends DurableObject<Env> {
           posts: unknown[];
           nextCursor: string | null;
         };
+        const viewer = request.headers.has("Authorization")
+          ? await authenticatedUser(request, this.env)
+          : null;
         return json({
+          ...(await this.followStatus(profileId, viewer?.id)),
           author: { ...author, official: profileId === OFFICIAL_ACCOUNT_ID },
           applications: applications.applications,
           ...posts,
@@ -296,6 +326,37 @@ export class Posts extends DurableObject<Env> {
             0,
         });
       return await this.queue.run(user.id, async () => {
+        const followId = url.pathname.match(
+          /^\/v1\/profiles\/([a-f0-9-]{36})\/follow$/
+        )?.[1];
+        if (
+          followId &&
+          (request.method === "POST" || request.method === "DELETE")
+        ) {
+          if (!uuid.test(followId) || followId === user.id)
+            throw new InputError("不能关注自己");
+          if (!(await publicProfiles([followId], this.env)).has(followId))
+            throw new InputError("这位作者不存在", 404);
+          const desired = request.method === "POST";
+          await this.ctx.storage.transaction(async (storage) => {
+            const key = `follow:${user.id}:${followId}`;
+            const previous = !!(await storage.get(key));
+            if (previous === desired) return;
+            if (desired) await storage.put(key, true);
+            else await storage.delete(key);
+            for (const countKey of [
+              `following-count:${user.id}`,
+              `follower-count:${followId}`,
+            ]) {
+              const count = (await storage.get<number>(countKey)) ?? 0;
+              await storage.put(
+                countKey,
+                Math.max(0, count + (desired ? 1 : -1))
+              );
+            }
+          });
+          return json(await this.followStatus(followId, user.id));
+        }
         if (
           url.pathname === "/v1/notifications/read" &&
           request.method === "POST"
@@ -511,6 +572,20 @@ export class Posts extends DurableObject<Env> {
       await storage.put(`stats:${id}`, stats);
     });
     return json({ post: await this.decorate(post, user) });
+  }
+  private async followStatus(authorId: string, viewerId?: string) {
+    const [following, followerCount, followingCount] = await Promise.all([
+      viewerId
+        ? this.ctx.storage.get<boolean>(`follow:${viewerId}:${authorId}`)
+        : Promise.resolve(false),
+      this.ctx.storage.get<number>(`follower-count:${authorId}`),
+      this.ctx.storage.get<number>(`following-count:${authorId}`),
+    ]);
+    return {
+      following: !!following,
+      followerCount: followerCount ?? 0,
+      followingCount: followingCount ?? 0,
+    };
   }
   private async comments(id: string, cursor?: string, start?: string) {
     const prefix = `comment:${id}:`;
@@ -770,7 +845,9 @@ export class Posts extends DurableObject<Env> {
       new Set(ids).size !== ids.length ||
       (!body && !ids.length && !selection && !content)
     )
-      throw new InputError("动态需有文字、HTML、图片或应用，正文最多 2000 字、4 张图");
+      throw new InputError(
+        "动态需有文字、HTML、图片或应用，正文最多 2000 字、4 张图"
+      );
     const fingerprint = await digest(
       JSON.stringify({
         body,

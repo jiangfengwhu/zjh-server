@@ -26,7 +26,7 @@ export default {
     try {
       if (/^\/v1\/(auth\/(?:code|verify|logout)|account(?:\/avatar)?)$/.test(url.pathname)) return env.ACCOUNTS.getByName("accounts").fetch(request);
       if (/^\/v1\/(posts(?:\/[a-f0-9]{64}(?:\/(?:like|comments)(?:\/[a-f0-9]{64})?)?)?|post-media)$/.test(url.pathname)) return env.POSTS.getByName("timeline").fetch(request);
-      if (/^\/v1\/profiles\/[a-f0-9-]{36}$/.test(url.pathname)) return env.POSTS.getByName("timeline").fetch(request);
+      if (/^\/v1\/profiles\/[a-f0-9-]{36}(?:\/follow)?$/.test(url.pathname)) return env.POSTS.getByName("timeline").fetch(request);
       if (/^\/v1\/notifications(?:\/(?:unread|read))?$/.test(url.pathname)) return env.POSTS.getByName("timeline").fetch(request);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/posts\/[a-f0-9]{64}$/.test(url.pathname)) return readSharedPost(request, env);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/post-images\/[a-f0-9-]{36}\/[a-f0-9-]{36}$/.test(url.pathname)) return readPostImage(request, env);
