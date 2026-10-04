@@ -747,8 +747,11 @@ export class Workshop extends DurableObject<Env> {
         const entries = await Promise.all(tasks.filter(task => task.ownerId === user.id).map(async task => {
           const [application, shared, cached] = await Promise.all([this.candidate(task.appId), this.ctx.storage.get<MarketEntry>(`shared:${task.appId}`), this.ctx.storage.get<{ key: string; at: number; status: WorkSummary }>(`work-summary:${task.appId}`)]);
           const valid = cached?.key === this.summaryKey(task, application);
-          const fresh = valid && Date.now() - cached.at < (cached.status.completed && cached.status.application ? 300000 : 20000);
-          return { task, application, shared: shared?.authorId === user.id ? shared : null, cached: valid ? cached : undefined, pending: force || !fresh ? this.refreshSummary(task, application) : undefined };
+          const settled = task.phase === "ready" && isRoundCandidate(task, application);
+          const fresh = settled || valid && Date.now() - cached.at < (cached.status.completed && cached.status.application ? 300000 : 20000);
+          // A completed round with its actual candidate is authoritative locally;
+          // old/expired Jules sessions cannot make a delivered work stale again.
+          return { task, application, shared: shared?.authorId === user.id ? shared : null, cached: valid ? cached : undefined, pending: !settled && (force || !fresh) ? this.refreshSummary(task, application) : undefined };
         }));
         const pending = Promise.all(entries.map(entry => entry.pending)); this.ctx.waitUntil(pending);
         // Bound the whole list wait, rather than spending a timeout on every work.
@@ -763,9 +766,10 @@ export class Workshop extends DurableObject<Env> {
           const [application, shared] = await Promise.all([this.candidate(task.appId), this.ctx.storage.get<MarketEntry>(`shared:${task.appId}`)]);
           const cached = await this.ctx.storage.get<{ key: string; at: number; status: WorkSummary }>(`work-summary:${task.appId}`);
           const valid = cached?.key === this.summaryKey(task, application);
-          const status = valid ? cached.status : summarizeWork(task, { state: task.phase === "ready" ? "COMPLETED" : "QUEUED" }, application);
+          const settled = task.phase === "ready" && isRoundCandidate(task, application);
+          const status = settled ? summarizeWork(task, { state: "COMPLETED" }, application) : valid ? cached.status : summarizeWork(task, { state: task.phase === "ready" ? "COMPLETED" : "QUEUED" }, application);
           const ttl = status.completed && status.application ? 300000 : 20000;
-          return { appId: task.appId, ownerId: task.ownerId, session: task.session, approvalToken: task.token, title: task.title ?? task.appId, wish: task.wish ?? "", startedAt: task.startedAt, originalAppId: task.originalAppId, originalReleaseId: task.originalReleaseId, originalCommit: task.originalCommit, branch: task.branch, phase: task.phase, status: { ...status, stale: !valid || Date.now() - cached.at >= ttl || force && cached.at === previous?.at }, sharing: { shared: shared?.authorId === user.id ? shared : null, application }, updatedAt: valid ? cached.at : null };
+          return { appId: task.appId, ownerId: task.ownerId, session: task.session, approvalToken: task.token, title: task.title ?? task.appId, wish: task.wish ?? "", startedAt: task.startedAt, originalAppId: task.originalAppId, originalReleaseId: task.originalReleaseId, originalCommit: task.originalCommit, branch: task.branch, phase: task.phase, status: { ...status, stale: !settled && (!valid || Date.now() - cached.at >= ttl || force && cached.at === previous?.at) }, sharing: { shared: shared?.authorId === user.id ? shared : null, application }, updatedAt: valid ? cached.at : null };
         }));
         const response = json({ works: works.filter(Boolean) }, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
       }
