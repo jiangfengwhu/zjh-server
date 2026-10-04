@@ -596,7 +596,7 @@ export class Workshop extends DurableObject<Env> {
         const params = new URL(request.url).searchParams;
         const appId = params.get("appId"); const authorId = params.get("authorId");
         const category = params.get("category") || ""; const query = (params.get("q") || "").trim().toLowerCase();
-        if (category && !MARKET_CATEGORIES.includes(category) || query.length > 80) return json({ message: "市场筛选无效" }, 400);
+        if (category && category !== "official" && !MARKET_CATEGORIES.includes(category) || query.length > 80) return json({ message: "市场筛选无效" }, 400);
         if (authorId && !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(authorId)) return json({ error: "author id invalid" }, 400);
         if (appId && !/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return json({ error: "application id invalid" }, 400);
         const selected = appId ? await this.ctx.storage.get<MarketEntry>(`shared:${appId}`) : undefined;
@@ -605,7 +605,7 @@ export class Workshop extends DurableObject<Env> {
           if ((OFFICIAL_APPLICATIONS as readonly string[]).includes(entry.manifest.appId)) { entry.authorId = OFFICIAL_ACCOUNT_ID; entry.authorName = "紫金花官方"; entry.authorAvatarUrl = null; }
           entry.authorOfficial = entry.authorId === OFFICIAL_ACCOUNT_ID;
         }
-        const filtered = entries.filter(entry => (!authorId || entry.authorId === authorId) && (!category || (entry.category || "other") === category) && (!query || `${entry.title} ${entry.summary}`.toLowerCase().includes(query)));
+        const filtered = entries.filter(entry => (!authorId || entry.authorId === authorId) && (!category || (category === "official" ? entry.authorOfficial : (entry.category || "other") === category)) && (!query || `${entry.title} ${entry.summary}`.toLowerCase().includes(query)));
         filtered.sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0) || a.manifest.appId.localeCompare(b.manifest.appId));
         // Explicit pagination keeps author-profile/internal callers on their existing full-list contract.
         const paged = params.has("limit") || params.has("cursor");
