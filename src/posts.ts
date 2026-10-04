@@ -50,7 +50,8 @@ type Notice = {
   commentId: string;
   body: string;
   postPreview: string;
-  kind: "comment" | "reply";
+  kind: "comment" | "reply" | "work-success" | "work-failure";
+  appId?: string;
   createdAt: number;
   read: boolean;
 };
@@ -151,6 +152,57 @@ export class Posts extends DurableObject<Env> {
           cursor = page.truncated ? page.cursor : undefined;
         } while (cursor);
         return json({ reset: true });
+      }
+      if (
+        url.pathname === "/internal/work-notice" &&
+        request.method === "POST"
+      ) {
+        const input = (await request.json()) as {
+          ownerId: string;
+          appId: string;
+          round: string;
+          success: boolean;
+          title: string;
+          message: string;
+        };
+        if (
+          !uuid.test(input.ownerId) ||
+          !/^[a-z][a-z0-9-]{0,63}$/.test(input.appId) ||
+          !input.round ||
+          input.round.length > 200 ||
+          typeof input.success !== "boolean"
+        )
+          throw new InputError("制作通知无效");
+        const id = await digest(
+          `work:${input.ownerId}:${input.appId}:${input.round}:${input.success}`
+        );
+        const notice: Notice = {
+          id,
+          actor: { id: OFFICIAL_ACCOUNT_ID, name: "Jolly", avatarUrl: null },
+          postId: "",
+          commentId: "",
+          appId: input.appId,
+          kind: input.success ? "work-success" : "work-failure",
+          body: String(input.message || "").slice(0, 1000),
+          postPreview: String(input.title || input.appId).slice(0, 200),
+          createdAt: Date.now(),
+          read: false,
+        };
+        await this.ctx.storage.transaction(async (storage) => {
+          const index = `notice-id:${input.ownerId}:${id}`;
+          if (await storage.get(index)) return;
+          const key = `notice:${input.ownerId}:${String(
+            9999999999999 - notice.createdAt
+          ).padStart(13, "0")}:${id}`;
+          await storage.put(key, notice);
+          await storage.put(index, key);
+          await storage.put(
+            `notice-unread:${input.ownerId}`,
+            ((await storage.get<number>(`notice-unread:${input.ownerId}`)) ??
+              0) + 1
+          );
+        });
+        return json({ id });
       }
       if (url.pathname === "/v1/posts" && request.method === "GET") {
         const following = url.searchParams.get("feed") === "following";

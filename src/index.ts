@@ -210,7 +210,7 @@ function pathBeforeQuery(path: string): string {
   return index < 0 ? path : path.slice(0, index);
 }
 type ApplicationRelease = { appId: string; releaseId: string; title: string; summary: string; modules: { base: number }; source: { repository: string; commit: string; tree?: string; dirty: boolean } };
-type WorkshopTask = { branch?: string; branchCommit?: string; roundRelease?: string; dispatchVersion?: string; originalBranch?: string; ownerId: string; appId: string; session: string; token: string; phase: "working" | "ready" | "paused"; previousCommit?: string; repair?: boolean; publishEpoch?: string; requestId?: string; creationTitle?: string; creationRejected?: boolean; title?: string; wish?: string; originalAppId?: string; originalReleaseId?: string; originalCommit?: string; startedAt?: number };
+type WorkshopTask = { deliveryWaitStartedAt?: number; branch?: string; branchCommit?: string; roundRelease?: string; dispatchVersion?: string; originalBranch?: string; ownerId: string; appId: string; session: string; token: string; phase: "working" | "ready" | "paused"; previousCommit?: string; repair?: boolean; publishEpoch?: string; requestId?: string; creationTitle?: string; creationRejected?: boolean; title?: string; wish?: string; originalAppId?: string; originalReleaseId?: string; originalCommit?: string; startedAt?: number };
 type CloudSession = { name?: string; state?: string; url?: string; title?: string; createTime?: string; updateTime?: string; sourceContext?: { source?: string }; outputs?: { pullRequest?: { url?: string } }[] };
 type WorkSummary = { completed: boolean; state: string; delivery: string; message: string; application?: ApplicationRelease; stale?: boolean };
 function isRoundCandidate(task: WorkshopTask, application: ApplicationRelease | null): application is ApplicationRelease {
@@ -220,12 +220,66 @@ function summarizeWork(task: WorkshopTask, session: CloudSession, application: A
   if (task.phase === "paused") return { completed: false, state: session.state === "FAILED" ? "FAILED" : "PAUSED", delivery: "unpublished", message: session.state === "FAILED" ? "制作失败，可以在当前作品继续处理" : "制作已暂停，可以继续这个应用" };
   if (session.state !== "COMPLETED") return { completed: false, state: session.state ?? "QUEUED", delivery: "unpublished", message: ["FAILED", "PAUSED"].includes(session.state ?? "") ? "制作已暂停，可以继续处理" : "这轮作品仍在制作" };
   const ready = isRoundCandidate(task, application);
+  if (!ready && task.deliveryWaitStartedAt && Date.now() - task.deliveryWaitStartedAt >= 120000) return { completed: true, state: "COMPLETED", delivery: "blocked", message: "Jolly 已结束制作，但本轮应用没有完成交付。可以在当前作品继续修复并重新发布。" };
   return { completed: true, state: "COMPLETED", delivery: ready ? "update" : "unpublished", message: ready ? "作品已发布，可直接体验、继续修改或上架" : "等待本轮候选包发布", ...(ready ? { application } : {}) };
 }
 const MARKET_CATEGORIES = ["tools", "productivity", "life", "creative", "other"];
 type MarketEntry = { manifest: ApplicationRelease; title: string; summary: string; category?: string; screenshots?: string[]; publishedAt?: number; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null; sourceCommit?: string; sourceBranch?: string };
 
 export class Workshop extends DurableObject<Env> {
+  private monitoring: Promise<void> | undefined;
+  private async armMonitor(delay = 60000) {
+    const alarm = await this.ctx.storage.getAlarm();
+    if (!alarm || alarm <= Date.now() || alarm > Date.now() + delay) await this.ctx.storage.setAlarm(Date.now() + delay);
+  }
+  private async notifyResult(task: WorkshopTask, success: boolean, message: string) {
+    const round = task.publishEpoch || task.requestId || task.session;
+    if (!round) return;
+    const key = `work-notice:${task.appId}:${round}:${success}`;
+    const sentKey = `work-notice-sent:${task.appId}:${round}:${success}`;
+    if (await this.ctx.storage.get(sentKey)) return;
+    const payload = { ownerId: task.ownerId, appId: task.appId, round, success, title: task.title || task.appId, message };
+    await this.ctx.storage.put(key, payload);
+    try {
+      const response = await this.env.POSTS.getByName("timeline").fetch(new Request("https://posts.internal/internal/work-notice", { method: "POST", body: JSON.stringify(payload) }));
+      if (!response.ok) throw new Error("通知暂未送达");
+      await this.ctx.storage.put(sentKey, true);
+      await this.ctx.storage.delete(key);
+    } catch { await this.armMonitor(); }
+  }
+  async alarm() {
+    if (this.monitoring) return this.monitoring;
+    this.monitoring = this.pollWorkAlarm().finally(() => { this.monitoring = undefined; });
+    return this.monitoring;
+  }
+  private async pollWorkAlarm() {
+    if (this.resetting) return;
+    const pending = await this.ctx.storage.list<{ ownerId: string; appId: string; round: string; success: boolean; title: string; message: string }>({ prefix: "work-notice:", limit: 100 });
+    for (const [key, payload] of pending) {
+      try {
+        const response = await this.env.POSTS.getByName("timeline").fetch(new Request("https://posts.internal/internal/work-notice", { method: "POST", body: JSON.stringify(payload) }));
+        if (response.ok) { await this.ctx.storage.put(key.replace("work-notice:", "work-notice-sent:"), true); await this.ctx.storage.delete(key); }
+      } catch { /* The durable outbox is retried by the next alarm. */ }
+    }
+    const after = await this.ctx.storage.get<string>("watch-cursor");
+    const watches = await this.ctx.storage.list<boolean>({ prefix: "watch:", startAfter: after, limit: 100 });
+    await Promise.all([...watches.keys()].map(async key => {
+      const task = await this.ctx.storage.get<WorkshopTask>(`task:${key.slice(6)}`);
+      if (!task || task.phase !== "working") {
+        await this.queue.run(`app:${key.slice(6)}`, async () => {
+          const current = await this.ctx.storage.get<WorkshopTask>(`task:${key.slice(6)}`);
+          if (!current || current.phase !== "working") await this.ctx.storage.delete(key);
+        });
+        return;
+      }
+      await this.refreshSummary(task, await this.candidate(task.appId));
+    }));
+    if (watches.size === 100) await this.ctx.storage.put("watch-cursor", [...watches.keys()].at(-1)!);
+    else await this.ctx.storage.delete("watch-cursor");
+    const remaining = await this.ctx.storage.list({ prefix: "watch:", limit: 1 });
+    const outbox = await this.ctx.storage.list({ prefix: "work-notice:", limit: 1 });
+    if (remaining.size || outbox.size) await this.armMonitor();
+  }
   private activityPages = new Map<string, { version: string; at: number; page: { activities: unknown[]; nextPageToken?: string } }>();
   private summaries = new Map<string, Promise<void>>();
   private summarySlots = new KeyedQueue();
@@ -243,12 +297,16 @@ export class Workshop extends DurableObject<Env> {
           });
           return;
         }
-        const session = task.phase === "paused" ? { state: "PAUSED" } : await this.session(task.session);
+        const cached = task.phase === "paused" ? await this.ctx.storage.get<{ key: string; status: WorkSummary }>(`work-summary:${task.appId}`) : undefined;
+        const session: CloudSession = task.phase === "paused" ? { state: cached?.key === key && cached.status.state === "FAILED" ? "FAILED" : "PAUSED" } : await this.session(task.session);
         await this.queue.run(`app:${task.appId}`, async () => {
           const current = await this.ctx.storage.get<WorkshopTask>(`task:${task.appId}`);
           const candidate = await this.candidate(task.appId);
           if (!current || this.resetting || this.summaryKey(current, candidate) !== key) return;
+          if (current.dispatchVersion && current.dispatchVersion === `${session.state}:${session.updateTime ?? ""}`) return;
+          if (session.state === "COMPLETED" && !isRoundCandidate(current, candidate) && !current.deliveryWaitStartedAt) { current.deliveryWaitStartedAt = Date.now(); await this.saveTask(current); }
           const status = summarizeWork(current, session, candidate);
+          if (session.state === "FAILED") await this.notifyResult(current, false, "制作失败了。点击查看制作记录，可以继续修复这个作品。");
           const phase = status.completed ? status.application ? "ready" : "working" : ["FAILED", "PAUSED"].includes(status.state) ? "paused" : current.phase;
           const title = status.application?.title || current.title;
           if (current.phase !== phase || current.title !== title) {
@@ -257,6 +315,9 @@ export class Workshop extends DurableObject<Env> {
             await this.saveTask(current);
           }
           await this.ctx.storage.put(`work-summary:${task.appId}`, { key: this.summaryKey(current, candidate), at: Date.now(), status });
+          if (status.completed && status.application) await this.notifyResult(current, true, "制作完成，作品已准备好。点击查看、体验或继续修改。");
+          if (status.delivery === "blocked") await this.notifyResult(current, false, status.message);
+          if (current.phase === "working") { await this.ctx.storage.put(`watch:${current.appId}`, true); await this.armMonitor(); }
         });
       } catch { /* Preserve the last result; the list marks expired data stale. */ }
     }).finally(() => this.summaries.delete(key));
@@ -279,7 +340,7 @@ export class Workshop extends DurableObject<Env> {
     if (this.resetting) return json({ message: "重置已在进行" }, 409);
     this.resetting = true;
     try {
-      await Promise.allSettled([...this.writes]);
+      await Promise.allSettled([...this.writes, ...(this.monitoring ? [this.monitoring] : [])]);
       // Keep only the current official Jolly release and infrastructure catalogs.
       const jolly = await this.ctx.storage.get<MarketEntry>("shared:jolly");
       if (!jolly) return json({ message: "请先发布官方 Jolly，再清理测试数据" }, 409);
@@ -352,9 +413,12 @@ export class Workshop extends DurableObject<Env> {
   private async saveTask(task: WorkshopTask) {
     await this.ctx.storage.transaction(async storage => {
       await storage.put({ [`task:${task.appId}`]: task, [`owner:${task.ownerId}:${task.appId}`]: task });
+      if (task.phase === "working") await storage.put(`watch:${task.appId}`, true);
+      else await storage.delete(`watch:${task.appId}`);
       const quota = await storage.get<{ day: number; count: number; reservations?: Record<string, number> }>(`quota:${task.ownerId}`);
       if (quota?.reservations?.[task.appId]) { delete quota.reservations[task.appId]; await storage.put(`quota:${task.ownerId}`, quota); }
     });
+    if (task.phase === "working") await this.armMonitor();
   }
   private async publisherInstruction(task: WorkshopTask) {
     const grant = await issuePublisherGrant({ appId: task.appId, ownerId: task.ownerId, epoch: task.publishEpoch! }, this.env.OFFICIAL_PUBLISH_TOKEN);
@@ -746,9 +810,15 @@ export class Workshop extends DurableObject<Env> {
         const origin = original ? `Remix 来源：应用 ${original.appId}，分支 ${originalBranch ?? "main"}，版本 ${original.releaseId}，源码提交 ${originalCommit}；init 使用此锁定提交。` : "";
         payload.prompt = `创建应用 ${appId}，目录 apps/${appId}/，平台分配 moduleBase=${moduleBase}；使用本 session 自动创建的应用分支。${await this.publisherInstruction(task)} ${origin} 用户需求：\n${prompt}`;
         const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
-        if (!response.ok) { task.phase = "paused"; task.creationRejected = response.status >= 400 && response.status < 500; await this.saveTask(task); return response; }
+        if (!response.ok) {
+          task.creationRejected = response.status >= 400 && response.status < 500;
+          task.phase = task.creationRejected ? "paused" : "working";
+          await this.saveTask(task);
+          if (task.creationRejected) await this.notifyResult(task, false, "Jolly 未能开始这轮制作。点击查看作品，调整后可以重试。");
+          return response;
+        }
         const session = await response.json() as CloudSession;
-        if (!session.name) { task.phase = "paused"; await this.saveTask(task); return json({ message: "Jules 未返回 session，请接回制作记录" }, 502); }
+        if (!session.name) { await this.saveTask(task); return json({ message: "Jules 未返回 session，正在后台接回制作记录" }, 502); }
         task.session = session.name;
         await this.saveTask(task);
         return json({ ...session, ownerId: user.id, approvalToken: task.token }, 200);
@@ -797,7 +867,7 @@ export class Workshop extends DurableObject<Env> {
           if (typeof payload.prompt !== "string" || !payload.prompt.trim() || payload.prompt.length > 8000) return json({ message: "请提交 1 到 8000 个字符的修改需求" }, 400);
           if (!await this.quota(user.id, appId)) return json({ message: "制作额度已用完或同时制作作品过多，请稍后再试" }, 429);
           const previous = structuredClone(task);
-          task.publishEpoch = crypto.randomUUID(); task.dispatchVersion = dispatchVersion;
+          task.publishEpoch = crypto.randomUUID(); task.dispatchVersion = dispatchVersion; task.deliveryWaitStartedAt = undefined;
           task.previousCommit = (await this.candidate(appId))?.source.commit ?? task.previousCommit; task.roundRelease = undefined;
           task.phase = "working"; task.repair = false; task.wish = String(payload.prompt ?? ""); task.startedAt = Date.now();
           // Persist the new round before upstream work starts; ambiguous timeouts can still deliver.
@@ -819,6 +889,7 @@ export class Workshop extends DurableObject<Env> {
         const [session, application, shared] = await Promise.all([
           this.session(task.session), this.candidate(appId), this.ctx.storage.get<MarketEntry>(`shared:${appId}`),
         ]);
+        if (task.dispatchVersion === `${session.state}:${session.updateTime ?? ""}`) session.state = "QUEUED";
         const activityResult = await this.recentActivities({ ...session, name: task.session });
         const status = summarizeWork(task, session, application);
         // A stopped round must not be resumed merely because Jules still reports work.
@@ -828,6 +899,8 @@ export class Workshop extends DurableObject<Env> {
         if (status.application?.title) task.title = status.application.title;
         await this.saveTask(task);
         await this.ctx.storage.put(`work-summary:${appId}`, { key: this.summaryKey(task, application), at: Date.now(), status });
+        if (session.state === "FAILED") await this.notifyResult(task, false, "制作失败了。点击查看制作记录，可以继续修复这个作品。");
+        if (status.completed && status.application) await this.notifyResult(task, true, "制作完成，作品已准备好。点击查看、体验或继续修改。");
         if (status.application) {
           status.delivery = input.applicationReleases?.[appId] === status.application.releaseId ? "loaded" : "update";
           this.ctx.waitUntil(this.queue.run(`app:${appId}`, async () => {
@@ -840,6 +913,8 @@ export class Workshop extends DurableObject<Env> {
       }
       const session = await this.session(task.session);
       if (task.dispatchVersion && task.dispatchVersion !== `${session.state}:${session.updateTime ?? ""}`) { task.dispatchVersion = undefined; await this.saveTask(task); }
+      else if (task.dispatchVersion) session.state = "QUEUED";
+      if (session.state === "FAILED") await this.notifyResult(task, false, "制作失败了。点击查看制作记录，可以继续修复这个作品。");
       if (input.action === "stop") {
         if (!["COMPLETED", "PAUSED", "FAILED"].includes(session.state ?? "")) {
           const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ method: "POST", path: `/v1alpha/${task.session}:sendMessage`, body: JSON.stringify({ prompt: "停止当前制作，不再修改或发布，等待我的下一条需求。" }) }) }), this.env);
@@ -860,14 +935,20 @@ export class Workshop extends DurableObject<Env> {
       try { delivery = await this.delivery(task, session); }
       catch (error) {
         task.repair = true; await this.saveTask(task);
+        await this.notifyResult(task, false, "制作交付未完成。点击查看记录，在当前作品继续修复并重新发布。");
         return json({ completed: true, state: session.state, delivery: "blocked", message: error instanceof Error ? error.message : "请在当前 session 修复交付后重新发包" }, input.action === "status" ? 200 : 409);
       }
       const ready = delivery?.ready === true;
       if (!ready) { task.repair = true; await this.saveTask(task); }
       const loaded = ready && input.applicationReleases?.[appId] === delivery!.application.releaseId;
+      if (input.action === "status" && !delivery) {
+        const missing = summarizeWork(task, session, null);
+        if (missing.delivery === "blocked") { await this.notifyResult(task, false, missing.message); return json(missing, 200); }
+      }
       if (input.action === "status") {
         if (delivery?.application.title && delivery.application.title !== appId) task.title = delivery.application.title;
         task.phase = ready ? "ready" : "working"; await this.saveTask(task);
+        if (ready) await this.notifyResult(task, true, "制作完成，作品已准备好。点击查看、体验或继续修改。");
         return json({ completed: true, state: session.state, delivery: !delivery ? "unpublished" : !ready ? "blocked" : loaded ? "loaded" : "update", message: !delivery ? "等待本轮候选包发布" : !ready ? delivery.message : loaded ? "正在运行本轮作品，可继续修改或上架" : "作品已发布，可直接体验、继续修改或上架", ...(delivery ? { application: delivery.application, branch: task.branch } : {}) }, 200);
       }
       return json({ message: "工坊只支持查看状态与停止制作，请更新客户端" }, 400);
