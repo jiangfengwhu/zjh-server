@@ -285,7 +285,7 @@ export class Posts extends DurableObject<Env> {
       )?.[1];
       if (profileId && request.method === "GET") {
         if (!uuid.test(profileId)) throw new InputError("作者标识无效");
-        const [profiles, market, timeline] = await Promise.all([
+        const [profiles, market, timeline, follow] = await Promise.all([
           publicProfiles([profileId], this.env),
           this.env.WORKSHOP.getByName("dynamic").fetch(
             new Request(
@@ -298,23 +298,23 @@ export class Posts extends DurableObject<Env> {
               { headers: request.headers }
             )
           ),
+          (async () => {
+            const viewer = request.headers.has("Authorization")
+              ? await authenticatedUser(request, this.env)
+              : null;
+            return this.followStatus(profileId, viewer?.id);
+          })(),
         ]);
         const author = profiles.get(profileId);
         if (!author) throw new InputError("这位作者不存在", 404);
         if (!market.ok || !timeline.ok)
           throw new InputError("作者主页暂时不可用，请重试", 503);
-        const applications = (await market.json()) as {
-          applications: unknown[];
-        };
-        const posts = (await timeline.json()) as {
-          posts: unknown[];
-          nextCursor: string | null;
-        };
-        const viewer = request.headers.has("Authorization")
-          ? await authenticatedUser(request, this.env)
-          : null;
+        const [applications, posts] = await Promise.all([
+          market.json() as Promise<{ applications: unknown[] }>,
+          timeline.json() as Promise<{ posts: unknown[]; nextCursor: string | null }>,
+        ]);
         return json({
-          ...(await this.followStatus(profileId, viewer?.id)),
+          ...follow,
           author: { ...author, official: profileId === OFFICIAL_ACCOUNT_ID },
           applications: applications.applications,
           ...posts,
