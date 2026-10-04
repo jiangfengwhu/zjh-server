@@ -50,7 +50,7 @@ type Notice = {
   commentId: string;
   body: string;
   postPreview: string;
-  kind: "comment" | "reply" | "work-success" | "work-failure";
+  kind: "comment" | "reply" | "work-success" | "work-failure" | "work-submitted";
   appId?: string;
   createdAt: number;
   read: boolean;
@@ -162,6 +162,7 @@ export class Posts extends DurableObject<Env> {
           appId: string;
           round: string;
           success: boolean;
+          kind?: "work-submitted";
           title: string;
           message: string;
         };
@@ -170,11 +171,11 @@ export class Posts extends DurableObject<Env> {
           !/^[a-z][a-z0-9-]{0,63}$/.test(input.appId) ||
           !input.round ||
           input.round.length > 200 ||
-          typeof input.success !== "boolean"
+          typeof input.success !== "boolean" || (input.kind !== undefined && input.kind !== "work-submitted")
         )
           throw new InputError("制作通知无效");
         const id = await digest(
-          `work:${input.ownerId}:${input.appId}:${input.round}:${input.success}`
+          `work:${input.ownerId}:${input.appId}:${input.round}:${input.kind || String(input.success)}`
         );
         const notice: Notice = {
           id,
@@ -182,7 +183,7 @@ export class Posts extends DurableObject<Env> {
           postId: "",
           commentId: "",
           appId: input.appId,
-          kind: input.success ? "work-success" : "work-failure",
+          kind: input.kind || (input.success ? "work-success" : "work-failure"),
           body: String(input.message || "").slice(0, 1000),
           postPreview: String(input.title || input.appId).slice(0, 200),
           createdAt: Date.now(),
@@ -478,7 +479,7 @@ export class Posts extends DurableObject<Env> {
       const records = await this.ctx.storage.list<Notice>({ prefix, startAfter: after, limit: 100 });
       for (const [key, notice] of records) {
         after = key;
-        const creation = notice.kind === "work-success" || notice.kind === "work-failure";
+        const creation = notice.kind === "work-success" || notice.kind === "work-failure" || notice.kind === "work-submitted";
         if (!category || (category === "creation") === creation) entries.push([key, notice]);
         if (entries.length === 51) break;
       }

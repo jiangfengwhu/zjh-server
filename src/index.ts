@@ -255,13 +255,14 @@ export class Workshop extends DurableObject<Env> {
     const alarm = await this.ctx.storage.getAlarm();
     if (!alarm || alarm <= Date.now() || alarm > Date.now() + delay) await this.ctx.storage.setAlarm(Date.now() + delay);
   }
-  private async notifyResult(task: WorkshopTask, success: boolean, message: string) {
+  private async notifyResult(task: WorkshopTask, success: boolean, message: string, kind?: "work-submitted") {
     const round = task.publishEpoch || task.requestId || task.session;
     if (!round) return;
-    const key = `work-notice:${task.appId}:${round}:${success}`;
-    const sentKey = `work-notice-sent:${task.appId}:${round}:${success}`;
+    const event = kind || String(success);
+    const key = `work-notice:${task.appId}:${round}:${event}`;
+    const sentKey = `work-notice-sent:${task.appId}:${round}:${event}`;
     if (await this.ctx.storage.get(sentKey)) return;
-    const payload = { ownerId: task.ownerId, appId: task.appId, round, success, title: task.title || task.appId, message };
+    const payload = { ownerId: task.ownerId, appId: task.appId, round, success, kind, title: task.title || task.appId, message };
     await this.ctx.storage.put(key, payload);
     try {
       const response = await this.env.POSTS.getByName("timeline").fetch(new Request("https://posts.internal/internal/work-notice", { method: "POST", body: JSON.stringify(payload) }));
@@ -277,7 +278,7 @@ export class Workshop extends DurableObject<Env> {
   }
   private async pollWorkAlarm() {
     if (this.resetting) return;
-    const pending = await this.ctx.storage.list<{ ownerId: string; appId: string; round: string; success: boolean; title: string; message: string }>({ prefix: "work-notice:", limit: 100 });
+    const pending = await this.ctx.storage.list<{ ownerId: string; appId: string; round: string; success: boolean; kind?: "work-submitted"; title: string; message: string }>({ prefix: "work-notice:", limit: 100 });
     for (const [key, payload] of pending) {
       try {
         const response = await this.env.POSTS.getByName("timeline").fetch(new Request("https://posts.internal/internal/work-notice", { method: "POST", body: JSON.stringify(payload) }));
@@ -295,6 +296,7 @@ export class Workshop extends DurableObject<Env> {
         });
         return;
       }
+      if (task.session) await this.notifyResult(task, true, "需求已提交，点击查看本轮制作进度。完成或失败都会在这里通知你。", "work-submitted");
       await this.refreshSummary(task, await this.candidate(task.appId));
     }));
     if (watches.size === 100) await this.ctx.storage.put("watch-cursor", [...watches.keys()].at(-1)!);
@@ -812,13 +814,13 @@ export class Workshop extends DurableObject<Env> {
       if (path === "/v1/jules" && input.method === "POST" && input.path === "/v1alpha/sessions") {
         if ((OFFICIAL_APPLICATIONS as readonly string[]).includes(appId)) return json({ message: "请基于这个应用创作新作品" }, 403);
         if (task?.session) {
-          if (input.requestId && input.requestId === task.requestId) return json({ name: task.session, ownerId: task.ownerId, approvalToken: task.token }, 200);
+          if (input.requestId && input.requestId === task.requestId) { await this.notifyResult(task, true, "制作需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted"); return json({ name: task.session, ownerId: task.ownerId, approvalToken: task.token }, 200); }
           return json({ message: "这个应用已有 session，请从作品列表接回" }, 409);
         }
         if (!input.requestId || !/^[a-zA-Z0-9-]{1,160}$/.test(input.requestId)) return json({ message: "创建需要稳定的请求 ID，请更新宿主" }, 400);
         if (task && !task.creationRejected) {
           task = await this.recoverSession(task);
-          if (input.requestId === task.requestId && task.session) return json({ name: task.session, ownerId: task.ownerId, approvalToken: task.token }, 200);
+          if (input.requestId === task.requestId && task.session) { await this.notifyResult(task, true, "制作需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted"); return json({ name: task.session, ownerId: task.ownerId, approvalToken: task.token }, 200); }
           return json({ message: "已记录创建请求，正在接回会话。请稍后从作品列表重试，不要重复创建。" }, 409);
         }
         if (await this.candidate(appId)) return json({ message: "应用 ID 已存在，请基于它创作新作品" }, 409);
@@ -854,6 +856,7 @@ export class Workshop extends DurableObject<Env> {
         if (!session.name) { await this.saveTask(task); return json({ message: "Jules 未返回 session，正在后台接回制作记录" }, 502); }
         task.session = session.name;
         await this.saveTask(task);
+        await this.notifyResult(task, true, "制作需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted");
         return json({ ...session, ownerId: user.id, approvalToken: task.token }, 200);
       }
       if (!task || (input.token ?? input.approvalToken) !== task.token) return json({ message: "这个应用的 session 凭据不匹配" }, 403);
@@ -898,6 +901,7 @@ export class Workshop extends DurableObject<Env> {
           const prior = requestKey ? await this.ctx.storage.get<{ session: string; prompt: string; response: string; status: number }>(requestKey) : undefined;
           if (prior) {
             if (prior.session !== task.session || prior.prompt !== payload.prompt) return json({ message: "提交标识已用于另一份修改需求" }, 409);
+            if (input.requestId === task.requestId) await this.notifyResult(task, true, "修改需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted");
             return new Response(prior.response, { status: prior.status, headers: { "Content-Type": "application/json" } });
           }
           const submittedPrompt = payload.prompt;
@@ -919,6 +923,7 @@ export class Workshop extends DurableObject<Env> {
           payload.prompt = `继续修改应用 ${appId}，目录 apps/${appId}/。${task.branch ? `目标分支：${task.branch}，git fetch origin 后 checkout 该分支。` : "目标分支：本 session 自动创建的应用分支。"} ${await this.publisherInstruction(task)} 用户需求：\n${payload.prompt ?? ""}`;
           const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
           if (response.ok && requestKey) await this.ctx.storage.put(requestKey, { session: task.session, prompt: submittedPrompt, response: await response.clone().text(), status: response.status });
+          if (response.ok) await this.notifyResult(task, true, "修改需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted");
           if (!response.ok && response.status < 500) await this.saveTask(previous);
           return response;
         }
