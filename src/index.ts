@@ -451,7 +451,7 @@ export class Workshop extends DurableObject<Env> {
   }
   private async publisherInstruction(task: WorkshopTask) {
     const grant = await issuePublisherGrant({ appId: task.appId, ownerId: task.ownerId, epoch: task.publishEpoch! }, this.env.OFFICIAL_PUBLISH_TOKEN);
-    return `先阅读仓库 AGENTS.md 和已安装 SDK 的 README.md，按文档完成安装后保存本轮授权：npx --no-install zjh-app authorize ${task.appId} '${grant}'。`;
+    return `先阅读仓库 AGENTS.md 和已安装 SDK 的 README.md；继续制作的旧分支也须阅读最新交付规则 https://github.com/jiangfengwhu/zjh-plugin/blob/main/AGENTS.md ，无需同步或合入 main。按文档完成安装后保存本轮授权：npx --no-install zjh-app authorize ${task.appId} '${grant}'。`;
   }
   private async recoverSession(task: WorkshopTask): Promise<WorkshopTask> {
     if (task.session || !task.creationTitle) return task;
