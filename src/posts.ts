@@ -224,7 +224,10 @@ export class Posts extends DurableObject<Env> {
             if (records.size < 500) break;
             after = [...records.keys()].at(-1);
           }
-          if (!followed.size) return json({ posts: [], nextCursor: null });
+          if (!followed.size) return json({
+            posts: [], nextCursor: null,
+            unreadCount: (await this.ctx.storage.get<number>(`notice-unread:${viewer!.id}`)) ?? 0,
+          });
         }
         const cursor = url.searchParams.get("cursor") || undefined;
         const authorId = url.searchParams.get("authorId") || undefined;
@@ -256,29 +259,31 @@ export class Posts extends DurableObject<Env> {
           hasMore = entries.size === limit;
         } while (matching.length <= 50 && hasMore && scannedCount < 5000);
         const page = matching.slice(0, 50);
-        const profiles = await publicProfiles(
-          [...new Set(page.map(([, post]) => post.author.id))],
-          this.env
-        );
+        // Hydrate the list as one BFF operation: batch stats/reactions instead of
+        // issuing up to two storage reads for every post in a 50-item page.
+        const keys = page.flatMap(([, post]) => [
+          `stats:${post.id}`,
+          ...(viewer ? [`like:${post.id}:${viewer.id}`] : []),
+        ]);
+        if (viewer) keys.push(`notice-unread:${viewer.id}`);
+        const [profiles, metadata] = await Promise.all([
+          publicProfiles([...new Set(page.map(([, post]) => post.author.id))], this.env),
+          keys.length ? this.ctx.storage.get<Stats | boolean | number>(keys) : Promise.resolve(new Map<string, Stats | boolean | number>()),
+        ]);
         return json({
-          posts: await Promise.all(
-            page.map(async ([, post]) =>
-              this.decorate(
-                {
-                  ...post,
-                  author: profiles.get(post.author.id) ?? post.author,
-                },
-                viewer
-              )
-            )
-          ),
+          posts: page.map(([, post]) => {
+            const stats = metadata.get(`stats:${post.id}`) as Stats | undefined;
+            return {
+              ...post,
+              author: profiles.get(post.author.id) ?? post.author,
+              likeCount: stats?.likes ?? 0,
+              commentCount: stats?.comments ?? 0,
+              liked: viewer ? !!metadata.get(`like:${post.id}:${viewer.id}`) : false,
+            };
+          }),
           nextCursor:
             matching.length > 50 ? page.at(-1)![0] : hasMore ? after : null,
-          unreadCount: viewer
-            ? (await this.ctx.storage.get<number>(
-                `notice-unread:${viewer.id}`
-              )) ?? 0
-            : 0,
+          unreadCount: viewer ? metadata.get(`notice-unread:${viewer.id}`) ?? 0 : 0,
         });
       }
       const profileId = url.pathname.match(
