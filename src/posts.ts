@@ -465,29 +465,39 @@ export class Posts extends DurableObject<Env> {
   }
   private async notices(url: URL, user: User) {
     const prefix = `notice:${user.id}:`;
-    const cursor = url.searchParams.get("cursor") || undefined;
-    if (
-      cursor &&
-      (!cursor.startsWith(prefix) ||
-        !/^notice:[a-f0-9-]{36}:\d{13}:[a-f0-9]{64}$/.test(cursor))
-    )
-      throw new InputError("通知分页标记无效");
-    const records = await this.ctx.storage.list<Notice>({
-      prefix,
-      startAfter: cursor,
-      limit: 51,
-    });
-    const entries = [...records].slice(0, 50);
+    const category = url.searchParams.get("category") || "";
+    if (category && !["creation", "interaction"].includes(category)) throw new InputError("通知分类无效");
+    const supplied = url.searchParams.get("cursor") || undefined;
+    if (supplied && category && !supplied.startsWith(`${category}|`)) throw new InputError("通知分页分类不一致");
+    const cursor = supplied && category ? supplied.slice(category.length + 1) : supplied;
+    if (cursor && (!cursor.startsWith(prefix) || !/^notice:[a-f0-9-]{36}:\d{13}:[a-f0-9]{64}$/.test(cursor))) throw new InputError("通知分页标记无效");
+    const entries: Array<[string, Notice]> = [];
+    let after = cursor;
+    let exhausted = false;
+    for (let scan = 0; scan < 10 && entries.length < 51; scan++) {
+      const records = await this.ctx.storage.list<Notice>({ prefix, startAfter: after, limit: 100 });
+      for (const [key, notice] of records) {
+        after = key;
+        const creation = notice.kind === "work-success" || notice.kind === "work-failure";
+        if (!category || (category === "creation") === creation) entries.push([key, notice]);
+        if (entries.length === 51) break;
+      }
+      exhausted = entries.length < 51 && records.size < 100;
+      if (exhausted) break;
+    }
+    const more = entries.length > 50 || !exhausted;
+    const page = entries.slice(0, 50);
+    const next = entries.length > 50 ? page.at(-1)![0] : after;
     const profiles = await publicProfiles(
-      [...new Set(entries.map(([, item]) => item.actor.id))],
+      [...new Set(page.map(([, item]) => item.actor.id))],
       this.env
     );
     return json({
-      notices: entries.map(([, item]) => ({
+      notices: page.map(([, item]) => ({
         ...item,
         actor: profiles.get(item.actor.id) ?? item.actor,
       })),
-      nextCursor: records.size > 50 ? entries.at(-1)![0] : null,
+      nextCursor: more && next ? (category ? `${category}|${next}` : next) : null,
       unreadCount:
         (await this.ctx.storage.get<number>(`notice-unread:${user.id}`)) ?? 0,
     });

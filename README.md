@@ -19,6 +19,7 @@ Secrets 通过 npx wrangler secret put <NAME> 交互配置，不把值写入代�
 
 - /v1/auth/*、/v1/account：验证码登录与资料；账号凭证仅由宿主保管。
 - /v1/posts、/v1/notifications、/v1/profiles：动态、互动与公开身份。
+- 通知可用 category=creation/interaction 分页，分类游标不能交叉使用；不传 category 保留原有全部通知接口。制作状态与详情携带当前 submissionId/startedAt，修改复用会话时只返回当前轮次记录，旧终态不能覆盖新提交。
 - /v1/workshop、/v1/works、/v1/jules：按账号和 appId 管理制作；同应用复用 session，同轮写操作串行，不同应用可并行。
 - /v1/creation-media：登录账号上传制作参考图（JPEG，最多 2 MB），沿用账号上传额度；不可变图片链接供制作服务读取。继续修改的 requestId 绑定账号、应用、会话和正文，成功请求重试不再次提交。
 - /v1/application-blobs/<id>/<sha256>、/v1/catalog：校验本轮授权、包哈希及 expectedReleases 原子基线，冲突返回 409。candidate 为权威候选，latest 为私有镜像，不检查应用提交祖先。

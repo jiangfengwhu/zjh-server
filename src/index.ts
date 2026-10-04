@@ -212,13 +212,34 @@ function pathBeforeQuery(path: string): string {
   return index < 0 ? path : path.slice(0, index);
 }
 type ApplicationRelease = { appId: string; releaseId: string; title: string; summary: string; modules: { base: number }; source: { repository: string; commit: string; tree?: string; dirty: boolean } };
-type WorkshopTask = { deliveryWaitStartedAt?: number; branch?: string; branchCommit?: string; roundRelease?: string; dispatchVersion?: string; originalBranch?: string; ownerId: string; appId: string; session: string; token: string; phase: "working" | "ready" | "paused"; previousCommit?: string; repair?: boolean; publishEpoch?: string; requestId?: string; creationTitle?: string; creationRejected?: boolean; title?: string; wish?: string; originalAppId?: string; originalReleaseId?: string; originalCommit?: string; startedAt?: number };
+type WorkshopTask = { awaitingRoundStart?: boolean; deliveryWaitStartedAt?: number; branch?: string; branchCommit?: string; roundRelease?: string; dispatchVersion?: string; originalBranch?: string; ownerId: string; appId: string; session: string; token: string; phase: "working" | "ready" | "paused"; previousCommit?: string; repair?: boolean; publishEpoch?: string; requestId?: string; creationTitle?: string; creationRejected?: boolean; title?: string; wish?: string; originalAppId?: string; originalReleaseId?: string; originalCommit?: string; startedAt?: number };
 type CloudSession = { name?: string; state?: string; url?: string; title?: string; createTime?: string; updateTime?: string; sourceContext?: { source?: string }; outputs?: { pullRequest?: { url?: string } }[] };
 type WorkSummary = { completed: boolean; state: string; delivery: string; message: string; application?: ApplicationRelease; stale?: boolean };
 function isRoundCandidate(task: WorkshopTask, application: ApplicationRelease | null): application is ApplicationRelease {
   return Boolean(application && (task.roundRelease ? task.roundRelease === application.releaseId : application.source.commit !== task.previousCommit));
 }
+function currentRoundSession(task: WorkshopTask, session: CloudSession, application: ApplicationRelease | null): CloudSession {
+  if (task.phase === "paused" || !task.dispatchVersion) return session;
+  if (session.state === "COMPLETED" && isRoundCandidate(task, application)) return session;
+  const version = `${session.state}:${session.updateTime ?? ""}`;
+  const terminal = ["COMPLETED", "FAILED", "PAUSED", "AWAITING_USER_FEEDBACK"].includes(session.state || "");
+  const previousState = task.dispatchVersion.split(":")[0];
+  const oldTimestamp = Date.parse(session.updateTime || "") < (task.startedAt || 0);
+  if (version === task.dispatchVersion || oldTimestamp || task.awaitingRoundStart && terminal && session.state === previousState && !isRoundCandidate(task, application))
+    return { ...session, state: "QUEUED" };
+  return session;
+}
+function observeRound(task: WorkshopTask, session: CloudSession, activities: unknown[] = []) {
+  if (!task.awaitingRoundStart) return;
+  const working = ["QUEUED", "PLANNING", "IN_PROGRESS", "AWAITING_PLAN_APPROVAL"].includes(session.state || "");
+  const fresh = activities.some(value => {
+    const activity = value as { createTime?: string; progressUpdated?: unknown; agentMessaged?: unknown; planGenerated?: unknown; sessionCompleted?: unknown; sessionFailed?: unknown };
+    return Date.parse(activity.createTime || "") >= (task.startedAt || 0) && Boolean(activity.sessionCompleted || activity.sessionFailed || session.state === "AWAITING_USER_FEEDBACK" && activity.agentMessaged);
+  });
+  if (working || fresh) task.awaitingRoundStart = false;
+}
 function summarizeWork(task: WorkshopTask, session: CloudSession, application: ApplicationRelease | null): WorkSummary {
+  session = currentRoundSession(task, session, application);
   if (task.phase === "paused") return { completed: false, state: session.state === "FAILED" ? "FAILED" : "PAUSED", delivery: "unpublished", message: session.state === "FAILED" ? "制作失败，可以在当前作品继续处理" : "制作已暂停，可以继续这个应用" };
   if (session.state !== "COMPLETED") return { completed: false, state: session.state ?? "QUEUED", delivery: "unpublished", message: ["FAILED", "PAUSED"].includes(session.state ?? "") ? "制作已暂停，可以继续处理" : "这轮作品仍在制作" };
   const ready = isRoundCandidate(task, application);
@@ -286,7 +307,7 @@ export class Workshop extends DurableObject<Env> {
   private summaries = new Map<string, Promise<void>>();
   private summarySlots = new KeyedQueue();
   private summarySlot = 0;
-  private summaryKey(task: WorkshopTask, application: ApplicationRelease | null) { return JSON.stringify([task.appId, task.ownerId, task.session, task.publishEpoch, task.phase, task.previousCommit, task.roundRelease, application?.releaseId]); }
+  private summaryKey(task: WorkshopTask, application: ApplicationRelease | null) { return JSON.stringify([task.appId, task.ownerId, task.session, task.publishEpoch, task.awaitingRoundStart, task.phase, task.previousCommit, task.roundRelease, application?.releaseId]); }
   private refreshSummary(task: WorkshopTask, application: ApplicationRelease | null): Promise<void> {
     const key = this.summaryKey(task, application);
     const previous = this.summaries.get(key); if (previous) return previous;
@@ -301,14 +322,18 @@ export class Workshop extends DurableObject<Env> {
         }
         const cached = task.phase === "paused" ? await this.ctx.storage.get<{ key: string; status: WorkSummary }>(`work-summary:${task.appId}`) : undefined;
         const session: CloudSession = task.phase === "paused" ? { state: cached?.key === key && cached.status.state === "FAILED" ? "FAILED" : "PAUSED" } : await this.session(task.session);
+        const activities = task.awaitingRoundStart && ["COMPLETED", "FAILED", "PAUSED", "AWAITING_USER_FEEDBACK"].includes(session.state || "") ? (await this.recentActivities({ ...session, name: task.session })).activities : [];
         await this.queue.run(`app:${task.appId}`, async () => {
           const current = await this.ctx.storage.get<WorkshopTask>(`task:${task.appId}`);
           const candidate = await this.candidate(task.appId);
           if (!current || this.resetting || this.summaryKey(current, candidate) !== key) return;
-          if (current.dispatchVersion && current.dispatchVersion === `${session.state}:${session.updateTime ?? ""}`) return;
-          if (session.state === "COMPLETED" && !isRoundCandidate(current, candidate) && !current.deliveryWaitStartedAt) { current.deliveryWaitStartedAt = Date.now(); await this.saveTask(current); }
-          const status = summarizeWork(current, session, candidate);
-          if (session.state === "FAILED") await this.notifyResult(current, false, "制作失败了。点击查看制作记录，可以继续修复这个作品。");
+          const waiting = current.awaitingRoundStart;
+          observeRound(current, session, activities);
+          if (waiting !== current.awaitingRoundStart) await this.saveTask(current);
+          const effectiveSession = currentRoundSession(current, session, candidate);
+          if (effectiveSession.state === "COMPLETED" && !isRoundCandidate(current, candidate) && !current.deliveryWaitStartedAt) { current.deliveryWaitStartedAt = Date.now(); await this.saveTask(current); }
+          const status = summarizeWork(current, effectiveSession, candidate);
+          if (effectiveSession.state === "FAILED") await this.notifyResult(current, false, "制作失败了。点击查看制作记录，可以继续修复这个作品。");
           const phase = status.completed ? status.application ? "ready" : "working" : ["FAILED", "PAUSED"].includes(status.state) ? "paused" : current.phase;
           const title = status.application?.title || current.title;
           if (current.phase !== phase || current.title !== title) {
@@ -773,7 +798,7 @@ export class Workshop extends DurableObject<Env> {
           const settled = task.phase === "ready" && isRoundCandidate(task, application);
           const status = settled ? summarizeWork(task, { state: "COMPLETED" }, application) : valid ? cached.status : summarizeWork(task, { state: task.phase === "ready" ? "COMPLETED" : "QUEUED" }, application);
           const ttl = status.completed && status.application ? 300000 : 20000;
-          return { appId: task.appId, ownerId: task.ownerId, session: task.session, approvalToken: task.token, title: task.title ?? task.appId, wish: task.wish ?? "", startedAt: task.startedAt, originalAppId: task.originalAppId, originalReleaseId: task.originalReleaseId, originalCommit: task.originalCommit, branch: task.branch, phase: task.phase, status: { ...status, stale: !settled && (!valid || Date.now() - cached.at >= ttl || force && cached.at === previous?.at) }, sharing: { shared: shared?.authorId === user.id ? shared : null, application }, updatedAt: valid ? cached.at : null };
+          return { submissionId: task.requestId, appId: task.appId, ownerId: task.ownerId, session: task.session, approvalToken: task.token, title: task.title ?? task.appId, wish: task.wish ?? "", startedAt: task.startedAt, originalAppId: task.originalAppId, originalReleaseId: task.originalReleaseId, originalCommit: task.originalCommit, branch: task.branch, phase: task.phase, status: { ...status, stale: !settled && (!valid || Date.now() - cached.at >= ttl || force && cached.at === previous?.at) }, sharing: { shared: shared?.authorId === user.id ? shared : null, application }, updatedAt: valid ? cached.at : null };
         }));
         const response = json({ works: works.filter(Boolean) }, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
       }
@@ -877,16 +902,20 @@ export class Workshop extends DurableObject<Env> {
           }
           const submittedPrompt = payload.prompt;
           const current = await this.session(task.session);
-          if (!["COMPLETED", "PAUSED", "AWAITING_USER_FEEDBACK", "FAILED"].includes(current.state ?? "")) return json({ message: "这个应用正在制作，请等本轮完成" }, 409);
+          const candidate = await this.candidate(appId);
+          const roundState = currentRoundSession(task, current, candidate).state;
+          if (!["COMPLETED", "PAUSED", "AWAITING_USER_FEEDBACK", "FAILED"].includes(roundState ?? "")) return json({ message: "这个应用正在制作，请等本轮完成" }, 409);
+          if (roundState === "COMPLETED" && task.phase === "working" && !isRoundCandidate(task, candidate) && (!task.deliveryWaitStartedAt || Date.now() - task.deliveryWaitStartedAt < 120000)) return json({ message: "本轮应用正在交付，请等交付完成后再修改" }, 409);
           const dispatchVersion = `${current.state}:${current.updateTime ?? ""}`;
           if (task.dispatchVersion === dispatchVersion) return json({ message: "本轮修改已提交，请等待制作状态更新" }, 409);
           if (!await this.quota(user.id, appId)) return json({ message: "制作额度已用完或同时制作作品过多，请稍后再试" }, 429);
           const previous = structuredClone(task);
-          task.publishEpoch = crypto.randomUUID(); task.dispatchVersion = dispatchVersion; task.deliveryWaitStartedAt = undefined;
+          task.publishEpoch = crypto.randomUUID(); task.requestId = input.requestId; task.awaitingRoundStart = true; task.dispatchVersion = dispatchVersion; task.deliveryWaitStartedAt = undefined;
           task.previousCommit = (await this.candidate(appId))?.source.commit ?? task.previousCommit; task.roundRelease = undefined;
           task.phase = "working"; task.repair = false; task.wish = String(payload.prompt ?? ""); task.startedAt = Date.now();
           // Persist the new round before upstream work starts; ambiguous timeouts can still deliver.
           await this.saveTask(task);
+          this.activityPages.delete(task.session);
           payload.prompt = `继续修改应用 ${appId}，目录 apps/${appId}/。${task.branch ? `目标分支：${task.branch}，git fetch origin 后 checkout 该分支。` : "目标分支：本 session 自动创建的应用分支。"} ${await this.publisherInstruction(task)} 用户需求：\n${payload.prompt ?? ""}`;
           const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
           if (response.ok && requestKey) await this.ctx.storage.put(requestKey, { session: task.session, prompt: submittedPrompt, response: await response.clone().text(), status: response.status });
@@ -905,8 +934,11 @@ export class Workshop extends DurableObject<Env> {
         const [session, application, shared] = await Promise.all([
           this.session(task.session), this.candidate(appId), this.ctx.storage.get<MarketEntry>(`shared:${appId}`),
         ]);
-        if (task.dispatchVersion === `${session.state}:${session.updateTime ?? ""}`) session.state = "QUEUED";
         const activityResult = await this.recentActivities({ ...session, name: task.session });
+        observeRound(task, session, activityResult.activities);
+        Object.assign(session, currentRoundSession(task, session, application));
+        if (task.startedAt) activityResult.activities = activityResult.activities.filter(value => Date.parse((value as { createTime?: string }).createTime || "") >= task.startedAt!);
+        if (session.state === "COMPLETED" && !isRoundCandidate(task, application) && !task.deliveryWaitStartedAt) task.deliveryWaitStartedAt = Date.now();
         const status = summarizeWork(task, session, application);
         // A stopped round must not be resumed merely because Jules still reports work.
         if (task.phase === "paused" && session.state !== "FAILED") session.state = "PAUSED";
@@ -918,25 +950,27 @@ export class Workshop extends DurableObject<Env> {
         if (session.state === "FAILED") await this.notifyResult(task, false, "制作失败了。点击查看制作记录，可以继续修复这个作品。");
         if (status.completed && status.application) await this.notifyResult(task, true, "制作完成，作品已准备好。点击查看、体验或继续修改。");
         if (status.application) {
+          // Delivery metadata may arrive after the session's completion event.
           status.delivery = input.applicationReleases?.[appId] === status.application.releaseId ? "loaded" : "update";
           this.ctx.waitUntil(this.queue.run(`app:${appId}`, async () => {
             const current = await this.ctx.storage.get<WorkshopTask>(`task:${appId}`);
             if (!this.resetting && current && current.publishEpoch === task.publishEpoch) await this.recordBranch(current, session, status.application!);
           }));
         }
-        const response = json({ session: { state: session.state, url: session.url, title: task.title, createTime: session.createTime, updateTime: session.updateTime }, status, sharing: { shared: shared?.authorId === user.id ? shared : null, application }, ...activityResult }, 200);
+        if (status.delivery === "blocked") await this.notifyResult(task, false, status.message);
+        const response = json({ roundStartedAt: task.startedAt, submissionId: task.requestId, session: { state: session.state, url: session.url, title: task.title, createTime: session.createTime, updateTime: session.updateTime }, status, sharing: { shared: shared?.authorId === user.id ? shared : null, application }, ...activityResult }, 200);
         response.headers.set("Cache-Control", "private,no-store"); return response;
       }
       const session = await this.session(task.session);
-      if (task.dispatchVersion && task.dispatchVersion !== `${session.state}:${session.updateTime ?? ""}`) { task.dispatchVersion = undefined; await this.saveTask(task); }
-      else if (task.dispatchVersion) session.state = "QUEUED";
+      observeRound(task, session);
+      Object.assign(session, currentRoundSession(task, session, await this.candidate(appId)));
       if (session.state === "FAILED") await this.notifyResult(task, false, "制作失败了。点击查看制作记录，可以继续修复这个作品。");
       if (input.action === "stop") {
         if (!["COMPLETED", "PAUSED", "FAILED"].includes(session.state ?? "")) {
           const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ method: "POST", path: `/v1alpha/${task.session}:sendMessage`, body: JSON.stringify({ prompt: "停止当前制作，不再修改或发布，等待我的下一条需求。" }) }) }), this.env);
           if (!response.ok) return response;
         }
-        task.phase = "paused"; task.repair = true; task.dispatchVersion = undefined;
+        task.phase = "paused"; task.repair = true; task.dispatchVersion = undefined; task.awaitingRoundStart = undefined;
         const latest = await this.candidate(appId);
         task.previousCommit = latest?.source.commit ?? task.previousCommit;
         await this.saveTask(task);
