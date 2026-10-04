@@ -608,7 +608,8 @@ export class Workshop extends DurableObject<Env> {
           if ((OFFICIAL_APPLICATIONS as readonly string[]).includes(entry.manifest.appId)) { entry.authorId = OFFICIAL_ACCOUNT_ID; entry.authorName = "紫金花官方"; entry.authorAvatarUrl = null; }
           entry.authorOfficial = entry.authorId === OFFICIAL_ACCOUNT_ID;
         }
-        const filtered = entries.filter(entry => (!authorId || entry.authorId === authorId) && (!category || (category === "official" ? entry.authorOfficial : (entry.category || "other") === category)) && (!query || `${entry.title} ${entry.summary}`.toLowerCase().includes(query)));
+        // Jolly is built into the host; archived releases are retained but no longer offered as an application.
+        const filtered = entries.filter(entry => entry.manifest.appId !== "jolly" && (!authorId || entry.authorId === authorId) && (!category || (category === "official" ? entry.authorOfficial : (entry.category || "other") === category)) && (!query || `${entry.title} ${entry.summary}`.toLowerCase().includes(query)));
         filtered.sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0) || a.manifest.appId.localeCompare(b.manifest.appId));
         // Explicit pagination keeps author-profile/internal callers on their existing full-list contract.
         const paged = params.has("limit") || params.has("cursor");
