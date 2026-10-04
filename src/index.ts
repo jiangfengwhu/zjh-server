@@ -32,6 +32,8 @@ export default {
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/post-images\/[a-f0-9-]{36}\/[a-f0-9-]{36}$/.test(url.pathname)) return readPostImage(request, env);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/market-images\/[a-z][a-z0-9-]{0,63}\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readPostImage(request, env);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/feedback-images\/[a-z][a-z0-9-]{0,63}\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readPostImage(request, env);
+      if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/creation-images\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readPostImage(request, env);
+      if (request.method === "PUT" && url.pathname === "/v1/creation-media") return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "PUT" && /^\/v1\/feedback-media\/[a-z][a-z0-9-]{0,63}\/[a-f0-9]{64}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "PUT" && /^\/v1\/market-media\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/avatars\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readAvatar(request, env);
@@ -372,7 +374,7 @@ export class Workshop extends DurableObject<Env> {
     } finally { this.resetting = false; }
   }
   private async write(request: Request, path: string): Promise<Response> {
-    if (path.startsWith("/v1/market-media/") || path.startsWith("/v1/feedback-media/")) return this.queue.runAll([`app:${path.split("/")[3]}`, "media-buffer"], () => this.handle(request));
+    if (path === "/v1/creation-media" || path.startsWith("/v1/market-media/") || path.startsWith("/v1/feedback-media/")) return this.queue.runAll([`app:${path.split("/")[3] ?? "creation"}`, "media-buffer"], () => this.handle(request));
     if (path.startsWith("/v1/application-blobs/")) {
       const appId = path.split("/")[3];
       if (!await this.publisher(request, appId)) return json({ message: "本轮发布授权已失效" }, 403);
@@ -524,7 +526,8 @@ export class Workshop extends DurableObject<Env> {
         const response = json({ applications: ids.map(appId => ({ appId, manifest: entries.get(`shared:${appId}`)?.manifest ?? null })) }, 200);
         response.headers.set("Cache-Control", "no-store"); return response;
       }
-      if ((path.startsWith("/v1/market-media/") || path.startsWith("/v1/feedback-media/")) && request.method === "PUT") {
+      if ((path === "/v1/creation-media" || path.startsWith("/v1/market-media/") || path.startsWith("/v1/feedback-media/")) && request.method === "PUT") {
+        const creation = path === "/v1/creation-media";
         const feedback = path.startsWith("/v1/feedback-media/");
         const appId = path.split("/")[3]; const releaseId = feedback ? path.split("/")[4] : undefined;
         const user = await authenticatedUser(request, this.env);
@@ -536,7 +539,7 @@ export class Workshop extends DurableObject<Env> {
           if (!owned && !publicVersion) return json({ message: "只能为自己的作品或公开版本附带反馈截图" }, 403);
           const candidate = await this.candidate(appId);
           if (candidate?.releaseId !== releaseId && !await this.env.CATALOG.get(`v1/applications/${appId}/releases/${releaseId}`)) return json({ message: "体验版本不存在，请重新打开应用" }, 404);
-        } else if (!task || task.ownerId !== user.id || request.headers.get("X-Workshop-Token") !== task.token) return json({ message: "只能上传自己作品的截图" }, 403);
+        } else if (!creation && (!task || task.ownerId !== user.id || request.headers.get("X-Workshop-Token") !== task.token)) return json({ message: "只能上传自己作品的截图" }, 403);
         const day = Math.floor(Date.now() / 86400000); const rateKey = `market-media-rate:${user.id}`;
         const rate = await this.ctx.storage.get<{ day: number; count: number }>(rateKey);
         const count = rate?.day === day ? rate.count : 0;
@@ -557,7 +560,7 @@ export class Workshop extends DurableObject<Env> {
         const bytes = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
         if (size < 32 || bytes[0] !== 255 || bytes[1] !== 216 || bytes[2] !== 255) return json({ message: "截图需为 JPEG 图片" }, 400);
         const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(value => value.toString(16).padStart(2, "0")).join("");
-        const key = `v1/${feedback ? "feedback-images" : "market-images"}/${appId}/${user.id}/${hash}`;
+        const key = creation ? `v1/creation-images/${user.id}/${hash}` : `v1/${feedback ? "feedback-images" : "market-images"}/${appId}/${user.id}/${hash}`;
         await this.env.BLOBS.put(key, bytes, { httpMetadata: { contentType: "image/jpeg", cacheControl: "public,max-age=31536000,immutable" } });
         return json({ url: `${new URL(request.url).origin}/${key}` }, 200);
       }
@@ -863,12 +866,19 @@ export class Workshop extends DurableObject<Env> {
         const name = input.path?.match(/^\/v1alpha\/(sessions\/[A-Za-z0-9_-]+)/)?.[1];
         if (name !== task.session) return json({ message: "Session 不属于这个应用" }, 403);
         if (input.method === "POST" && input.path?.endsWith(":sendMessage")) {
+          const payload = JSON.parse(input.body ?? "{}");
+          if (typeof payload.prompt !== "string" || !payload.prompt.trim() || payload.prompt.length > 8000) return json({ message: "请提交 1 到 8000 个字符的修改需求" }, 400);
+          const requestKey = typeof input.requestId === "string" && /^[a-zA-Z0-9-]{1,180}$/.test(input.requestId) ? `message-request:${appId}:${user.id}:${input.requestId}` : undefined;
+          const prior = requestKey ? await this.ctx.storage.get<{ session: string; prompt: string; response: string; status: number }>(requestKey) : undefined;
+          if (prior) {
+            if (prior.session !== task.session || prior.prompt !== payload.prompt) return json({ message: "提交标识已用于另一份修改需求" }, 409);
+            return new Response(prior.response, { status: prior.status, headers: { "Content-Type": "application/json" } });
+          }
+          const submittedPrompt = payload.prompt;
           const current = await this.session(task.session);
           if (!["COMPLETED", "PAUSED", "AWAITING_USER_FEEDBACK", "FAILED"].includes(current.state ?? "")) return json({ message: "这个应用正在制作，请等本轮完成" }, 409);
           const dispatchVersion = `${current.state}:${current.updateTime ?? ""}`;
           if (task.dispatchVersion === dispatchVersion) return json({ message: "本轮修改已提交，请等待制作状态更新" }, 409);
-          const payload = JSON.parse(input.body ?? "{}");
-          if (typeof payload.prompt !== "string" || !payload.prompt.trim() || payload.prompt.length > 8000) return json({ message: "请提交 1 到 8000 个字符的修改需求" }, 400);
           if (!await this.quota(user.id, appId)) return json({ message: "制作额度已用完或同时制作作品过多，请稍后再试" }, 429);
           const previous = structuredClone(task);
           task.publishEpoch = crypto.randomUUID(); task.dispatchVersion = dispatchVersion; task.deliveryWaitStartedAt = undefined;
@@ -878,6 +888,7 @@ export class Workshop extends DurableObject<Env> {
           await this.saveTask(task);
           payload.prompt = `继续修改应用 ${appId}，目录 apps/${appId}/。${task.branch ? `目标分支：${task.branch}，git fetch origin 后 checkout 该分支。` : "目标分支：本 session 自动创建的应用分支。"} ${await this.publisherInstruction(task)} 用户需求：\n${payload.prompt ?? ""}`;
           const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
+          if (response.ok && requestKey) await this.ctx.storage.put(requestKey, { session: task.session, prompt: submittedPrompt, response: await response.clone().text(), status: response.status });
           if (!response.ok && response.status < 500) await this.saveTask(previous);
           return response;
         }
