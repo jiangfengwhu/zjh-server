@@ -6,6 +6,7 @@ import {
   OFFICIAL_ACCOUNT_ID,
   type User,
 } from "./accounts";
+import { SocialInbox, SocialError } from "./social";
 import { KeyedQueue } from "./concurrency";
 
 type Author = Pick<User, "id" | "name" | "avatarUrl">;
@@ -366,8 +367,14 @@ export class Posts extends DurableObject<Env> {
           nextCursor: page.nextCursor,
         });
       }
+      const relationship = url.pathname.match(/^\/v1\/profiles\/([a-f0-9-]{36})\/(followers|following)$/);
+      if (relationship && request.method === "GET") {
+        const viewer = request.headers.has("Authorization") ? await authenticatedUser(request, this.env) : null;
+        return await new SocialInbox(this.ctx, this.env).relations(relationship[1], relationship[2] as "followers" | "following", url, viewer);
+      }
       const user = await authenticatedUser(request, this.env);
       if (!user) return json({ message: "请先登录后再发动态" }, 401);
+      if (url.pathname.startsWith("/v1/messages")) return await new SocialInbox(this.ctx, this.env).handle(request, user);
       if (url.pathname === "/v1/notifications" && request.method === "GET")
         return this.notices(url, user);
       if (
@@ -391,6 +398,9 @@ export class Posts extends DurableObject<Env> {
           await this.ctx.storage.transaction(async (storage) => {
             const key = `follow:${user.id}:${followId}`;
             const previous = !!(await storage.get(key));
+            const reverse = `follower:${followId}:${user.id}`;
+            if (desired) await storage.put(reverse, true);
+            else await storage.delete(reverse);
             if (previous === desired) return;
             if (desired) await storage.put(key, true);
             else await storage.delete(key);
@@ -453,14 +463,20 @@ export class Posts extends DurableObject<Env> {
       return json(
         {
           message:
-            error instanceof InputError
+            (error instanceof InputError || error instanceof SocialError)
               ? error.message
               : "动态操作未完成，请稍后重试",
         },
-        error instanceof InputError ? error.status : 503
+        (error instanceof InputError || error instanceof SocialError) ? error.status : 503
       );
     }
   }
+  webSocketMessage(socket: WebSocket, message: string | ArrayBuffer) {
+    // Messages are sent through authenticated, idempotent HTTP only.
+    if (message === "ping") socket.send("pong");
+  }
+  webSocketClose(socket: WebSocket, code: number, reason: string) { socket.close(code, reason); }
+  webSocketError(socket: WebSocket) { socket.close(1011, "Connection closed"); }
   private async noticeSummary(userId: string) {
     return this.ctx.storage.transaction(async (storage) => {
       const key = `notice-unread-categories:${userId}`;

@@ -27,7 +27,8 @@ GitHub/Jules 集成仅开放 zjh-plugin；云端不获得 R2、Wrangler 或全�
 | 接口 | 职责 |
 | --- | --- |
 | /v1/auth/*、/v1/account | 登录与资料，账号凭证由宿主保管 |
-| /v1/posts、/v1/notifications、/v1/profiles | 动态、互动与公开身份 |
+| /v1/posts、/v1/notifications、/v1/profiles | 动态、互动、公开身份及关注／粉丝分页 |
+| /v1/messages、/v1/messages/<用户 ID> | 私信会话、文字发送与历史；登录鉴权、幂等发送 |
 | /v1/workshop、/v1/works、/v1/jules | 按账号和 appId 管理制作，同应用复用会话并串行写入 |
 | /v1/creation-media | 账号认证的制作参考图上传，JPEG 最大 2 MB，沿用上传额度 |
 | /v1/application-blobs/<id>/<sha256>、/v1/catalog | 候选上传、哈希与本轮授权校验 |
@@ -44,3 +45,9 @@ GitHub/Jules 集成仅开放 zjh-plugin；云端不获得 R2、Wrangler 或全�
 Jolly 紧凑查询先返回本轮状态，历史在后台预热；尚未确认的新轮终态等待记录校验。通知发送不阻塞查询，制作监控与通知重试由服务端持有。
 
 `/v1/updates?apkVersionCode=<本机版本>` 返回 release、apk 与 apkUpdate；APK 文件位于既有 R2 的 v1/apk/<sha256>.apk。运行时与 APK 清单仅允许维护者发布，应用发布授权不可修改。
+
+关注关系由既有 Posts 存储维护正反索引，GET /v1/profiles/<id>/following 或 followers 返回独立游标及关系。旧数据首次读取时补齐反向索引，不改账号或作品存储。
+
+私信复用 Posts 存储，不新建绑定。GET /v1/messages 返回会话与总未读数，GET /v1/messages/<peerId> 返回当前账号与对方的历史；POST 同路径携带 body、requestId，最多 2000 字、每分钟 30 条，重复请求不重复写入。POST /v1/messages/<peerId>/read 携带 through 消息 ID，仅标记读取到的边界；GET /v1/messages/unread 返回私信总未读数。所有接口鉴权，禁止自发私信和跨会话游标。
+
+GET /v1/messages/live 以 Authorization 头建立 WebSocket，复用 Posts 的休眠连接。推送只含 message/read 失效事件，正文须通过鉴权接口读取；过期连接在下一次事件时关闭并由客户端重新鉴权连接，不使用定时查询。
