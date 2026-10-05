@@ -7,13 +7,13 @@ export { Posts } from "./posts";
 import { readPostImage, readSharedPost } from "./posts";
 
 /** 清单类的键：整套清单和 vendor 的模块编号表。格式变了就换前缀（v3/…），旧版本的手机继续读旧前缀。 */
-const JSON_KEY = /^v1\/(?:release|runtime|maps\/vendor\.json|applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|releases\/[a-f0-9]{64}))$/;
-const DYNAMIC_JSON_KEY = /^v1\/(?:release|maps\/vendor\.json|applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|releases\/[a-f0-9]{64}))$/;
+const JSON_KEY = /^v1\/(?:release|runtime|apk|maps\/vendor\.json|applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|releases\/[a-f0-9]{64}))$/;
+const DYNAMIC_JSON_KEY = /^v1\/(?:release|apk|maps\/vendor\.json|applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|releases\/[a-f0-9]{64}))$/;
 const PLUGIN_SOURCE = "sources/github/jiangfengwhu/zjh-plugin";
 const allowedSource = (source?: string) => source === PLUGIN_SOURCE;
 
 /** 包体的键：vendor、app、插件 DEX，全部按内容哈希命名，写入后不再改。 */
-const BLOB_KEY = /^v1\/(?:vendor|app|sdk)\/[a-f0-9]{64}$|^v1\/plugins\/[a-z0-9-]+\/[a-f0-9]{64}$/;
+const BLOB_KEY = /^v1\/apk\/[a-f0-9]{64}\.apk$|^v1\/(?:vendor|app|sdk)\/[a-f0-9]{64}$|^v1\/plugins\/[a-z0-9-]+\/[a-f0-9]{64}$/;
 
 const ACTIVITY_MASK =
   "activities.name,activities.id,activities.createTime,activities.description,activities.progressUpdated,activities.planGenerated,activities.planApproved,activities.sessionCompleted,activities.sessionFailed,activities.agentMessaged,activities.userMessaged,nextPageToken";
@@ -49,6 +49,7 @@ export default {
       }
       if (request.method === "POST" && url.pathname === "/v1/jules") return proxyJules(request, env);
       if (request.method !== "GET" && request.method !== "HEAD") return json({ error: "not found" }, 404);
+      if (url.pathname === "/v1/updates") return readUpdates(request, env);
       const key = url.pathname.replace(/^\/+/, "");
       if (JSON_KEY.test(key)) return readCatalog(request, env, key);
       if (BLOB_KEY.test(key)) return readBlob(request, env, key);
@@ -59,6 +60,17 @@ export default {
     }
   },
 } satisfies ExportedHandler<Env>;
+
+type ApkRelease = { versionCode: number; versionName: string; sha256: string; bytes: number; runtimeVersion: string; source: { commit: string; dirty: boolean }; publishedAt: number };
+async function readUpdates(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const code = Number(url.searchParams.get("apkVersionCode") || "0");
+  if (!Number.isSafeInteger(code) || code < 0) return json({ message: "APK 版本无效" }, 400);
+  const [release, apk] = await Promise.all([env.CATALOG.get("v1/release", "json"), env.CATALOG.get<ApkRelease>("v1/apk", "json")]);
+  if (!release) return json({ message: "还没有线上版本" }, 404);
+  const response = json({ release, apk: apk ? { ...apk, url: `https://zjh-cdn.297782.xyz/v1/apk/${apk.sha256}.apk` } : null, apkUpdate: !!apk && apk.versionCode > code }, 200);
+  response.headers.set("Cache-Control", "no-store"); return response;
+}
 
 async function readCatalog(request: Request, env: Env, key: string): Promise<Response> {
   const body = await env.CATALOG.get(key);
@@ -84,7 +96,8 @@ async function readBlob(request: Request, env: Env, key: string): Promise<Respon
   }
   const headers = new Headers();
   object.writeHttpMetadata(headers);
-  headers.set("content-type", "application/octet-stream");
+  headers.set("content-type", key.startsWith("v1/apk/") ? "application/vnd.android.package-archive" : "application/octet-stream");
+  if (key.startsWith("v1/apk/")) headers.set("content-disposition", 'attachment; filename="zijinhua.apk"');
   headers.set("cache-control", "public, max-age=31536000, immutable");
   headers.set("etag", object.httpEtag);
   console.log(JSON.stringify({ event: "blob", key, bytes: object.size }));
@@ -484,7 +497,7 @@ export class Workshop extends DurableObject<Env> {
   private async recentActivities(session: CloudSession) {
     const name = session.name!; const version = `${session.state}:${session.updateTime || ""}`;
     const cached = this.activityPages.get(name);
-    if (cached?.version === version && Date.now() - cached.at < 30000) return { ...cached.page, stale: false };
+    if (cached && (!session.state || cached.version === version) && Date.now() - cached.at < 30000) return { ...cached.page, stale: false };
     const activities: unknown[] = []; let nextPageToken: string | undefined;
     // Jules exposes pagination but no documented ordering/filter. Preserve the
     // existing four-page bound; remaining records are explicitly pageable.
@@ -804,7 +817,7 @@ export class Workshop extends DurableObject<Env> {
         }));
         const response = json({ works: works.filter(Boolean) }, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
       }
-      const input = await request.json() as { appId?: string; originalAppId?: string; originalReleaseId?: string; requestId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; category?: string; screenshots?: string[]; applicationReleases?: Record<string, string>; pageToken?: string };
+      const input = await request.json() as { appId?: string; originalAppId?: string; originalReleaseId?: string; requestId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; category?: string; screenshots?: string[]; applicationReleases?: Record<string, string>; pageToken?: string; compact?: boolean };
       const appId = input.appId;
       if (!appId || !/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return json({ message: "请指定目标应用" }, 400);
       const user = await authenticatedUser(request, this.env);
@@ -861,9 +874,9 @@ export class Workshop extends DurableObject<Env> {
       }
       if (!task || (input.token ?? input.approvalToken) !== task.token) return json({ message: "这个应用的 session 凭据不匹配" }, 403);
       if (path === "/v1/market") {
-        const shared = await this.ctx.storage.get<MarketEntry>(`shared:${appId}`) ?? null;
+        const [published, application] = await Promise.all([this.ctx.storage.get<MarketEntry>(`shared:${appId}`), this.candidate(appId)]);
+        const shared = published ?? null;
         if (shared && shared.authorId !== user.id) return json({ message: "只有作者可以管理这份分享" }, 403);
-        const application = await this.candidate(appId);
         if (input.action === "status") return json({ shared, application }, 200);
         if (input.action === "withdraw") {
           await this.ctx.storage.delete(`shared:${appId}`);
@@ -936,10 +949,16 @@ export class Workshop extends DurableObject<Env> {
         response.headers.set("Cache-Control", "private,no-store"); return response;
       }
       if (input.action === "detail") {
-        const [session, application, shared] = await Promise.all([
+        const started = Date.now();
+        const [session, application, shared, initialActivities] = await Promise.all([
           this.session(task.session), this.candidate(appId), this.ctx.storage.get<MarketEntry>(`shared:${appId}`),
+          input.compact ? Promise.resolve({ ...(this.activityPages.get(task.session)?.page ?? { activities: [] }), stale: true }) : this.recentActivities({ name: task.session }),
         ]);
-        const activityResult = await this.recentActivities({ ...session, name: task.session });
+        // Status is independent of the bulk history. Only round confirmation
+        // needs activities before replying; history warming never polls the client.
+        const confirmRound = task.awaitingRoundStart && ["COMPLETED", "FAILED", "PAUSED", "AWAITING_USER_FEEDBACK"].includes(session.state || "");
+        const activityResult = input.compact && confirmRound ? await this.recentActivities({ ...session, name: task.session }) : initialActivities;
+        if (input.compact && !confirmRound) this.ctx.waitUntil(this.recentActivities({ ...session, name: task.session }).catch(() => {}));
         observeRound(task, session, activityResult.activities);
         Object.assign(session, currentRoundSession(task, session, application));
         if (task.startedAt) activityResult.activities = activityResult.activities.filter(value => Date.parse((value as { createTime?: string }).createTime || "") >= task.startedAt!);
@@ -952,8 +971,8 @@ export class Workshop extends DurableObject<Env> {
         if (status.application?.title) task.title = status.application.title;
         await this.saveTask(task);
         await this.ctx.storage.put(`work-summary:${appId}`, { key: this.summaryKey(task, application), at: Date.now(), status });
-        if (session.state === "FAILED") await this.notifyResult(task, false, "制作失败了。点击查看制作记录，可以继续修复这个作品。");
-        if (status.completed && status.application) await this.notifyResult(task, true, "制作完成，作品已准备好。点击查看、体验或继续修改。");
+        if (session.state === "FAILED") this.ctx.waitUntil(this.notifyResult(task, false, "制作失败了。点击查看制作记录，可以继续修复这个作品。"));
+        if (status.completed && status.application) this.ctx.waitUntil(this.notifyResult(task, true, "制作完成，作品已准备好。点击查看、体验或继续修改。"));
         if (status.application) {
           // Delivery metadata may arrive after the session's completion event.
           status.delivery = input.applicationReleases?.[appId] === status.application.releaseId ? "loaded" : "update";
@@ -962,9 +981,10 @@ export class Workshop extends DurableObject<Env> {
             if (!this.resetting && current && current.publishEpoch === task.publishEpoch) await this.recordBranch(current, session, status.application!);
           }));
         }
-        if (status.delivery === "blocked") await this.notifyResult(task, false, status.message);
+        if (status.delivery === "blocked") this.ctx.waitUntil(this.notifyResult(task, false, status.message));
         const response = json({ roundStartedAt: task.startedAt, submissionId: task.requestId, session: { state: session.state, url: session.url, title: task.title, createTime: session.createTime, updateTime: session.updateTime }, status, sharing: { shared: shared?.authorId === user.id ? shared : null, application }, ...activityResult }, 200);
-        response.headers.set("Cache-Control", "private,no-store"); return response;
+        response.headers.set("Cache-Control", "private,no-store");
+        response.headers.set("Server-Timing", `workshop;dur=${Date.now() - started}`); return response;
       }
       const session = await this.session(task.session);
       observeRound(task, session);

@@ -28,3 +28,5 @@ Secrets 通过 npx wrangler secret put <NAME> 交互配置，不把值写入代�
 - /v1/runtime：配套 APK 的运行时契约，普通应用发布不能修改。
 
 制作提示由服务端注入本轮授权与任务上下文；Jolly 只整理用户需求，通用开发与发包规则引用插件及 SDK 文档。Remix 锁定原作 releaseId/commit，为新应用分配独立身份和模块范围。共享 JS 环境不是恶意代码沙箱。
+
+`/v1/updates?apkVersionCode=<本机版本>` 返回动态 release、APK 版本与 apkUpdate 标志；`/v1/apk` 为 APK 清单，文件位于既有 R2 的 `v1/apk/<sha256>.apk`。APK 清单只有维护者可发布，应用发布授权不可修改。Jolly 紧凑详情先返回本轮状态，活动历史在后台预热，只有尚未确认的新轮次终态必须等待记录校验；通知发送不阻塞查询响应。
