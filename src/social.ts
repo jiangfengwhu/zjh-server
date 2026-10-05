@@ -1,3 +1,4 @@
+import { sendAccountLive } from "./live";
 import { publicProfiles, type User } from "./accounts";
 
 type Author = Pick<User, "id" | "name" | "avatarUrl">;
@@ -40,13 +41,7 @@ async function inputOf(request: Request): Promise<Record<string, unknown>> {
 export class SocialInbox {
   constructor(private ctx: DurableObjectState, private env: Env) {}
   private notify(owner: string, type: "message" | "read") {
-    for (const socket of this.ctx.getWebSockets(owner)) {
-      try {
-        const metadata = socket.deserializeAttachment() as { expiresAt?: number } | null;
-        if (!metadata?.expiresAt || metadata.expiresAt <= Date.now()) socket.close(1000, "Reconnect");
-        else socket.send(JSON.stringify({ type })); // Invalidation only; HTTP rechecks account authorization.
-      } catch { try { socket.close(); } catch {} }
-    }
+    return sendAccountLive(this.ctx, owner, type);
   }
   async relations(authorId: string, kind: "following" | "followers", url: URL, viewer: User | null) {
     if (!uuid.test(authorId)) throw new SocialError("作者标识无效");
@@ -89,6 +84,7 @@ export class SocialInbox {
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1], [user.id]);
       pair[1].serializeAttachment({ expiresAt: Date.now() + 3600000 });
+      await sendAccountLive(this.ctx, user.id, "ready", {}, pair[1]);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
     if (url.pathname === "/v1/messages/unread" && request.method === "GET") return json({ unreadCount: (await this.ctx.storage.get<number>(`dm-unread:${user.id}`)) ?? 0 });
@@ -154,7 +150,7 @@ export class SocialInbox {
       await storage.put(`dm-unread:${peer.id}`, ((await storage.get<number>(`dm-unread:${peer.id}`)) ?? 0) + 1);
       return { message, created: true };
     });
-    if (result.created) { this.notify(user.id, "message"); this.notify(peer.id, "message"); }
+    if (result.created) { await this.notify(user.id, "message"); await this.notify(peer.id, "message"); }
     return json({ message: result.message }, result.created ? 201 : 200);
   }
   private async markRead(request: Request, user: User, peerId: string) {
@@ -178,7 +174,7 @@ export class SocialInbox {
       await storage.put(`dm-unread:${user.id}`, Math.max(0, ((await storage.get<number>(`dm-unread:${user.id}`)) ?? 0) - removed));
       return removed > 0;
     });
-    if (changed) this.notify(user.id, "read");
+    if (changed) await this.notify(user.id, "read");
     return json({ unreadCount: (await this.ctx.storage.get<number>(`dm-unread:${user.id}`)) ?? 0 });
   }
 }

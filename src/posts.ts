@@ -1,3 +1,4 @@
+import { sendLive, sendAccountLive } from "./live";
 import { normalizePostContent, type PostContent } from "./postHtml";
 import { DurableObject } from "cloudflare:workers";
 import {
@@ -107,6 +108,7 @@ const postKey = (post: Post) =>
 /** Public user timeline; account credentials and app-generated posts remain separate. */
 export class Posts extends DurableObject<Env> {
   private queue = new KeyedQueue();
+  private noticeChanges = new Set<string>();
   private resetting = false;
   private pending = new Set<Promise<unknown>>();
   async fetch(request: Request): Promise<Response> {
@@ -128,7 +130,12 @@ export class Posts extends DurableObject<Env> {
     const operation = this.handle(request);
     this.pending.add(operation);
     try {
-      return await operation;
+      const response = await operation;
+      const owners = [...this.noticeChanges];
+      this.noticeChanges.clear();
+      if (owners.length) this.ctx.waitUntil(Promise.all(owners.map(owner => sendAccountLive(this.ctx, owner, "notification"))).catch(() => {}));
+      if (response.ok && request.method === "POST" && new URL(request.url).pathname === "/v1/posts") sendLive(this.ctx, { type: "feed" });
+      return response;
     } finally {
       this.pending.delete(operation);
     }
@@ -153,6 +160,12 @@ export class Posts extends DurableObject<Env> {
           cursor = page.truncated ? page.cursor : undefined;
         } while (cursor);
         return json({ reset: true });
+      }
+      if (url.pathname === "/internal/live-work" && request.method === "POST") {
+        const input = await request.json() as { ownerId: string; appId: string };
+        if (!uuid.test(input.ownerId) || !/^[a-z][a-z0-9-]{0,63}$/.test(input.appId)) throw new InputError("作品事件无效");
+        await sendAccountLive(this.ctx, input.ownerId, "work", { appId: input.appId });
+        return json({ sent: true });
       }
       if (
         url.pathname === "/internal/work-notice" &&
@@ -200,6 +213,7 @@ export class Posts extends DurableObject<Env> {
           await storage.put(index, key);
           await this.changeUnread(storage, input.ownerId, notice.kind, 1);
         });
+        this.ctx.waitUntil(sendAccountLive(this.ctx, input.ownerId, "work", { appId: input.appId }).catch(() => {}));
         return json({ id });
       }
       if (url.pathname === "/v1/posts" && request.method === "GET") {
@@ -374,7 +388,10 @@ export class Posts extends DurableObject<Env> {
       }
       const user = await authenticatedUser(request, this.env);
       if (!user) return json({ message: "请先登录后再发动态" }, 401);
-      if (url.pathname.startsWith("/v1/messages")) return await new SocialInbox(this.ctx, this.env).handle(request, user);
+      if (url.pathname.startsWith("/v1/messages")) {
+        if (url.pathname === "/v1/messages/live") await this.noticeSummary(user.id);
+        return await new SocialInbox(this.ctx, this.env).handle(request, user);
+      }
       if (url.pathname === "/v1/notifications" && request.method === "GET")
         return this.notices(url, user);
       if (
@@ -501,6 +518,7 @@ export class Posts extends DurableObject<Env> {
     });
   }
   private async changeUnread(storage: DurableObjectTransaction, userId: string, kind: Notice["kind"], delta: number) {
+    this.noticeChanges.add(userId);
     const totalKey = `notice-unread:${userId}`;
     await storage.put(totalKey, Math.max(0, ((await storage.get<number>(totalKey)) ?? 0) + delta));
     const key = `notice-unread-categories:${userId}`;

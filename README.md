@@ -42,7 +42,7 @@ GitHub/Jules 集成仅开放 zjh-plugin；云端不获得 R2、Wrangler 或全�
 
 宿主负责制作表单，Jolly 仅查进度。服务端注入授权与任务上下文，通用规则引用插件及 SDK 文档。Remix 锁定原作 releaseId/commit，分配独立身份与模块范围。共享 JS 环境不是恶意代码沙箱。
 
-Jolly 紧凑查询先返回本轮状态，历史在后台预热；尚未确认的新轮终态等待记录校验。通知发送不阻塞查询，制作监控与通知重试由服务端持有。
+Jolly 紧凑查询先返回本轮状态，历史在后台预热；尚未确认的新轮终态等待记录校验。通知发送不阻塞查询；进度由用户手动查询，定时任务仅重试已生成但尚未送达的通知。/v1/works 默认只读本地快照，refresh=1 才查询上游。
 
 `/v1/updates?apkVersionCode=<本机版本>` 返回 release、apk 与 apkUpdate；APK 文件位于既有 R2 的 v1/apk/<sha256>.apk。运行时与 APK 清单仅允许维护者发布，应用发布授权不可修改。
 
@@ -50,4 +50,4 @@ Jolly 紧凑查询先返回本轮状态，历史在后台预热；尚未确认�
 
 私信复用 Posts 存储，不新建绑定。GET /v1/messages 返回会话与总未读数，GET /v1/messages/<peerId> 返回当前账号与对方的历史；POST 同路径携带 body、requestId，最多 2000 字、每分钟 30 条，重复请求不重复写入。POST /v1/messages/<peerId>/read 携带 through 消息 ID，仅标记读取到的边界；GET /v1/messages/unread 返回私信总未读数。所有接口鉴权，禁止自发私信和跨会话游标。
 
-GET /v1/messages/live 以 Authorization 头建立 WebSocket，复用 Posts 的休眠连接。推送只含 message/read 失效事件，正文须通过鉴权接口读取；过期连接在下一次事件时关闭并由客户端重新鉴权连接，不使用定时查询。
+GET /v1/messages/live 以 Authorization 头建立 WebSocket，复用 Posts 的休眠连接。推送 ready/message/read/notification/feed/work 事件；账号事件带递增 version、私信总未读及通知分类数量，作品事件带 appId。正文须通过鉴权接口读取；过期连接在下一次事件时关闭并由客户端重新鉴权连接，不使用定时查询。客户端合并短时事件，仅刷新可见列表，首页新动态由用户点击提示后展示；后台关闭连接，重连补同步。

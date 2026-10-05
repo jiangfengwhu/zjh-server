@@ -287,10 +287,10 @@ export class Workshop extends DurableObject<Env> {
   }
   async alarm() {
     if (this.monitoring) return this.monitoring;
-    this.monitoring = this.pollWorkAlarm().finally(() => { this.monitoring = undefined; });
+    this.monitoring = this.retryNoticeOutbox().finally(() => { this.monitoring = undefined; });
     return this.monitoring;
   }
-  private async pollWorkAlarm() {
+  private async retryNoticeOutbox() {
     if (this.resetting) return;
     const pending = await this.ctx.storage.list<{ ownerId: string; appId: string; round: string; success: boolean; kind?: "work-submitted"; title: string; message: string }>({ prefix: "work-notice:", limit: 100 });
     for (const [key, payload] of pending) {
@@ -299,25 +299,15 @@ export class Workshop extends DurableObject<Env> {
         if (response.ok) { await this.ctx.storage.put(key.replace("work-notice:", "work-notice-sent:"), true); await this.ctx.storage.delete(key); }
       } catch { /* The durable outbox is retried by the next alarm. */ }
     }
-    const after = await this.ctx.storage.get<string>("watch-cursor");
-    const watches = await this.ctx.storage.list<boolean>({ prefix: "watch:", startAfter: after, limit: 100 });
-    await Promise.all([...watches.keys()].map(async key => {
-      const task = await this.ctx.storage.get<WorkshopTask>(`task:${key.slice(6)}`);
-      if (!task || task.phase !== "working") {
-        await this.queue.run(`app:${key.slice(6)}`, async () => {
-          const current = await this.ctx.storage.get<WorkshopTask>(`task:${key.slice(6)}`);
-          if (!current || current.phase !== "working") await this.ctx.storage.delete(key);
-        });
-        return;
-      }
-      if (task.session) await this.notifyResult(task, true, "需求已提交，点击查看本轮制作进度。完成或失败都会在这里通知你。", "work-submitted");
-      await this.refreshSummary(task, await this.candidate(task.appId));
-    }));
-    if (watches.size === 100) await this.ctx.storage.put("watch-cursor", [...watches.keys()].at(-1)!);
-    else await this.ctx.storage.delete("watch-cursor");
-    const remaining = await this.ctx.storage.list({ prefix: "watch:", limit: 1 });
+    // Only retry already-created notifications; never query Jules on a timer.
+    await this.ctx.storage.delete("watch-cursor");
     const outbox = await this.ctx.storage.list({ prefix: "work-notice:", limit: 1 });
-    if (remaining.size || outbox.size) await this.armMonitor();
+    if (outbox.size) await this.armMonitor();
+  }
+  private emitWork(ownerId: string, appId: string) {
+    this.ctx.waitUntil(this.env.POSTS.getByName("timeline").fetch(new Request("https://posts.internal/internal/live-work", {
+      method: "POST", body: JSON.stringify({ ownerId, appId }),
+    })).catch(() => {}));
   }
   private activityPages = new Map<string, { version: string; at: number; page: { activities: unknown[]; nextPageToken?: string } }>();
   private summaries = new Map<string, Promise<void>>();
@@ -360,7 +350,6 @@ export class Workshop extends DurableObject<Env> {
           await this.ctx.storage.put(`work-summary:${task.appId}`, { key: this.summaryKey(current, candidate), at: Date.now(), status });
           if (status.completed && status.application) await this.notifyResult(current, true, "制作完成，作品已准备好。点击查看、体验或继续修改。");
           if (status.delivery === "blocked") await this.notifyResult(current, false, status.message);
-          if (current.phase === "working") { await this.ctx.storage.put(`watch:${current.appId}`, true); await this.armMonitor(); }
         });
       } catch { /* Preserve the last result; the list marks expired data stale. */ }
     }).finally(() => this.summaries.delete(key));
@@ -456,12 +445,10 @@ export class Workshop extends DurableObject<Env> {
   private async saveTask(task: WorkshopTask) {
     await this.ctx.storage.transaction(async storage => {
       await storage.put({ [`task:${task.appId}`]: task, [`owner:${task.ownerId}:${task.appId}`]: task });
-      if (task.phase === "working") await storage.put(`watch:${task.appId}`, true);
-      else await storage.delete(`watch:${task.appId}`);
+      await storage.delete(`watch:${task.appId}`);
       const quota = await storage.get<{ day: number; count: number; reservations?: Record<string, number> }>(`quota:${task.ownerId}`);
       if (quota?.reservations?.[task.appId]) { delete quota.reservations[task.appId]; await storage.put(`quota:${task.ownerId}`, quota); }
     });
-    if (task.phase === "working") await this.armMonitor();
   }
   private async publisherInstruction(task: WorkshopTask) {
     const grant = await issuePublisherGrant({ appId: task.appId, ownerId: task.ownerId, epoch: task.publishEpoch! }, this.env.OFFICIAL_PUBLISH_TOKEN);
@@ -741,7 +728,7 @@ export class Workshop extends DurableObject<Env> {
           await this.ctx.storage.put(Object.fromEntries([...candidates].map(([id, manifest]) => [`candidate:${id}`, manifest])));
           for (const [id, manifest] of candidates) {
             const task = await this.ctx.storage.get<WorkshopTask>(`task:${id}`);
-            if (task) { task.roundRelease = manifest.releaseId; await this.saveTask(task); }
+            if (task) { task.roundRelease = manifest.releaseId; await this.saveTask(task); this.emitWork(task.ownerId, id); }
           }
         }
         return response;
@@ -793,10 +780,9 @@ export class Workshop extends DurableObject<Env> {
           const [application, shared, cached] = await Promise.all([this.candidate(task.appId), this.ctx.storage.get<MarketEntry>(`shared:${task.appId}`), this.ctx.storage.get<{ key: string; at: number; status: WorkSummary }>(`work-summary:${task.appId}`)]);
           const valid = cached?.key === this.summaryKey(task, application);
           const settled = task.phase === "ready" && isRoundCandidate(task, application);
-          const fresh = settled || valid && Date.now() - cached.at < (cached.status.completed && cached.status.application ? 300000 : 20000);
           // A completed round with its actual candidate is authoritative locally;
           // old/expired Jules sessions cannot make a delivered work stale again.
-          return { task, application, shared: shared?.authorId === user.id ? shared : null, cached: valid ? cached : undefined, pending: !settled && (force || !fresh) ? this.refreshSummary(task, application) : undefined };
+          return { task, application, shared: shared?.authorId === user.id ? shared : null, cached: valid ? cached : undefined, pending: !settled && force ? this.refreshSummary(task, application) : undefined };
         }));
         const pending = Promise.all(entries.map(entry => entry.pending)); this.ctx.waitUntil(pending);
         // Bound the whole list wait, rather than spending a timeout on every work.
@@ -882,6 +868,7 @@ export class Workshop extends DurableObject<Env> {
         if (input.action === "withdraw") {
           await this.ctx.storage.delete(`shared:${appId}`);
           await this.ctx.storage.put(`withdrawn:${appId}`, true);
+          this.emitWork(user.id, appId);
           return json({ shared: null, application }, 200);
         }
         if (input.action && !["share", "edit"].includes(input.action)) return json({ message: "分享操作无效" }, 400);
@@ -903,6 +890,7 @@ export class Workshop extends DurableObject<Env> {
         const entry: MarketEntry = { manifest, title, summary, category, screenshots, publishedAt: input.action === "edit" ? shared!.publishedAt || 0 : shared?.manifest.releaseId === manifest.releaseId ? shared.publishedAt || Date.now() : Date.now(), authorId: user.id, authorName: user.name, authorAvatarUrl: user.avatarUrl, authorOfficial: user.id === OFFICIAL_ACCOUNT_ID, originalAppId: (manifest as ApplicationRelease & { originalAppId?: string }).originalAppId ?? null, sourceCommit: input.action === "edit" ? shared!.sourceCommit : proof?.commit ?? manifest.source.commit, sourceBranch: input.action === "edit" ? shared!.sourceBranch : task.branch };
         await this.ctx.storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${manifest.releaseId}`]: true });
         await this.ctx.storage.delete(`withdrawn:${appId}`);
+        this.emitWork(user.id, appId);
         return json({ shared: entry, application }, 200);
       }
       if (path === "/v1/jules") {
