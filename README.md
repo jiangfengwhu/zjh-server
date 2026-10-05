@@ -35,7 +35,7 @@ GitHub/Jules 集成仅开放 zjh-plugin；云端不获得 R2、Wrangler 或全�
 | /v1/official-release、/v1/runtime | 维护者公开官方版本、发布配套 APK 契约 |
 | /v1/updates、/v1/apk | 动态与 APK 更新检查、APK 清单 |
 
-通知 category=creation/interaction 使用独立分页游标；不传 category 返回全部通知。制作状态携带 submissionId/startedAt，旧轮终态不能覆盖新提交；继续修改的 requestId 绑定账号、应用、会话与正文，成功重试不再次提交。
+通知 category=creation/interaction 使用独立分页游标；不传 category 返回全部通知。通知列表、未读查询与标记已读均返回 unreadByCategory（creation/interaction 未读数）；点赞、评论、回复归入互动，重复点赞不生成通知，取消点赞清理对应通知。制作状态携带 submissionId/startedAt，旧轮终态不能覆盖新提交；继续修改的 requestId 绑定账号、应用、会话与正文，成功重试不再次提交。
 
 候选发布必须提供 expectedReleases 原子基线，冲突返回 409；candidate 为权威候选，latest 为私有镜像，不检查应用提交祖先。市场、安装及 APK seed 只消费公开版本；官方身份由服务端生成。
 

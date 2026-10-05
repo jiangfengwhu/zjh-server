@@ -50,7 +50,7 @@ type Notice = {
   commentId: string;
   body: string;
   postPreview: string;
-  kind: "comment" | "reply" | "work-success" | "work-failure" | "work-submitted";
+  kind: "like" | "comment" | "reply" | "work-success" | "work-failure" | "work-submitted";
   appId?: string;
   createdAt: number;
   read: boolean;
@@ -197,11 +197,7 @@ export class Posts extends DurableObject<Env> {
           ).padStart(13, "0")}:${id}`;
           await storage.put(key, notice);
           await storage.put(index, key);
-          await storage.put(
-            `notice-unread:${input.ownerId}`,
-            ((await storage.get<number>(`notice-unread:${input.ownerId}`)) ??
-              0) + 1
-          );
+          await this.changeUnread(storage, input.ownerId, notice.kind, 1);
         });
         return json({ id });
       }
@@ -378,11 +374,7 @@ export class Posts extends DurableObject<Env> {
         url.pathname === "/v1/notifications/unread" &&
         request.method === "GET"
       )
-        return json({
-          unreadCount:
-            (await this.ctx.storage.get<number>(`notice-unread:${user.id}`)) ??
-            0,
-        });
+        return json(await this.noticeSummary(user.id));
       return await this.queue.run(user.id, async () => {
         const followId = url.pathname.match(
           /^\/v1\/profiles\/([a-f0-9-]{36})\/follow$/
@@ -469,6 +461,40 @@ export class Posts extends DurableObject<Env> {
       );
     }
   }
+  private async noticeSummary(userId: string) {
+    return this.ctx.storage.transaction(async (storage) => {
+      const key = `notice-unread-categories:${userId}`;
+      let counts = await storage.get<{ creation: number; interaction: number }>(key);
+      if (!counts) {
+        counts = { creation: 0, interaction: 0 };
+        let cursor: string | undefined;
+        while (true) {
+          const records = await storage.list<Notice>({
+            prefix: `notice:${userId}:`, startAfter: cursor, limit: 256,
+          });
+          for (const notice of records.values()) {
+            if (!notice.read) counts[notice.kind.startsWith("work-") ? "creation" : "interaction"]++;
+          }
+          if (records.size < 256) break;
+          cursor = [...records.keys()].at(-1);
+        }
+        await storage.put(key, counts);
+        await storage.put(`notice-unread:${userId}`, counts.creation + counts.interaction);
+      }
+      return { unreadCount: counts.creation + counts.interaction, unreadByCategory: counts };
+    });
+  }
+  private async changeUnread(storage: DurableObjectTransaction, userId: string, kind: Notice["kind"], delta: number) {
+    const totalKey = `notice-unread:${userId}`;
+    await storage.put(totalKey, Math.max(0, ((await storage.get<number>(totalKey)) ?? 0) + delta));
+    const key = `notice-unread-categories:${userId}`;
+    const counts = await storage.get<{ creation: number; interaction: number }>(key);
+    if (counts) {
+      const category = kind.startsWith("work-") ? "creation" : "interaction";
+      counts[category] = Math.max(0, counts[category] + delta);
+      await storage.put(key, counts);
+    }
+  }
   private async notices(url: URL, user: User) {
     const prefix = `notice:${user.id}:`;
     const category = url.searchParams.get("category") || "";
@@ -504,8 +530,7 @@ export class Posts extends DurableObject<Env> {
         actor: profiles.get(item.actor.id) ?? item.actor,
       })),
       nextCursor: more && next ? (category ? `${category}|${next}` : next) : null,
-      unreadCount:
-        (await this.ctx.storage.get<number>(`notice-unread:${user.id}`)) ?? 0,
+      ...await this.noticeSummary(user.id),
     });
   }
   private async readNotices(request: Request, user: User) {
@@ -532,16 +557,13 @@ export class Posts extends DurableObject<Env> {
     const ids = input.ids as string[] | undefined;
     const mark = async (keys: string[]) =>
       this.ctx.storage.transaction(async (storage) => {
-        let unread =
-          (await storage.get<number>(`notice-unread:${user.id}`)) ?? 0;
         for (const key of keys) {
           const notice = await storage.get<Notice>(key);
           if (notice && !notice.read && notice.createdAt <= before) {
             await storage.put(key, { ...notice, read: true });
-            unread = Math.max(0, unread - 1);
+            await this.changeUnread(storage, user.id, notice.kind, -1);
           }
         }
-        await storage.put(`notice-unread:${user.id}`, unread);
       });
     if (ids) {
       const keys = await Promise.all(
@@ -564,8 +586,7 @@ export class Posts extends DurableObject<Env> {
       }
     }
     return json({
-      unreadCount:
-        (await this.ctx.storage.get<number>(`notice-unread:${user.id}`)) ?? 0,
+      ...await this.noticeSummary(user.id),
       before,
     });
   }
@@ -578,14 +599,7 @@ export class Posts extends DurableObject<Env> {
         const key = await storage.get<string>(index);
         const notice = key ? await storage.get<Notice>(key) : undefined;
         if (notice && !notice.read)
-          await storage.put(
-            `notice-unread:${recipient}`,
-            Math.max(
-              0,
-              ((await storage.get<number>(`notice-unread:${recipient}`)) ?? 0) -
-                1
-            )
-          );
+          await this.changeUnread(storage, recipient, notice.kind, -1);
         if (key) await storage.delete(key);
         await storage.delete(index);
       }
@@ -627,6 +641,7 @@ export class Posts extends DurableObject<Env> {
   private async like(id: string, user: User, wanted: boolean) {
     const post = await this.findPost(id);
     const key = `like:${id}:${user.id}`;
+    const noticeId = await digest(key);
     await this.ctx.storage.transaction(async (storage) => {
       const prior = !!(await storage.get(key));
       if (prior === wanted) return;
@@ -638,6 +653,34 @@ export class Posts extends DurableObject<Env> {
       else await storage.delete(key);
       stats.likes = Math.max(0, stats.likes + (wanted ? 1 : -1));
       await storage.put(`stats:${id}`, stats);
+      if (post.author.id === user.id) return;
+      const recipient = post.author.id;
+      const index = `notice-id:${recipient}:${noticeId}`;
+      const targets = `notice-targets:${id}:${noticeId}`;
+      const previousKey = await storage.get<string>(index);
+      if (wanted && !previousKey) {
+        const notice: Notice = {
+          id: noticeId,
+          actor: { id: user.id, name: user.name, avatarUrl: user.avatarUrl },
+          postId: id,
+          commentId: "",
+          kind: "like",
+          body: "赞了你的动态",
+          postPreview: (post.body || post.application?.title || (post.content ? "HTML 动态" : "图片动态")).slice(0, 100),
+          createdAt: Date.now(),
+          read: false,
+        };
+        const noticeKey = `notice:${recipient}:${String(9999999999999 - notice.createdAt).padStart(13, "0")}:${noticeId}`;
+        await storage.put(noticeKey, notice);
+        await storage.put(index, noticeKey);
+        await storage.put(targets, [recipient]);
+        await this.changeUnread(storage, recipient, notice.kind, 1);
+      } else if (!wanted && previousKey) {
+        const notice = await storage.get<Notice>(previousKey);
+        if (notice && !notice.read) await this.changeUnread(storage, recipient, notice.kind, -1);
+        await storage.delete([previousKey, index, targets]);
+      }
+
     });
     return json({ post: await this.decorate(post, user) });
   }
@@ -775,10 +818,7 @@ export class Posts extends DurableObject<Env> {
         ).padStart(13, "0")}:${notice.id}`;
         await storage.put(noticeKey, notice);
         await storage.put(`notice-id:${recipient}:${notice.id}`, noticeKey);
-        await storage.put(
-          `notice-unread:${recipient}`,
-          ((await storage.get<number>(`notice-unread:${recipient}`)) ?? 0) + 1
-        );
+        await this.changeUnread(storage, recipient, notice.kind, 1);
       }
       if (recipients.length)
         await storage.put(`notice-targets:${id}:${comment.id}`, recipients);
