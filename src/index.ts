@@ -452,7 +452,7 @@ export class Workshop extends DurableObject<Env> {
   }
   private async publisherInstruction(task: WorkshopTask) {
     const grant = await issuePublisherGrant({ appId: task.appId, ownerId: task.ownerId, epoch: task.publishEpoch! }, this.env.OFFICIAL_PUBLISH_TOKEN);
-    return `以 https://github.com/jiangfengwhu/zjh-plugin/blob/main/AGENTS.md 的最新规则为准。安装后授权：npx --no-install zjh-app authorize ${task.appId} '${grant}'。`;
+    return `开工先 git fetch origin，切到指定任务分支（未指定则用本会话分支），执行 git merge --no-edit origin/main && npm ci；按同步后的 AGENTS.md 开发。安装后授权：npx --no-install zjh-app authorize ${task.appId} '${grant}'。`;
   }
   private async recoverSession(task: WorkshopTask): Promise<WorkshopTask> {
     if (task.session || !task.creationTitle) return task;
@@ -922,7 +922,7 @@ export class Workshop extends DurableObject<Env> {
           // Persist the new round before upstream work starts; ambiguous timeouts can still deliver.
           await this.saveTask(task);
           this.activityPages.delete(task.session);
-          payload.prompt = `修改 ${appId}；${task.branch ? `分支：${task.branch}，git fetch origin 后 checkout。` : "使用本会话分支。"} ${await this.publisherInstruction(task)} 需求：\n${payload.prompt ?? ""}`;
+          payload.prompt = `修改 ${appId}；${task.branch ? `任务分支：${task.branch}。` : "使用本会话分支。"} ${await this.publisherInstruction(task)} 需求：\n${payload.prompt ?? ""}`;
           const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
           if (response.ok && requestKey) await this.ctx.storage.put(requestKey, { session: task.session, prompt: submittedPrompt, response: await response.clone().text(), status: response.status });
           if (response.ok) await this.notifyResult(task, true, "修改需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted");
