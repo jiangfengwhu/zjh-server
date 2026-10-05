@@ -452,7 +452,7 @@ export class Workshop extends DurableObject<Env> {
   }
   private async publisherInstruction(task: WorkshopTask) {
     const grant = await issuePublisherGrant({ appId: task.appId, ownerId: task.ownerId, epoch: task.publishEpoch! }, this.env.OFFICIAL_PUBLISH_TOKEN);
-    return `以 https://github.com/jiangfengwhu/zjh-plugin/blob/main/AGENTS.md 的最新规则为准。安装后授权：npx --no-install zjh-app authorize ${task.appId} '${grant}'。`;
+    return `以 https://github.com/jiangfengwhu/zjh-plugin/blob/main/AGENTS.md 的最新规则为准。交付运行 npm run publish:application -- ${task.appId}；确认 published:true 的本轮回执后再提交任务。安装后授权：npx --no-install zjh-app authorize ${task.appId} '${grant}'。`;
   }
   private async recoverSession(task: WorkshopTask): Promise<WorkshopTask> {
     if (task.session || !task.creationTitle) return task;
