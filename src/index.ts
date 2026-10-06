@@ -233,6 +233,7 @@ function isRoundCandidate(task: WorkshopTask, application: ApplicationRelease | 
   return Boolean(application && (task.roundRelease ? task.roundRelease === application.releaseId : application.source.commit !== task.previousCommit));
 }
 function currentRoundSession(task: WorkshopTask, session: CloudSession, application: ApplicationRelease | null): CloudSession {
+  if (task.phase === "ready" && isRoundCandidate(task, application)) return { ...session, state: "COMPLETED" };
   if (task.phase === "paused" || !task.dispatchVersion) return session;
   if (session.state === "COMPLETED" && isRoundCandidate(task, application)) return session;
   const version = `${session.state}:${session.updateTime ?? ""}`;
@@ -736,7 +737,15 @@ export class Workshop extends DurableObject<Env> {
           await this.ctx.storage.put(Object.fromEntries([...candidates].map(([id, manifest]) => [`candidate:${id}`, manifest])));
           for (const [id, manifest] of candidates) {
             const task = await this.ctx.storage.get<WorkshopTask>(`task:${id}`);
-            if (task) { task.roundRelease = manifest.releaseId; await this.saveTask(task); this.emitWork(task.ownerId, id); }
+            if (task) {
+              task.roundRelease = manifest.releaseId;
+              task.phase = "ready";
+              task.awaitingRoundStart = false;
+              task.title = manifest.title || task.title;
+              await this.saveTask(task);
+              this.emitWork(task.ownerId, id);
+              this.ctx.waitUntil(this.notifyResult(structuredClone(task), true, "制作完成，作品已发布候选版本。点击查看、体验或继续修改。"));
+            }
           }
         }
         return response;
