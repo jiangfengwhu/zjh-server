@@ -532,13 +532,13 @@ export class Workshop extends DurableObject<Env> {
   }
   private async recordBranch(task: WorkshopTask, session: CloudSession, application: ApplicationRelease) {
     const proof = await this.ctx.storage.get<{ commit: string; tree?: string }>(`source-proof:${task.appId}:${application.releaseId}`);
-    if (task.branch && proof?.commit === task.branchCommit && (proof.commit === application.source.commit || Boolean(application.source.tree && proof.tree === application.source.tree))) return;
+    if (task.branch && proof?.commit === task.branchCommit && (application.source.tree ? proof.tree === application.source.tree : !application.source.dirty && proof.commit === application.source.commit)) return;
     const urls = session.outputs?.map(output => output.pullRequest?.url).filter((url): url is string => /^https:\/\/github\.com\/jiangfengwhu\/zjh-plugin\/pull\/[0-9]+$/.test(url ?? "")) ?? [];
     for (const url of urls.reverse()) {
       const pr = await this.github(`pulls/${Number(url.split("/").pop())}`);
       if (pr.head?.repo?.full_name !== "jiangfengwhu/zjh-plugin" || !pr.head.ref || pr.head.ref === "main" || !pr.head.sha) continue;
       const commit = await this.github(`git/commits/${pr.head.sha}`);
-      if (application.source.commit !== pr.head.sha && (!application.source.tree || application.source.tree !== commit.tree?.sha)) continue;
+      if (application.source.tree ? application.source.tree !== commit.tree?.sha : application.source.dirty || application.source.commit !== pr.head.sha) continue;
       task.branch = pr.head.ref; task.branchCommit = pr.head.sha;
       await this.ctx.storage.put(`source-proof:${task.appId}:${application.releaseId}`, { commit: pr.head.sha, tree: application.source.tree });
       await this.saveTask(task); return;
@@ -680,12 +680,12 @@ export class Workshop extends DurableObject<Env> {
           if (!await this.publisher(request, match[1])) return json({ error: "publisher is not authorized for this application and round" }, 403);
           const manifest = JSON.parse(item.body) as { appId: string; releaseId: string; source: { dirty: boolean }; modules: { base: number; size: number } };
           const base = manifest.modules?.base;
-          if (manifest.appId !== match[1] || manifest.source?.dirty !== false || !/^[a-f0-9]{64}$/.test(manifest.releaseId) || !Number.isSafeInteger(base) || base < 2000000 || base % 100000 || manifest.modules.size !== 100000) return json({ error: "application manifest invalid" }, 400);
+          if (manifest.appId !== match[1] || typeof manifest.source?.dirty !== "boolean" || !/^[a-f0-9]{64}$/.test(manifest.releaseId) || !Number.isSafeInteger(base) || base < 2000000 || base % 100000 || manifest.modules.size !== 100000) return json({ error: "application manifest invalid" }, 400);
           const document = JSON.parse(item.body);
           const { releaseId, ...content } = document;
           const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(content)));
           const identity = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
-          if (document.source.tree !== undefined && !/^[a-f0-9]{40}$/.test(document.source.tree)) return json({ error: "application source tree invalid" }, 400);
+          if ((document.source.dirty || document.source.tree !== undefined) && !/^[a-f0-9]{40}$/.test(document.source.tree)) return json({ error: "application source tree invalid" }, 400);
           if (identity !== releaseId || document.format !== 1 || !/^[a-f0-9]{40}$/.test(document.source.commit) || !document.requires?.engineAbi || !document.requires?.sdk) return json({ error: "application integrity invalid" }, 400);
           if (document.source.repository !== "jiangfengwhu/zjh-plugin" || document.dataSchemaVersion !== 1) return json({ error: "application source or data schema invalid" }, 400);
           const task = await this.ctx.storage.get<WorkshopTask>(`task:${manifest.appId}`);
