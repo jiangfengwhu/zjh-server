@@ -452,7 +452,7 @@ export class Workshop extends DurableObject<Env> {
   }
   private async publisherInstruction(task: WorkshopTask) {
     const grant = await issuePublisherGrant({ appId: task.appId, ownerId: task.ownerId, epoch: task.publishEpoch! }, this.env.OFFICIAL_PUBLISH_TOKEN);
-    return `开工先 git fetch origin，切到指定任务分支（未指定则用本会话分支），执行 git merge --no-edit origin/main && npm ci；按同步后的 AGENTS.md 开发。安装后授权：npx --no-install zjh-app authorize ${task.appId} '${grant}'。`;
+    return `按仓库 main 的 AGENTS.md 准备任务分支与环境，再授权：npx --no-install zjh-app authorize ${task.appId} '${grant}'。`;
   }
   private async recoverSession(task: WorkshopTask): Promise<WorkshopTask> {
     if (task.session || !task.creationTitle) return task;
@@ -814,13 +814,13 @@ export class Workshop extends DurableObject<Env> {
       if (path === "/v1/jules" && input.method === "POST" && input.path === "/v1alpha/sessions") {
         if ((OFFICIAL_APPLICATIONS as readonly string[]).includes(appId)) return json({ message: "请基于这个应用创作新作品" }, 403);
         if (task?.session) {
-          if (input.requestId && input.requestId === task.requestId) { await this.notifyResult(task, true, "制作需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted"); return json({ name: task.session, ownerId: task.ownerId, approvalToken: task.token }, 200); }
+          if (input.requestId && input.requestId === task.requestId) { this.ctx.waitUntil(this.notifyResult(structuredClone(task), true, "制作需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted")); return json({ name: task.session, ownerId: task.ownerId, approvalToken: task.token }, 200); }
           return json({ message: "这个应用已有 session，请从作品列表接回" }, 409);
         }
         if (!input.requestId || !/^[a-zA-Z0-9-]{1,160}$/.test(input.requestId)) return json({ message: "创建需要稳定的请求 ID，请更新宿主" }, 400);
         if (task && !task.creationRejected) {
           task = await this.recoverSession(task);
-          if (input.requestId === task.requestId && task.session) { await this.notifyResult(task, true, "制作需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted"); return json({ name: task.session, ownerId: task.ownerId, approvalToken: task.token }, 200); }
+          if (input.requestId === task.requestId && task.session) { this.ctx.waitUntil(this.notifyResult(structuredClone(task), true, "制作需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted")); return json({ name: task.session, ownerId: task.ownerId, approvalToken: task.token }, 200); }
           return json({ message: "已记录创建请求，正在接回会话。请稍后从作品列表重试，不要重复创建。" }, 409);
         }
         if (await this.candidate(appId)) return json({ message: "应用 ID 已存在，请基于它创作新作品" }, 409);
@@ -856,7 +856,7 @@ export class Workshop extends DurableObject<Env> {
         if (!session.name) { await this.saveTask(task); return json({ message: "Jules 未返回 session，正在后台接回制作记录" }, 502); }
         task.session = session.name;
         await this.saveTask(task);
-        await this.notifyResult(task, true, "制作需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted");
+        this.ctx.waitUntil(this.notifyResult(structuredClone(task), true, "制作需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted"));
         return json({ ...session, ownerId: user.id, approvalToken: task.token }, 200);
       }
       if (!task || (input.token ?? input.approvalToken) !== task.token) return json({ message: "这个应用的 session 凭据不匹配" }, 403);
@@ -903,7 +903,7 @@ export class Workshop extends DurableObject<Env> {
           const prior = requestKey ? await this.ctx.storage.get<{ session: string; prompt: string; response: string; status: number }>(requestKey) : undefined;
           if (prior) {
             if (prior.session !== task.session || prior.prompt !== payload.prompt) return json({ message: "提交标识已用于另一份修改需求" }, 409);
-            if (input.requestId === task.requestId) await this.notifyResult(task, true, "修改需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted");
+            if (input.requestId === task.requestId) this.ctx.waitUntil(this.notifyResult(structuredClone(task), true, "修改需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted"));
             return new Response(prior.response, { status: prior.status, headers: { "Content-Type": "application/json" } });
           }
           const submittedPrompt = payload.prompt;
@@ -925,7 +925,7 @@ export class Workshop extends DurableObject<Env> {
           payload.prompt = `修改 ${appId}；${task.branch ? `任务分支：${task.branch}。` : "使用本会话分支。"} ${await this.publisherInstruction(task)} 需求：\n${payload.prompt ?? ""}`;
           const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
           if (response.ok && requestKey) await this.ctx.storage.put(requestKey, { session: task.session, prompt: submittedPrompt, response: await response.clone().text(), status: response.status });
-          if (response.ok) await this.notifyResult(task, true, "修改需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted");
+          if (response.ok) this.ctx.waitUntil(this.notifyResult(structuredClone(task), true, "修改需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted"));
           if (!response.ok && response.status < 500) await this.saveTask(previous);
           return response;
         }
