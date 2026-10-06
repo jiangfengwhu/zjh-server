@@ -11,6 +11,8 @@ npm run deploy
 
 维护者登录 Wrangler 后部署，保留 wrangler.jsonc 现有绑定。纯文档修改不部署。
 
+开发清理使用维护者鉴权的 `POST /v1/development-reset`，请求携带 `confirm: "RESET_WORKSHOP_DEVELOPMENT_DATA"`。设置 `scope: "applications"` 仅清理应用目录、制作记录和授权，保留内置 Jolly、账号、动态与私信；省略 scope 清理全部开发数据。`dryRun: true` 只返回待清理应用与制作分支，不删除数据。
+
 Secrets 用 `npx wrangler secret put <NAME>` 交互配置，值不写入代码或命令文本，.dev.vars 不提交。
 
 | 配置 | 用途 |

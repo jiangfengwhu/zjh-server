@@ -269,7 +269,14 @@ export class Workshop extends DurableObject<Env> {
     const alarm = await this.ctx.storage.getAlarm();
     if (!alarm || alarm <= Date.now() || alarm > Date.now() + delay) await this.ctx.storage.setAlarm(Date.now() + delay);
   }
+  private notices = new Set<Promise<void>>();
   private async notifyResult(task: WorkshopTask, success: boolean, message: string, kind?: "work-submitted") {
+    if (this.resetting) return;
+    const pending = this.sendResultNotice(task, success, message, kind);
+    this.notices.add(pending);
+    try { await pending; } finally { this.notices.delete(pending); }
+  }
+  private async sendResultNotice(task: WorkshopTask, success: boolean, message: string, kind?: "work-submitted") {
     const round = task.publishEpoch || task.requestId || task.session;
     if (!round) return;
     const event = kind || String(success);
@@ -367,19 +374,29 @@ export class Workshop extends DurableObject<Env> {
   }
   private async reset(request: Request): Promise<Response> {
     if (request.method !== "POST" || !await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN)) return json({ error: "unauthorized" }, 403);
-    const input = await request.json() as { confirm?: string };
+    const input = await request.json() as { confirm?: string; scope?: string; dryRun?: boolean };
+    if (input.scope !== undefined && input.scope !== "applications") return json({ message: "清理范围无效" }, 400);
     if (input.confirm !== "RESET_WORKSHOP_DEVELOPMENT_DATA") return json({ message: "需要明确的开发清库指令" }, 400);
     if (this.resetting) return json({ message: "重置已在进行" }, 409);
     this.resetting = true;
     try {
-      await Promise.allSettled([...this.writes, ...(this.monitoring ? [this.monitoring] : [])]);
+      await Promise.allSettled([...this.writes, ...this.summaries.values(), ...(this.monitoring ? [this.monitoring] : [])]);
+      await Promise.allSettled([...this.notices]);
       // Keep only the current official Jolly release and infrastructure catalogs.
       const jolly = await this.ctx.storage.get<MarketEntry>("shared:jolly");
       if (!jolly) return json({ message: "请先发布官方 Jolly，再清理测试数据" }, 409);
-      const accountReset = await this.env.ACCOUNTS.getByName("accounts").fetch(new Request("https://account.internal/internal/development-reset", { method: "POST" }));
-      if (!accountReset.ok) return json({ message: "账户清理未完成，请重试" }, 503);
-      const postsReset = await this.env.POSTS.getByName("timeline").fetch(new Request("https://posts.internal/internal/development-reset", { method: "POST" }));
-      if (!postsReset.ok) return json({ message: "用户动态清理未完成，请重试" }, 503);
+      const tasks = [...(await this.ctx.storage.list<WorkshopTask>({ prefix: "task:" })).values()];
+      const candidates = [...(await this.ctx.storage.list<ApplicationRelease>({ prefix: "candidate:" })).values()];
+      const applications = [...new Set([...tasks, ...candidates].map(item => item.appId))].filter(id => id !== "jolly");
+      if (input.dryRun) return json({ applications, branches: [...new Set(tasks.map(task => task.branch).filter(Boolean))], retainedApplications: ["jolly"] }, 200);
+      let accounts: unknown;
+      if (input.scope !== "applications") {
+        const accountReset = await this.env.ACCOUNTS.getByName("accounts").fetch(new Request("https://account.internal/internal/development-reset", { method: "POST" }));
+        if (!accountReset.ok) return json({ message: "账户清理未完成，请重试" }, 503);
+        accounts = await accountReset.json();
+        const postsReset = await this.env.POSTS.getByName("timeline").fetch(new Request("https://posts.internal/internal/development-reset", { method: "POST" }));
+        if (!postsReset.ok) return json({ message: "用户动态清理未完成，请重试" }, 503);
+      }
       let cursor: string | undefined; let count = 0;
       const releaseKey = `v1/applications/jolly/releases/${jolly.manifest.releaseId}`;
       do {
@@ -393,6 +410,7 @@ export class Workshop extends DurableObject<Env> {
       await this.env.CATALOG.put(releaseKey, JSON.stringify(jolly.manifest));
       await this.env.CATALOG.put("v1/applications/jolly/latest", JSON.stringify(jolly.manifest));
       await this.ctx.storage.deleteAll();
+      await this.ctx.storage.deleteAlarm();
       await this.ctx.storage.put({
         "shared:jolly": jolly,
         "candidate:jolly": jolly.manifest,
@@ -400,7 +418,8 @@ export class Workshop extends DurableObject<Env> {
         "allocation:jolly": jolly.manifest.modules.base,
         [`application-range:${jolly.manifest.modules.base}`]: "jolly",
       });
-      return json({ reset: true, accounts: await accountReset.json(), deletedApplicationCatalogs: count, retainedApplications: ["jolly"] }, 200);
+      for (const task of tasks) this.emitWork(task.ownerId, task.appId);
+      return json({ reset: true, scope: input.scope ?? "all", accounts, deletedApplications: applications, deletedApplicationCatalogs: count, retainedApplications: ["jolly"] }, 200);
     } finally { this.resetting = false; }
   }
   private async write(request: Request, path: string): Promise<Response> {
