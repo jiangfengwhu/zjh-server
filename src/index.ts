@@ -225,7 +225,7 @@ function pathBeforeQuery(path: string): string {
   const index = path.indexOf("?");
   return index < 0 ? path : path.slice(0, index);
 }
-type ApplicationRelease = { appId: string; releaseId: string; title: string; summary: string; modules: { base: number }; source: { repository: string; commit: string; tree?: string; dirty: boolean } };
+type ApplicationRelease = { appId: string; releaseId: string; appName: string; description: string; version: string; releaseNotes: string; modules: { base: number }; source: { repository: string; commit: string; tree?: string; dirty: boolean } };
 type WorkshopTask = { awaitingRoundStart?: boolean; deliveryWaitStartedAt?: number; branch?: string; branchCommit?: string; roundRelease?: string; dispatchVersion?: string; originalBranch?: string; ownerId: string; appId: string; session: string; token: string; phase: "working" | "ready" | "paused"; previousCommit?: string; repair?: boolean; publishEpoch?: string; requestId?: string; creationTitle?: string; creationRejected?: boolean; title?: string; wish?: string; originalAppId?: string; originalReleaseId?: string; originalCommit?: string; startedAt?: number };
 type CloudSession = { name?: string; state?: string; url?: string; title?: string; createTime?: string; updateTime?: string; sourceContext?: { source?: string }; outputs?: { pullRequest?: { url?: string } }[] };
 type WorkSummary = { completed: boolean; state: string; delivery: string; message: string; application?: ApplicationRelease; stale?: boolean };
@@ -349,7 +349,7 @@ export class Workshop extends DurableObject<Env> {
           const status = summarizeWork(current, effectiveSession, candidate);
           if (effectiveSession.state === "FAILED") await this.notifyResult(current, false, "制作失败了。点击查看制作记录，可以继续修复这个作品。");
           const phase = status.completed ? status.application ? "ready" : "working" : ["FAILED", "PAUSED"].includes(status.state) ? "paused" : current.phase;
-          const title = status.application?.title || current.title;
+          const title = status.application?.appName || current.title;
           if (current.phase !== phase || current.title !== title) {
             current.phase = phase; current.title = title;
             if (phase === "paused") current.repair = true;
@@ -535,7 +535,7 @@ export class Workshop extends DurableObject<Env> {
   }
   private async recordBranch(task: WorkshopTask, session: CloudSession, application: ApplicationRelease) {
     const proof = await this.ctx.storage.get<{ commit: string; tree?: string }>(`source-proof:${task.appId}:${application.releaseId}`);
-    if (task.branch && proof?.commit === task.branchCommit && (application.source.tree ? proof.tree === application.source.tree : !application.source.dirty && proof.commit === application.source.commit)) return;
+    if (task.branch && proof && proof.commit === task.branchCommit && (application.source.tree ? proof.tree === application.source.tree : !application.source.dirty && proof.commit === application.source.commit)) return;
     const urls = session.outputs?.map(output => output.pullRequest?.url).filter((url): url is string => /^https:\/\/github\.com\/jiangfengwhu\/zjh-plugin\/pull\/[0-9]+$/.test(url ?? "")) ?? [];
     for (const url of urls.reverse()) {
       const pr = await this.github(`pulls/${Number(url.split("/").pop())}`);
@@ -741,7 +741,7 @@ export class Workshop extends DurableObject<Env> {
               task.roundRelease = manifest.releaseId;
               task.phase = "ready";
               task.awaitingRoundStart = false;
-              task.title = manifest.title || task.title;
+              task.title = manifest.appName || task.title;
               await this.saveTask(task);
               this.emitWork(task.ownerId, id);
               this.ctx.waitUntil(this.notifyResult(structuredClone(task), true, "制作完成，作品已发布候选版本。点击查看、体验或继续修改。"));
@@ -759,7 +759,7 @@ export class Workshop extends DurableObject<Env> {
         const manifest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/releases/${releaseId}`, "json");
         if (!manifest || manifest.appId !== appId || manifest.releaseId !== releaseId || manifest.source.dirty) return json({ message: "指定版本尚未上传或无效" }, 409);
         const prior = await this.ctx.storage.get<MarketEntry>(`shared:${appId}`);
-        const entry: MarketEntry = { manifest, title: manifest.title, summary: manifest.summary, category: prior?.category || (appId === "jolly" ? "creative" : "other"), screenshots: prior?.screenshots || [], publishedAt: prior?.manifest.releaseId === releaseId ? prior.publishedAt || Date.now() : Date.now(), authorId: OFFICIAL_ACCOUNT_ID, authorName: "紫金花官方", authorOfficial: true, originalAppId: null };
+        const entry: MarketEntry = { manifest, title: manifest.appName, summary: manifest.description, category: prior?.category || (appId === "jolly" ? "creative" : "other"), screenshots: prior?.screenshots || [], publishedAt: prior?.manifest.releaseId === releaseId ? prior.publishedAt || Date.now() : Date.now(), authorId: OFFICIAL_ACCOUNT_ID, authorName: "紫金花官方", authorOfficial: true, originalAppId: null };
         await this.ctx.storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${releaseId}`]: true });
         await this.ctx.storage.delete(`withdrawn:${appId}`);
         return json({ appId, public: releaseId }, 200);
@@ -894,8 +894,8 @@ export class Workshop extends DurableObject<Env> {
         const manifest = input.action === "edit" ? shared!.manifest : application;
         if (!manifest) return json({ message: "作品尚未发包，请先完成制作" }, 409);
         const proof = await this.ctx.storage.get<{ commit: string }>(`source-proof:${appId}:${manifest.releaseId}`);
-        const title = input.title?.trim() ?? shared?.title ?? manifest.title;
-        const summary = input.summary?.trim() ?? shared?.summary ?? manifest.summary;
+        const title = input.title?.trim() ?? shared?.title ?? manifest.appName;
+        const summary = input.summary?.trim() ?? shared?.summary ?? manifest.description;
         if (!title || title.length > 60 || summary.length > 300) return json({ message: "名称不能为空且最多 60 字，介绍最多 300 字" }, 400);
         const category = input.category ?? shared?.category ?? "other"; const screenshots = input.screenshots ?? shared?.screenshots ?? [];
         if (!MARKET_CATEGORIES.includes(category) || !Array.isArray(screenshots) || screenshots.length > 6 || new Set(screenshots).size !== screenshots.length) return json({ message: "请选择分类，截图最多六张且不能重复" }, 400);
@@ -974,7 +974,7 @@ export class Workshop extends DurableObject<Env> {
         if (task.phase === "paused" && session.state !== "FAILED") session.state = "PAUSED";
         if (task.phase !== "paused" && ["FAILED", "PAUSED"].includes(session.state || "")) { task.phase = "paused"; task.repair = true; }
         if (status.completed) { task.phase = status.application ? "ready" : "working"; task.repair = !status.application; }
-        if (status.application?.title) task.title = status.application.title;
+        if (status.application?.appName) task.title = status.application.appName;
         await this.saveTask(task);
         await this.ctx.storage.put(`work-summary:${appId}`, { key: this.summaryKey(task, application), at: Date.now(), status });
         if (session.state === "FAILED") this.ctx.waitUntil(this.notifyResult(task, false, "制作失败了。点击查看制作记录，可以继续修复这个作品。"));
@@ -1027,7 +1027,7 @@ export class Workshop extends DurableObject<Env> {
         if (missing.delivery === "blocked") { await this.notifyResult(task, false, missing.message); return json(missing, 200); }
       }
       if (input.action === "status") {
-        if (delivery?.application.title && delivery.application.title !== appId) task.title = delivery.application.title;
+        if (delivery?.application.appName && delivery.application.appName !== appId) task.title = delivery.application.appName;
         task.phase = ready ? "ready" : "working"; await this.saveTask(task);
         if (ready) await this.notifyResult(task, true, "制作完成，作品已准备好。点击查看、体验或继续修改。");
         return json({ completed: true, state: session.state, delivery: !delivery ? "unpublished" : !ready ? "blocked" : loaded ? "loaded" : "update", message: !delivery ? "等待本轮候选包发布" : !ready ? delivery.message : loaded ? "正在运行本轮作品，可继续修改或上架" : "作品已发布，可直接体验、继续修改或上架", ...(delivery ? { application: delivery.application, branch: task.branch } : {}) }, 200);

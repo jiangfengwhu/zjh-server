@@ -24,7 +24,6 @@ type ApplicationLink = {
   releaseId: string;
   title: string;
   summary: string;
-  mark: string;
   accent: string;
 };
 type Post = {
@@ -1030,7 +1029,7 @@ export class Posts extends DurableObject<Env> {
           authorId: string | null;
           title?: string;
           summary?: string;
-          manifest: ApplicationLink;
+          manifest: Pick<ApplicationLink, "appId" | "releaseId" | "accent"> & { appName: string; description: string };
         }>;
       };
       const entry = result.applications[0];
@@ -1041,9 +1040,8 @@ export class Posts extends DurableObject<Env> {
       application = {
         appId: entry.manifest.appId,
         releaseId: entry.manifest.releaseId,
-        title: (entry.title || entry.manifest.title).slice(0, 60),
-        summary: (entry.summary ?? entry.manifest.summary ?? "").slice(0, 300),
-        mark: entry.manifest.mark || "应",
+        title: (entry.title || entry.manifest.appName).slice(0, 60),
+        summary: (entry.summary ?? entry.manifest.description ?? "").slice(0, 300),
         accent: /^#[a-f0-9]{6}$/i.test(entry.manifest.accent)
           ? entry.manifest.accent
           : "#A77C45",
