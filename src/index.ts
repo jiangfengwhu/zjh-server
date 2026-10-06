@@ -382,13 +382,11 @@ export class Workshop extends DurableObject<Env> {
     try {
       await Promise.allSettled([...this.writes, ...this.summaries.values(), ...(this.monitoring ? [this.monitoring] : [])]);
       await Promise.allSettled([...this.notices]);
-      // Keep only the current official Jolly release and infrastructure catalogs.
-      const jolly = await this.ctx.storage.get<MarketEntry>("shared:jolly");
-      if (!jolly) return json({ message: "请先发布官方 Jolly，再清理测试数据" }, 409);
+      // Jolly lives in the host. No plugin application needs to be retained.
       const tasks = [...(await this.ctx.storage.list<WorkshopTask>({ prefix: "task:" })).values()];
       const candidates = [...(await this.ctx.storage.list<ApplicationRelease>({ prefix: "candidate:" })).values()];
-      const applications = [...new Set([...tasks, ...candidates].map(item => item.appId))].filter(id => id !== "jolly");
-      if (input.dryRun) return json({ applications, branches: [...new Set(tasks.map(task => task.branch).filter(Boolean))], retainedApplications: ["jolly"] }, 200);
+      const applications = [...new Set([...tasks, ...candidates].map(item => item.appId))];
+      if (input.dryRun) return json({ applications, branches: [...new Set(tasks.map(task => task.branch).filter(Boolean))], retainedApplications: [] }, 200);
       let accounts: unknown;
       if (input.scope !== "applications") {
         const accountReset = await this.env.ACCOUNTS.getByName("accounts").fetch(new Request("https://account.internal/internal/development-reset", { method: "POST" }));
@@ -398,28 +396,17 @@ export class Workshop extends DurableObject<Env> {
         if (!postsReset.ok) return json({ message: "用户动态清理未完成，请重试" }, 503);
       }
       let cursor: string | undefined; let count = 0;
-      const releaseKey = `v1/applications/jolly/releases/${jolly.manifest.releaseId}`;
       do {
         const page = await this.env.CATALOG.list({ prefix: "v1/applications/", cursor });
         for (const key of page.keys) {
-          if (key.name === releaseKey) continue;
           await this.env.CATALOG.delete(key.name); count++;
         }
         cursor = page.list_complete ? undefined : page.cursor;
       } while (cursor);
-      await this.env.CATALOG.put(releaseKey, JSON.stringify(jolly.manifest));
-      await this.env.CATALOG.put("v1/applications/jolly/latest", JSON.stringify(jolly.manifest));
       await this.ctx.storage.deleteAll();
       await this.ctx.storage.deleteAlarm();
-      await this.ctx.storage.put({
-        "shared:jolly": jolly,
-        "candidate:jolly": jolly.manifest,
-        [`published:jolly:${jolly.manifest.releaseId}`]: true,
-        "allocation:jolly": jolly.manifest.modules.base,
-        [`application-range:${jolly.manifest.modules.base}`]: "jolly",
-      });
       for (const task of tasks) this.emitWork(task.ownerId, task.appId);
-      return json({ reset: true, scope: input.scope ?? "all", accounts, deletedApplications: applications, deletedApplicationCatalogs: count, retainedApplications: ["jolly"] }, 200);
+      return json({ reset: true, scope: input.scope ?? "all", accounts, deletedApplications: applications, deletedApplicationCatalogs: count, retainedApplications: [] }, 200);
     } finally { this.resetting = false; }
   }
   private async write(request: Request, path: string): Promise<Response> {
