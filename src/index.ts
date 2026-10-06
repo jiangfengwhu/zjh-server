@@ -456,9 +456,11 @@ export class Workshop extends DurableObject<Env> {
       if (quota?.reservations?.[task.appId]) { delete quota.reservations[task.appId]; await storage.put(`quota:${task.ownerId}`, quota); }
     });
   }
-  private async publisherInstruction(task: WorkshopTask) {
+  private async publisherInstruction(task: WorkshopTask, initialize = false) {
     const grant = await issuePublisherGrant({ appId: task.appId, ownerId: task.ownerId, epoch: task.publishEpoch! }, this.env.OFFICIAL_PUBLISH_TOKEN);
-    return `按仓库 main 的 AGENTS.md 准备任务分支与环境，再授权：npx --no-install zjh-app authorize ${task.appId} '${grant}'。`;
+    return initialize
+      ? `初始化：npm run init:application -- ${task.appId} '${grant}'。完成后必须执行 npm run publish:application -- ${task.appId}。`
+      : `完成后必须执行 npm run publish:application -- ${task.appId} '${grant}'。`;
   }
   private async recoverSession(task: WorkshopTask): Promise<WorkshopTask> {
     if (task.session || !task.creationTitle) return task;
@@ -849,7 +851,7 @@ export class Workshop extends DurableObject<Env> {
         payload.sourceContext = { source: PLUGIN_SOURCE, githubRepoContext: { startingBranch: originalBranch ?? "main" }, environmentVariablesEnabled: false };
         await this.saveTask(task);
         const origin = original ? `Remix：${original.appId}@${originalCommit}，分支 ${originalBranch ?? "main"}，版本 ${original.releaseId}；init 复制此提交。` : "";
-        payload.prompt = `新建 ${appId}；moduleBase=${moduleBase}，使用本会话分支。${await this.publisherInstruction(task)} ${origin} 需求：\n${prompt}`;
+        payload.prompt = `先执行 git fetch origin main && git merge --no-edit FETCH_HEAD && npm ci。\n新建 ${appId}。${await this.publisherInstruction(task, true)} ${origin} 需求：\n${prompt}`;
         const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
         if (!response.ok) {
           task.creationRejected = response.status >= 400 && response.status < 500;
@@ -928,7 +930,7 @@ export class Workshop extends DurableObject<Env> {
           // Persist the new round before upstream work starts; ambiguous timeouts can still deliver.
           await this.saveTask(task);
           this.activityPages.delete(task.session);
-          payload.prompt = `修改 ${appId}；${task.branch ? `任务分支：${task.branch}。` : "使用本会话分支。"} ${await this.publisherInstruction(task)} 需求：\n${payload.prompt ?? ""}`;
+          payload.prompt = `先执行 git fetch origin main && git merge --no-edit FETCH_HEAD && npm ci。\n修改 ${appId}。${await this.publisherInstruction(task)} 需求：\n${payload.prompt ?? ""}`;
           const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
           if (response.ok && requestKey) await this.ctx.storage.put(requestKey, { session: task.session, prompt: submittedPrompt, response: await response.clone().text(), status: response.status });
           if (response.ok) this.ctx.waitUntil(this.notifyResult(structuredClone(task), true, "修改需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted"));
