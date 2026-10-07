@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { authenticatedUser, OFFICIAL_ACCOUNT_ID, OFFICIAL_APPLICATIONS, publicProfiles, readAvatar } from "./accounts";
 import { KeyedQueue } from "./concurrency";
+import { sdkPreparation } from "./sdk-distribution";
 import { issuePublisherGrant, readPublisherGrant, redactPublisherGrants } from "./publisher";
 export { Accounts } from "./accounts";
 export { Posts } from "./posts";
@@ -852,6 +853,7 @@ export class Workshop extends DurableObject<Env> {
           if (!shared || shared.manifest.releaseId !== input.originalReleaseId) return json({ message: "原作公开版本已改变，请刷新市场后重新创作" }, 409);
           original = shared.manifest; originalCommit = shared.sourceCommit ?? original.source.commit; originalBranch = shared.sourceBranch;
         }
+        const preparation = await sdkPreparation();
         if (!await this.quota(user.id, appId)) return json({ message: "每天最多发起 10 轮制作，同时最多制作 3 个作品" }, 429);
         const moduleBase = await this.allocate(appId);
         task = { ownerId: user.id, appId, session: "", token: crypto.randomUUID(), phase: "working", publishEpoch: crypto.randomUUID(), requestId: input.requestId, title: String(payload.title ?? appId).slice(0, 80), wish: prompt, startedAt: Date.now(), originalAppId: original?.appId, originalReleaseId: original?.releaseId, originalCommit, originalBranch };
@@ -860,7 +862,7 @@ export class Workshop extends DurableObject<Env> {
         payload.sourceContext = { source: PLUGIN_SOURCE, githubRepoContext: { startingBranch: originalBranch ?? "main" }, environmentVariablesEnabled: false };
         await this.saveTask(task);
         const origin = original ? `Remix：${original.appId}@${originalCommit}，分支 ${originalBranch ?? "main"}，版本 ${original.releaseId}；init 复制此提交。` : "";
-        payload.prompt = `先执行 git fetch origin main && git merge --no-edit FETCH_HEAD && npm ci。\n新建 ${appId}。${await this.publisherInstruction(task, true)} ${origin} 需求：\n${prompt}`;
+        payload.prompt = `${preparation}\n新建 ${appId}。${await this.publisherInstruction(task, true)} ${origin} 需求：\n${prompt}`;
         const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
         if (!response.ok) {
           task.creationRejected = response.status >= 400 && response.status < 500;
@@ -931,6 +933,7 @@ export class Workshop extends DurableObject<Env> {
           if (roundState === "COMPLETED" && task.phase === "working" && !isRoundCandidate(task, candidate) && (!task.deliveryWaitStartedAt || Date.now() - task.deliveryWaitStartedAt < 120000)) return json({ message: "本轮应用正在交付，请等交付完成后再修改" }, 409);
           const dispatchVersion = `${current.state}:${current.updateTime ?? ""}`;
           if (task.dispatchVersion === dispatchVersion) return json({ message: "本轮修改已提交，请等待制作状态更新" }, 409);
+          const preparation = await sdkPreparation();
           if (!await this.quota(user.id, appId)) return json({ message: "制作额度已用完或同时制作作品过多，请稍后再试" }, 429);
           const previous = structuredClone(task);
           task.publishEpoch = crypto.randomUUID(); task.requestId = input.requestId; task.awaitingRoundStart = true; task.dispatchVersion = dispatchVersion; task.deliveryWaitStartedAt = undefined;
@@ -939,7 +942,7 @@ export class Workshop extends DurableObject<Env> {
           // Persist the new round before upstream work starts; ambiguous timeouts can still deliver.
           await this.saveTask(task);
           this.activityPages.delete(task.session);
-          payload.prompt = `先执行 git fetch origin main && git merge --no-edit FETCH_HEAD && npm ci。\n修改 ${appId}。${await this.publisherInstruction(task)} 需求：\n${payload.prompt ?? ""}`;
+          payload.prompt = `${preparation}\n修改 ${appId}。${await this.publisherInstruction(task)} 需求：\n${payload.prompt ?? ""}`;
           const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
           if (response.ok && requestKey) await this.ctx.storage.put(requestKey, { session: task.session, prompt: submittedPrompt, response: await response.clone().text(), status: response.status });
           if (response.ok) this.ctx.waitUntil(this.notifyResult(structuredClone(task), true, "修改需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted"));
