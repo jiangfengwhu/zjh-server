@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { authenticatedUser, OFFICIAL_ACCOUNT_ID, OFFICIAL_APPLICATIONS, publicProfiles, readAvatar } from "./accounts";
 import { KeyedQueue } from "./concurrency";
 import { sdkPreparation } from "./sdk-distribution";
-import { issuePublisherGrant, readPublisherGrant, redactPublisherGrants } from "./publisher";
+import { issuePublisherGrant, readPublisherGrant, redactPublisherGrants, publisherGrantActive } from "./publisher";
 export { Accounts } from "./accounts";
 export { Posts } from "./posts";
 import { readPostImage, readSharedPost } from "./posts";
@@ -41,6 +41,7 @@ export default {
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/avatars\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readAvatar(request, env);
       if (request.method === "PUT" && url.pathname === "/v1/catalog") return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "PUT" && /^\/v1\/application-blobs\/[a-z][a-z0-9-]{0,63}\/[a-f0-9]{64}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
+      if (request.method === "POST" && /^\/v1\/application-publisher\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (/^\/v1\/applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|candidate|public|releases\/[a-f0-9]{64})$/.test(url.pathname) || ["/v1/official-release", "/v1/development-reset", "/v1/works", "/v1/market"].includes(url.pathname) || /^\/v1\/application-allocation\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "GET" && ["/v1/applications", "/v1/application-updates"].includes(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && url.pathname === "/v1/workshop") return env.WORKSHOP.getByName("dynamic").fetch(request);
@@ -432,7 +433,7 @@ export class Workshop extends DurableObject<Env> {
     const grant = await readPublisherGrant(request, this.env.OFFICIAL_PUBLISH_TOKEN);
     if (!grant || grant.appId !== appId) return false;
     const task = await this.ctx.storage.get<WorkshopTask>(`task:${appId}`);
-    return Boolean(task?.session && task.ownerId === grant.ownerId && task.publishEpoch === grant.epoch && task.phase === "working");
+    return publisherGrantActive(grant, task);
   }
   private async quota(ownerId: string, appId: string): Promise<boolean> {
     const day = Math.floor(Date.now() / 86400000);
@@ -461,8 +462,8 @@ export class Workshop extends DurableObject<Env> {
   private async publisherInstruction(task: WorkshopTask, initialize = false) {
     const grant = await issuePublisherGrant({ appId: task.appId, ownerId: task.ownerId, epoch: task.publishEpoch! }, this.env.OFFICIAL_PUBLISH_TOKEN);
     return initialize
-      ? `初始化：npm run init:application -- ${task.appId} '${grant}'。完成后必须执行 npm run publish:application -- ${task.appId}。`
-      : `完成后必须执行 npm run publish:application -- ${task.appId} '${grant}'。`;
+      ? `先初始化：npm run init:application -- ${task.appId} '${grant}'。然后完成用户要求的应用开发和 application.json，最后执行 npm run publish:application -- ${task.appId}。不要发布初始化模板或未完成的应用；发布成功后再结束任务。`
+      : `先完成本轮修改并更新 application.json，最后执行 npm run publish:application -- ${task.appId} '${grant}'。不要在修改前发布；发布成功后再结束任务。`;
   }
   private async recoverSession(task: WorkshopTask): Promise<WorkshopTask> {
     if (task.session || !task.creationTitle) return task;
@@ -601,6 +602,16 @@ export class Workshop extends DurableObject<Env> {
         const key = creation ? `v1/creation-images/${user.id}/${hash}` : `v1/${feedback ? "feedback-images" : "market-images"}/${appId}/${user.id}/${hash}`;
         await this.env.BLOBS.put(key, bytes, { httpMetadata: { contentType: "image/jpeg", cacheControl: "public,max-age=31536000,immutable" } });
         return json({ url: `${new URL(request.url).origin}/${key}` }, 200);
+      }
+      const publisherRoute = path.match(/^\/v1\/application-publisher\/([a-z][a-z0-9-]{0,63})$/);
+      if (publisherRoute && request.method === "POST") {
+        const grant = await readPublisherGrant(request, this.env.OFFICIAL_PUBLISH_TOKEN);
+        const task = await this.ctx.storage.get<WorkshopTask>(`task:${publisherRoute[1]}`);
+        if (!grant || grant.appId !== publisherRoute[1] || !publisherGrantActive(grant, task)) return json({ message: "本轮发布授权已失效，请在紫金花继续制作后使用新任务提供的发布命令" }, 403);
+        const token = await issuePublisherGrant({ appId: grant.appId, ownerId: grant.ownerId, epoch: grant.epoch }, this.env.OFFICIAL_PUBLISH_TOKEN, Math.min(30 * 60000, grant.expiresAt - Date.now()));
+        const response = json({ token }, 200);
+        response.headers.set("Cache-Control", "no-store");
+        return response;
       }
       const upload = path.match(/^\/v1\/application-blobs\/([a-z][a-z0-9-]{0,63})\/([a-f0-9]{64})$/);
       if (upload && request.method === "PUT") {

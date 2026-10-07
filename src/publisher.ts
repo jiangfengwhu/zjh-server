@@ -4,11 +4,15 @@ const hex = (value: ArrayBuffer) => [...new Uint8Array(value)].map(byte => byte.
 async function signingKey(secret: string) {
   return crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
 }
-export async function issuePublisherGrant(grant: Omit<Grant, "expiresAt">, secret: string): Promise<string> {
+export async function issuePublisherGrant(grant: Omit<Grant, "expiresAt">, secret: string, lifetimeMs = 7 * 86400000): Promise<string> {
   if (!secret) throw new Error("应用发布授权尚未配置");
-  const payload = btoa(JSON.stringify({ ...grant, expiresAt: Date.now() + 7 * 86400000 }));
+  const payload = btoa(JSON.stringify({ ...grant, expiresAt: Date.now() + lifetimeMs }));
   const signature = hex(await crypto.subtle.sign("HMAC", await signingKey(secret), encoder.encode(payload)));
   return `zjh1.${payload}.${signature}`;
+}
+/** First delivery does not revoke the round; stop and a new epoch do. */
+export function publisherGrantActive(grant: Grant, task?: { appId: string; ownerId: string; session: string; publishEpoch?: string; phase: string }): boolean {
+  return Boolean(task?.session && task.appId === grant.appId && task.ownerId === grant.ownerId && task.publishEpoch === grant.epoch && grant.expiresAt > Date.now() && ["working", "ready"].includes(task.phase));
 }
 export async function readPublisherGrant(request: Request, secret: string): Promise<Grant | null> {
   const token = request.headers.get("Authorization")?.match(/^Bearer (zjh1\.[A-Za-z0-9+/=]+\.[a-f0-9]{64})$/)?.[1];
