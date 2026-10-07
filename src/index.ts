@@ -462,8 +462,8 @@ export class Workshop extends DurableObject<Env> {
   private async publisherInstruction(task: WorkshopTask, initialize = false) {
     const grant = await issuePublisherGrant({ appId: task.appId, ownerId: task.ownerId, epoch: task.publishEpoch! }, this.env.OFFICIAL_PUBLISH_TOKEN);
     return initialize
-      ? `先初始化：npm run init:application -- ${task.appId} '${grant}'。然后完成用户要求的应用开发和 application.json，最后执行 npm run publish:application -- ${task.appId}。不要发布初始化模板或未完成的应用；发布成功后再结束任务。`
-      : `先完成本轮修改并更新 application.json，最后执行 npm run publish:application -- ${task.appId} '${grant}'。不要在修改前发布；发布成功后再结束任务。`;
+      ? `初始化：npm run init:application -- ${task.appId} '${grant}'。完成应用开发和 application.json 后，再执行 npm run publish:application -- ${task.appId}。不要发布初始化模板。`
+      : `完成本轮修改并更新 application.json 后，执行 npm run publish:application -- ${task.appId} '${grant}'。`;
   }
   private async recoverSession(task: WorkshopTask): Promise<WorkshopTask> {
     if (task.session || !task.creationTitle) return task;
