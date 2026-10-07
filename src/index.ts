@@ -44,6 +44,7 @@ export default {
       if (request.method === "PUT" && url.pathname === "/v1/catalog") return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "PUT" && /^\/v1\/application-blobs\/[a-z][a-z0-9-]{0,63}\/[a-f0-9]{64}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && /^\/v1\/application-publisher\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
+      if (request.method === "POST" && /^\/v1\/application-download\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (/^\/v1\/applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|candidate|public|releases\/[a-f0-9]{64})$/.test(url.pathname) || ["/v1/official-release", "/v1/development-reset", "/v1/works", "/v1/market"].includes(url.pathname) || /^\/v1\/application-allocation\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "GET" && ["/v1/applications", "/v1/application-updates"].includes(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && url.pathname === "/v1/workshop") return env.WORKSHOP.getByName("dynamic").fetch(request);
@@ -266,7 +267,7 @@ function summarizeWork(task: WorkshopTask, session: CloudSession, application: A
   return { completed: true, state: "COMPLETED", delivery: ready ? "update" : "unpublished", message: ready ? "作品已发布，可直接体验、继续修改或上架" : "等待本轮候选包发布", ...(ready ? { application } : {}) };
 }
 const MARKET_CATEGORIES = ["tools", "productivity", "life", "creative", "other"];
-type MarketEntry = { iconUrl?: string; manifest: ApplicationRelease; title: string; summary: string; category?: string; screenshots?: string[]; publishedAt?: number; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null; sourceCommit?: string; sourceBranch?: string };
+type MarketEntry = { downloadCount?: number; iconUrl?: string; manifest: ApplicationRelease; title: string; summary: string; category?: string; screenshots?: string[]; publishedAt?: number; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null; sourceCommit?: string; sourceBranch?: string };
 
 export class Workshop extends DurableObject<Env> {
   private monitoring: Promise<void> | undefined;
@@ -689,6 +690,10 @@ export class Workshop extends DurableObject<Env> {
           const profiles = await publicProfiles([...new Set(visible.map(entry => entry.authorId).filter((id): id is string => Boolean(id)))], this.env);
           for (const entry of visible) { const profile = entry.authorId ? profiles.get(entry.authorId) : undefined; if (profile) { entry.authorName = profile.name; entry.authorAvatarUrl = profile.avatarUrl; } }
         } catch { /* Keep published snapshots available if the account service is unavailable. */ }
+        if (path === "/v1/market" && visible.length) {
+          const counts = await this.ctx.storage.get<number>(visible.map(entry => `downloads:${entry.manifest.appId}`));
+          for (const entry of visible) entry.downloadCount = counts.get(`downloads:${entry.manifest.appId}`) ?? 0;
+        }
         const response = json({ applications: path === "/v1/applications" ? visible.map(entry => entry.manifest) : visible, nextCursor }, 200);
         response.headers.set("Cache-Control", "no-store"); return response;
       }
@@ -793,6 +798,22 @@ export class Workshop extends DurableObject<Env> {
         await this.ctx.storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${releaseId}`]: true });
         await this.ctx.storage.delete(`withdrawn:${appId}`);
         return json({ appId, public: releaseId }, 200);
+      }
+      const downloadRoute = path.match(/^\/v1\/application-download\/([a-z][a-z0-9-]{0,63})$/);
+      if (downloadRoute && request.method === "POST") {
+        const user = await authenticatedUser(request, this.env);
+        if (!user) return json({ message: "请先登录" }, 401);
+        const appId = downloadRoute[1];
+        const input = await request.json() as { releaseId?: string };
+        if (!input.releaseId || !/^[a-f0-9]{64}$/.test(input.releaseId) || !await this.ctx.storage.get(`published:${appId}:${input.releaseId}`)) return json({ message: "应用版本尚未上架" }, 400);
+        const count = await this.ctx.storage.transaction(async storage => {
+          const key = `download-user:${appId}:${user.id}`;
+          const total = await storage.get<number>(`downloads:${appId}`) ?? 0;
+          if (await storage.get(key)) return total;
+          await storage.put({ [key]: true, [`downloads:${appId}`]: total + 1 });
+          return total + 1;
+        });
+        return json({ downloadCount: count }, 200);
       }
       const versionRoute = path.match(/^\/v1\/applications\/([a-z][a-z0-9-]{0,63})\/(latest|candidate|public|releases\/[a-f0-9]{64})$/);
       if (versionRoute && ["GET", "HEAD"].includes(request.method)) {
