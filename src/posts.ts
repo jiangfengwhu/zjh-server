@@ -20,6 +20,8 @@ type Media = {
   postId?: string;
 };
 type ApplicationLink = {
+  iconUrl?: string;
+  icon?: { sha256: string; bytes: number; format: "svg" };
   appId: string;
   releaseId: string;
   title: string;
@@ -1073,6 +1075,8 @@ export class Posts extends DurableObject<Env> {
       if (entry.manifest.releaseId !== selection.releaseId)
         throw new InputError("公开版本已变化，请重新选择应用", 409);
       application = {
+        iconUrl: (entry as { iconUrl?: string }).iconUrl,
+        icon: (entry.manifest as { icon?: ApplicationLink["icon"] }).icon,
         appId: entry.manifest.appId,
         releaseId: entry.manifest.releaseId,
         title: (entry.title || entry.manifest.appName).slice(0, 60),

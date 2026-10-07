@@ -1,3 +1,4 @@
+import { validateApplicationIcon, validIconJpeg } from "./applicationIcon";
 import { DurableObject } from "cloudflare:workers";
 import { authenticatedUser, OFFICIAL_ACCOUNT_ID, OFFICIAL_APPLICATIONS, publicProfiles, readAvatar } from "./accounts";
 import { KeyedQueue } from "./concurrency";
@@ -32,11 +33,12 @@ export default {
       if (/^\/v1\/notifications(?:\/(?:unread|read))?$/.test(url.pathname)) return env.POSTS.getByName("timeline").fetch(request);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/posts\/[a-f0-9]{64}$/.test(url.pathname)) return readSharedPost(request, env);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/post-images\/[a-f0-9-]{36}\/[a-f0-9-]{36}$/.test(url.pathname)) return readPostImage(request, env);
-      if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/market-images\/[a-z][a-z0-9-]{0,63}\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readPostImage(request, env);
+      if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/(?:market-images|market-icons)\/[a-z][a-z0-9-]{0,63}\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readPostImage(request, env);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/feedback-images\/[a-z][a-z0-9-]{0,63}\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readPostImage(request, env);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/creation-images\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readPostImage(request, env);
       if (request.method === "PUT" && url.pathname === "/v1/creation-media") return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "PUT" && /^\/v1\/feedback-media\/[a-z][a-z0-9-]{0,63}\/[a-f0-9]{64}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
+      if (request.method === "PUT" && /^\/v1\/market-icon\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "PUT" && /^\/v1\/market-media\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/avatars\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readAvatar(request, env);
       if (request.method === "PUT" && url.pathname === "/v1/catalog") return env.WORKSHOP.getByName("dynamic").fetch(request);
@@ -227,7 +229,7 @@ function pathBeforeQuery(path: string): string {
   const index = path.indexOf("?");
   return index < 0 ? path : path.slice(0, index);
 }
-type ApplicationRelease = { appId: string; releaseId: string; appName: string; description: string; version: string; releaseNotes: string; modules: { base: number }; source: { repository: string; commit: string; tree?: string; dirty: boolean } };
+type ApplicationRelease = { icon?: { sha256: string; bytes: number; format: "svg" }; appId: string; releaseId: string; appName: string; description: string; version: string; releaseNotes: string; modules: { base: number }; source: { repository: string; commit: string; tree?: string; dirty: boolean } };
 type WorkshopTask = { awaitingRoundStart?: boolean; deliveryWaitStartedAt?: number; branch?: string; branchCommit?: string; roundRelease?: string; dispatchVersion?: string; originalBranch?: string; ownerId: string; appId: string; session: string; token: string; phase: "working" | "ready" | "paused"; previousCommit?: string; repair?: boolean; publishEpoch?: string; requestId?: string; creationTitle?: string; creationRejected?: boolean; title?: string; wish?: string; originalAppId?: string; originalReleaseId?: string; originalCommit?: string; startedAt?: number };
 type CloudSession = { name?: string; state?: string; url?: string; title?: string; createTime?: string; updateTime?: string; sourceContext?: { source?: string }; outputs?: { pullRequest?: { url?: string } }[] };
 type WorkSummary = { completed: boolean; state: string; delivery: string; message: string; application?: ApplicationRelease; stale?: boolean };
@@ -264,7 +266,7 @@ function summarizeWork(task: WorkshopTask, session: CloudSession, application: A
   return { completed: true, state: "COMPLETED", delivery: ready ? "update" : "unpublished", message: ready ? "作品已发布，可直接体验、继续修改或上架" : "等待本轮候选包发布", ...(ready ? { application } : {}) };
 }
 const MARKET_CATEGORIES = ["tools", "productivity", "life", "creative", "other"];
-type MarketEntry = { manifest: ApplicationRelease; title: string; summary: string; category?: string; screenshots?: string[]; publishedAt?: number; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null; sourceCommit?: string; sourceBranch?: string };
+type MarketEntry = { iconUrl?: string; manifest: ApplicationRelease; title: string; summary: string; category?: string; screenshots?: string[]; publishedAt?: number; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null; sourceCommit?: string; sourceBranch?: string };
 
 export class Workshop extends DurableObject<Env> {
   private monitoring: Promise<void> | undefined;
@@ -413,7 +415,7 @@ export class Workshop extends DurableObject<Env> {
     } finally { this.resetting = false; }
   }
   private async write(request: Request, path: string): Promise<Response> {
-    if (path === "/v1/creation-media" || path.startsWith("/v1/market-media/") || path.startsWith("/v1/feedback-media/")) return this.queue.runAll([`app:${path.split("/")[3] ?? "creation"}`, "media-buffer"], () => this.handle(request));
+    if (path === "/v1/creation-media" || path.startsWith("/v1/market-media/") || path.startsWith("/v1/market-icon/") || path.startsWith("/v1/feedback-media/")) return this.queue.runAll([`app:${path.split("/")[3] ?? "creation"}`, "media-buffer"], () => this.handle(request));
     if (path.startsWith("/v1/application-blobs/")) {
       const appId = path.split("/")[3];
       if (!await this.publisher(request, appId)) return json({ message: "本轮发布授权已失效" }, 403);
@@ -565,7 +567,8 @@ export class Workshop extends DurableObject<Env> {
         const response = json({ applications: ids.map(appId => ({ appId, manifest: entries.get(`shared:${appId}`)?.manifest ?? null })) }, 200);
         response.headers.set("Cache-Control", "no-store"); return response;
       }
-      if ((path === "/v1/creation-media" || path.startsWith("/v1/market-media/") || path.startsWith("/v1/feedback-media/")) && request.method === "PUT") {
+      if ((path === "/v1/creation-media" || path.startsWith("/v1/market-media/") || path.startsWith("/v1/market-icon/") || path.startsWith("/v1/feedback-media/")) && request.method === "PUT") {
+        const icon = path.startsWith("/v1/market-icon/");
         const creation = path === "/v1/creation-media";
         const feedback = path.startsWith("/v1/feedback-media/");
         const appId = path.split("/")[3]; const releaseId = feedback ? path.split("/")[4] : undefined;
@@ -591,17 +594,25 @@ export class Workshop extends DurableObject<Env> {
           await storage.put(rateKey, { day, count: value + 1 }); return true;
         });
         if (!reserved) return json({ message: "今天上传的截图较多，请明天再试" }, 429);
-        const maximum = 2 * 1024 * 1024;
+        const maximum = icon ? 256 * 1024 : 2 * 1024 * 1024;
         if (Number(request.headers.get("Content-Length")) > maximum) return json({ message: "截图需小于 2 MB" }, 413);
         const reader = request.body?.getReader(); if (!reader) return json({ message: "没有截图文件" }, 400);
         const chunks: Uint8Array[] = []; let size = 0;
         while (true) { const next = await reader.read(); if (next.done) break; size += next.value.byteLength; if (size > maximum) { await reader.cancel(); return json({ message: "截图需小于 2 MB" }, 413); } chunks.push(next.value); }
         const bytes = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
         if (size < 32 || bytes[0] !== 255 || bytes[1] !== 216 || bytes[2] !== 255) return json({ message: "截图需为 JPEG 图片" }, 400);
+        if (icon && !validIconJpeg(bytes)) return json({ message: "图标需要压缩为 512×512 的 JPEG，且不超过 256 KB" }, 400);
         const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(value => value.toString(16).padStart(2, "0")).join("");
-        const key = creation ? `v1/creation-images/${user.id}/${hash}` : `v1/${feedback ? "feedback-images" : "market-images"}/${appId}/${user.id}/${hash}`;
+        const key = creation ? `v1/creation-images/${user.id}/${hash}` : `v1/${feedback ? "feedback-images" : icon ? "market-icons" : "market-images"}/${appId}/${user.id}/${hash}`;
         await this.env.BLOBS.put(key, bytes, { httpMetadata: { contentType: "image/jpeg", cacheControl: "public,max-age=31536000,immutable" } });
-        return json({ url: `${new URL(request.url).origin}/${key}` }, 200);
+        const iconUrl = `${new URL(request.url).origin}/${key}`;
+        if (icon) {
+          await this.ctx.storage.put(`application-icon:${appId}`, iconUrl);
+          const shared = await this.ctx.storage.get<MarketEntry>(`shared:${appId}`);
+          if (shared?.authorId === user.id) await this.ctx.storage.put(`shared:${appId}`, { ...shared, iconUrl });
+          this.emitWork(user.id, appId);
+        }
+        return json({ url: iconUrl }, 200);
       }
       const publisherRoute = path.match(/^\/v1\/application-publisher\/([a-z][a-z0-9-]{0,63})$/);
       if (publisherRoute && request.method === "POST") {
@@ -709,6 +720,13 @@ export class Workshop extends DurableObject<Env> {
             if (!blob || !/^[a-f0-9]{64}$/.test(blob.sha256) || !Number.isSafeInteger(blob.bytes) || blob.bytes < 0 || (blob === document.bundle && !blob.bytes)) return json({ error: "application blob invalid" }, 400);
             const stored = await this.env.BLOBS.head(`v1/app/${blob.sha256}`);
             if (!stored || stored.size !== blob.bytes) return json({ error: "application blob not uploaded" }, 409);
+          }
+          if (document.icon) {
+            const icon = document.icon;
+            if (icon.format !== "svg" || !document.assets?.some((asset: { name: string; sha256: string; bytes: number }) => asset.name === "icon.svg" && asset.sha256 === icon.sha256 && asset.bytes === icon.bytes) || icon.bytes > 65536) return json({ error: "application icon invalid" }, 400);
+            const stored = await this.env.BLOBS.get(`v1/app/${icon.sha256}`);
+            if (!stored) return json({ error: "application icon not uploaded" }, 409);
+            try { validateApplicationIcon(await stored.text()); } catch { return json({ error: "application icon must be static self-contained SVG" }, 400); }
           }
           const fixedOwners: Record<number, string> = { 2000000: "jolly" };
           if (fixedOwners[base] && fixedOwners[base] !== manifest.appId) return json({ error: "application module range reserved" }, 409);
@@ -829,7 +847,7 @@ export class Workshop extends DurableObject<Env> {
           const settled = task.phase === "ready" && isRoundCandidate(task, application);
           const status = settled ? summarizeWork(task, { state: "COMPLETED" }, application) : valid ? cached.status : summarizeWork(task, { state: task.phase === "ready" ? "COMPLETED" : "QUEUED" }, application);
           const ttl = status.completed && status.application ? 300000 : 20000;
-          return { submissionId: task.requestId, appId: task.appId, ownerId: task.ownerId, session: task.session, approvalToken: task.token, title: task.title ?? task.appId, wish: task.wish ?? "", startedAt: task.startedAt, originalAppId: task.originalAppId, originalReleaseId: task.originalReleaseId, originalCommit: task.originalCommit, branch: task.branch, phase: task.phase, status: { ...status, stale: !settled && (!valid || Date.now() - cached.at >= ttl || force && cached.at === previous?.at) }, sharing: { shared: shared?.authorId === user.id ? shared : null, application }, updatedAt: valid ? cached.at : null };
+          return { submissionId: task.requestId, appId: task.appId, ownerId: task.ownerId, session: task.session, approvalToken: task.token, title: task.title ?? task.appId, wish: task.wish ?? "", startedAt: task.startedAt, originalAppId: task.originalAppId, originalReleaseId: task.originalReleaseId, originalCommit: task.originalCommit, branch: task.branch, phase: task.phase, status: { ...status, stale: !settled && (!valid || Date.now() - cached.at >= ttl || force && cached.at === previous?.at) }, sharing: { shared: shared?.authorId === user.id ? shared : null, application, iconUrl: await this.ctx.storage.get<string>(`application-icon:${task.appId}`) }, updatedAt: valid ? cached.at : null };
         }));
         const response = json({ works: works.filter(Boolean) }, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
       }
@@ -894,7 +912,7 @@ export class Workshop extends DurableObject<Env> {
         const [published, application] = await Promise.all([this.ctx.storage.get<MarketEntry>(`shared:${appId}`), this.candidate(appId)]);
         const shared = published ?? null;
         if (shared && shared.authorId !== user.id) return json({ message: "只有作者可以管理这份分享" }, 403);
-        if (input.action === "status") return json({ shared, application }, 200);
+        if (input.action === "status") return json({ shared, application, iconUrl: await this.ctx.storage.get<string>(`application-icon:${appId}`) }, 200);
         if (input.action === "withdraw") {
           await this.ctx.storage.delete(`shared:${appId}`);
           await this.ctx.storage.put(`withdrawn:${appId}`, true);
@@ -917,7 +935,7 @@ export class Workshop extends DurableObject<Env> {
           const prefix = `${new URL(request.url).origin}/v1/market-images/${appId}/${user.id}/`;
           if (!screenshot.startsWith(prefix) || !/^[a-f0-9]{64}$/.test(screenshot.slice(prefix.length)) || !await this.env.BLOBS.head(screenshot.slice(new URL(request.url).origin.length + 1))) return json({ message: "截图未上传或不属于这个作品" }, 400);
         }
-        const entry: MarketEntry = { manifest, title, summary, category, screenshots, publishedAt: input.action === "edit" ? shared!.publishedAt || 0 : shared?.manifest.releaseId === manifest.releaseId ? shared.publishedAt || Date.now() : Date.now(), authorId: user.id, authorName: user.name, authorAvatarUrl: user.avatarUrl, authorOfficial: user.id === OFFICIAL_ACCOUNT_ID, originalAppId: (manifest as ApplicationRelease & { originalAppId?: string }).originalAppId ?? null, sourceCommit: input.action === "edit" ? shared!.sourceCommit : proof?.commit ?? manifest.source.commit, sourceBranch: input.action === "edit" ? shared!.sourceBranch : task.branch };
+        const entry: MarketEntry = { iconUrl: await this.ctx.storage.get<string>(`application-icon:${appId}`), manifest, title, summary, category, screenshots, publishedAt: input.action === "edit" ? shared!.publishedAt || 0 : shared?.manifest.releaseId === manifest.releaseId ? shared.publishedAt || Date.now() : Date.now(), authorId: user.id, authorName: user.name, authorAvatarUrl: user.avatarUrl, authorOfficial: user.id === OFFICIAL_ACCOUNT_ID, originalAppId: (manifest as ApplicationRelease & { originalAppId?: string }).originalAppId ?? null, sourceCommit: input.action === "edit" ? shared!.sourceCommit : proof?.commit ?? manifest.source.commit, sourceBranch: input.action === "edit" ? shared!.sourceBranch : task.branch };
         await this.ctx.storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${manifest.releaseId}`]: true });
         await this.ctx.storage.delete(`withdrawn:${appId}`);
         this.emitWork(user.id, appId);
