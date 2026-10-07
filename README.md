@@ -36,6 +36,8 @@ GitHub/Jules 集成仅开放 zjh-plugin；云端不获得 R2、Wrangler 或全�
 | /v1/application-blobs/<id>/<sha256>、/v1/catalog | 候选上传、哈希与本轮授权校验 |
 | /v1/market、应用 public | 作者主动公开的快照，后续候选发布不改变公开版本 |
 | POST /v1/application-download/<id> | 宿主成功安装后异步记录，按登录账号及应用去重；仅接受已上架 releaseId，市场列表返回 downloadCount |
+| /posts/<id>、/applications/<id>、/download | 公开分享落地页、打开 App 的兜底入口；下载地址重定向到当前 R2 APK |
+| /.well-known/assetlinks.json | Android App Links 域名关联，证书指纹必须与分发 APK 签名一致 |
 | /v1/official-release、/v1/runtime | 维护者公开官方版本、发布配套 APK 契约 |
 | /v1/updates、/v1/apk | 动态与 APK 更新检查、APK 清单 |
 

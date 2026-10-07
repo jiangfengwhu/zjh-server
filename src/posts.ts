@@ -1,4 +1,5 @@
 import { sendLive, sendAccountLive } from "./live";
+import { sharedLinkActions, sharedLinkStyles } from "./sharedLinks";
 import { normalizePostContent, type PostContent } from "./postHtml";
 import { DurableObject } from "cloudflare:workers";
 import {
@@ -1237,11 +1238,11 @@ export async function readSharedPost(request: Request, env: Env) {
   const app = post?.application
     ? `<section><h2>应用 · ${escape(post.application.title)}</h2><p>${escape(
         post.application.summary
-      )}</p><p class="date">在紫金花应用市场搜索此应用，即可查看当前公开版本。</p></section>`
+      )}</p><p class="date"><a href="/applications/${escape(post.application.appId)}">查看作品详情</a></p></section>`
     : "";
   const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(
     post ? post.author.name + "的动态" : "动态不存在"
-  )} · 紫金花</title><style>body{margin:0;background:#faf8f5;color:#25221f;font:16px/1.7 system-ui,sans-serif}main{max-width:620px;margin:0 auto;padding:28px 20px}h1{font-size:18px;color:#9c7437}h2{margin-bottom:0;font-size:18px}.date{font-size:12px;color:#888}.body{white-space:pre-wrap;overflow-wrap:anywhere}.post-html{overflow:hidden;overflow-wrap:anywhere}.post-html img{max-width:100%;height:auto}.images{display:grid;gap:10px}img{width:100%;border-radius:14px}section{margin-top:20px;padding:16px;background:white;border-radius:14px}</style></head><body><main><h1>紫金花</h1>${content}${app}</main></body></html>`;
+  )} · 紫金花</title><style>${sharedLinkStyles}body{margin:0;background:#faf8f5;color:#25221f;font:16px/1.7 system-ui,sans-serif}main{max-width:620px;margin:0 auto;padding:28px 20px}h1{font-size:18px;color:#9c7437}h2{margin-bottom:0;font-size:18px}.date{font-size:12px;color:#888}.body{white-space:pre-wrap;overflow-wrap:anywhere}.post-html{overflow:hidden;overflow-wrap:anywhere}.post-html img{max-width:100%;height:auto}.images{display:grid;gap:10px}img{width:100%;border-radius:14px}section{margin-top:20px;padding:16px;background:white;border-radius:14px}</style></head><body><main><h1>紫金花</h1>${content}${app}${sharedLinkActions("posts", id)}</main></body></html>`;
   return new Response(request.method === "HEAD" ? null : html, {
     status: response.status,
     headers: {
