@@ -43,7 +43,7 @@ type Comment = {
   createdAt: number;
   replyTo?: { id: string; name: string };
 };
-type Stats = { likes: number; comments: number };
+type Stats = { likes: number; comments: number; views?: number };
 type Notice = {
   id: string;
   actor: Author;
@@ -276,9 +276,10 @@ export class Posts extends DurableObject<Env> {
           ...(viewer ? [`like:${post.id}:${viewer.id}`] : []),
         ]);
         if (viewer) keys.push(`notice-unread:${viewer.id}`);
-        const [profiles, metadata] = await Promise.all([
+        const [profiles, metadata, views] = await Promise.all([
           publicProfiles([...new Set(page.map(([, post]) => post.author.id))], this.env),
           keys.length ? this.ctx.storage.get<Stats | boolean | number>(keys) : Promise.resolve(new Map<string, Stats | boolean | number>()),
+          this.recordViews(page.map(([, post]) => post.id), request, viewer).catch(() => new Map<string, number>()),
         ]);
         return json({
           posts: page.map(([, post]) => {
@@ -286,6 +287,7 @@ export class Posts extends DurableObject<Env> {
             return {
               ...post,
               author: profiles.get(post.author.id) ?? post.author,
+              viewCount: views.get(post.id) ?? stats?.views ?? 0,
               likeCount: stats?.likes ?? 0,
               commentCount: stats?.comments ?? 0,
               liked: viewer ? !!metadata.get(`like:${post.id}:${viewer.id}`) : false,
@@ -368,6 +370,7 @@ export class Posts extends DurableObject<Env> {
           [post.author.id, ...page.comments.map((item) => item.author.id)],
           this.env
         );
+        if (!target[2] && !url.searchParams.has("cursor")) await this.recordViews([post.id], request, viewer).catch(() => {});
         return json({
           post: await this.decorate(
             { ...post, author: profiles.get(post.author.id) ?? post.author },
@@ -656,6 +659,37 @@ export class Posts extends DurableObject<Env> {
     if (!post) throw new InputError("这条动态已删除或不存在", 404);
     return post;
   }
+  /** Count API delivery once per account, or approximately per anonymous request source. */
+  private async recordViews(ids: string[], request: Request, viewer: User | null) {
+    const ip = request.headers.get("CF-Connecting-IP");
+    if (!ids.length || (!viewer && !ip)) return new Map<string, number>();
+    // Persist only a digest, never IP addresses or user-agent strings.
+    const identity = await digest(viewer ? `account:${viewer.id}` : `guest:${ip}:${request.headers.get("User-Agent") ?? ""}`);
+    const counts = new Map<string, number>();
+    for (let offset = 0; offset < ids.length; offset += 32) {
+      const batch = [...new Set(ids.slice(offset, offset + 32))];
+      const result = await this.ctx.storage.transaction(async storage => {
+        const keys = batch.flatMap(id => [`id:${id}`, `view:${id}:${identity}`, `stats:${id}`]);
+        const metadata = await storage.get<string | boolean | Stats>(keys);
+        const result = new Map<string, number>();
+        const writes: Record<string, boolean | Stats> = {};
+        for (const id of batch) {
+          if (!metadata.has(`id:${id}`)) continue;
+          const stats = (metadata.get(`stats:${id}`) as Stats | undefined) ?? { likes: 0, comments: 0 };
+          if (!metadata.has(`view:${id}:${identity}`)) {
+            stats.views = (stats.views ?? 0) + 1;
+            writes[`view:${id}:${identity}`] = true;
+            writes[`stats:${id}`] = stats;
+          }
+          result.set(id, stats.views ?? 0);
+        }
+        if (Object.keys(writes).length) await storage.put(writes);
+        return result;
+      });
+      for (const [id, count] of result) counts.set(id, count);
+    }
+    return counts;
+  }
   private async decorate(post: Post, viewer: User | null) {
     const stats = (await this.ctx.storage.get<Stats>(`stats:${post.id}`)) ?? {
       likes: 0,
@@ -666,6 +700,7 @@ export class Posts extends DurableObject<Env> {
       : false;
     return {
       ...post,
+      viewCount: stats.views ?? 0,
       likeCount: stats.likes,
       commentCount: stats.comments,
       liked,
@@ -1102,6 +1137,7 @@ export class Posts extends DurableObject<Env> {
     });
     await this.clearPostNotices(id);
     for (const prefix of [
+      `view:${id}:`,
       `like:${id}:`,
       `comment:${id}:`,
       `comment-id:${id}:`,
