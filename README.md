@@ -55,3 +55,5 @@ Jolly 紧凑查询先返回本轮状态，历史在后台预热；尚未确认�
 GET /v1/messages/live 以 Authorization 头建立 WebSocket，复用 Posts 的休眠连接。推送 ready/message/read/notification/feed/work 事件；账号事件带递增 version、私信总未读及通知分类数量，作品事件带 appId。正文须通过鉴权接口读取；过期连接在下一次事件时关闭并由客户端重新鉴权连接，不使用定时查询。客户端合并短时事件，仅刷新可见列表，首页新动态由用户点击提示后展示；后台关闭连接，重连补同步。
 
 制作与继续修改每轮从 npm 的 `@zijinhua/app-sdk/latest` 选择稳定版本，任务开头注入安装确切版本的命令。获取失败时不占用额度、不创建制作轮次；原请求重试仍复用已有结果。SDK 更新不合并 plugin main，版本的宿主兼容性由维护者发布 latest 前核对。
+
+任务 SDK 的 npm 大版本必须与当前生效宿主 release.applications.sdk 一致；切换发布渠道期间不下发不匹配的 SDK。作品清单 requires 只要求 sdk，API/共享库/原生的破坏性升级统一反映到 SDK 大版本。

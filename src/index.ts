@@ -690,7 +690,7 @@ export class Workshop extends DurableObject<Env> {
           const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(content)));
           const identity = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
           if ((document.source.dirty || document.source.tree !== undefined) && !/^[a-f0-9]{40}$/.test(document.source.tree)) return json({ error: "application source tree invalid" }, 400);
-          if (identity !== releaseId || document.format !== 1 || !/^[a-f0-9]{40}$/.test(document.source.commit) || !document.requires?.engineAbi || !document.requires?.sdk) return json({ error: "application integrity invalid" }, 400);
+          if (identity !== releaseId || document.format !== 1 || !/^[a-f0-9]{40}$/.test(document.source.commit) || !/^\d+\.\d+\.\d+$/.test(document.requires?.sdk ?? "")) return json({ error: "application integrity invalid" }, 400);
           if (document.source.repository !== "jiangfengwhu/zjh-plugin" || document.dataSchemaVersion !== 1) return json({ error: "application source or data schema invalid" }, 400);
           const task = await this.ctx.storage.get<WorkshopTask>(`task:${manifest.appId}`);
           if (task?.originalAppId && (document.originalAppId !== task.originalAppId || document.originalReleaseId !== task.originalReleaseId || document.originalCommit !== task.originalCommit)) return json({ error: "original application version cannot change" }, 409);
@@ -853,7 +853,7 @@ export class Workshop extends DurableObject<Env> {
           if (!shared || shared.manifest.releaseId !== input.originalReleaseId) return json({ message: "原作公开版本已改变，请刷新市场后重新创作" }, 409);
           original = shared.manifest; originalCommit = shared.sourceCommit ?? original.source.commit; originalBranch = shared.sourceBranch;
         }
-        const preparation = await sdkPreparation();
+        const preparation = await sdkPreparation((await this.env.CATALOG.get<{ applications?: { sdk: string } }>("v1/release", "json"))?.applications?.sdk);
         if (!await this.quota(user.id, appId)) return json({ message: "每天最多发起 10 轮制作，同时最多制作 3 个作品" }, 429);
         const moduleBase = await this.allocate(appId);
         task = { ownerId: user.id, appId, session: "", token: crypto.randomUUID(), phase: "working", publishEpoch: crypto.randomUUID(), requestId: input.requestId, title: String(payload.title ?? appId).slice(0, 80), wish: prompt, startedAt: Date.now(), originalAppId: original?.appId, originalReleaseId: original?.releaseId, originalCommit, originalBranch };
@@ -933,7 +933,7 @@ export class Workshop extends DurableObject<Env> {
           if (roundState === "COMPLETED" && task.phase === "working" && !isRoundCandidate(task, candidate) && (!task.deliveryWaitStartedAt || Date.now() - task.deliveryWaitStartedAt < 120000)) return json({ message: "本轮应用正在交付，请等交付完成后再修改" }, 409);
           const dispatchVersion = `${current.state}:${current.updateTime ?? ""}`;
           if (task.dispatchVersion === dispatchVersion) return json({ message: "本轮修改已提交，请等待制作状态更新" }, 409);
-          const preparation = await sdkPreparation();
+          const preparation = await sdkPreparation((await this.env.CATALOG.get<{ applications?: { sdk: string } }>("v1/release", "json"))?.applications?.sdk);
           if (!await this.quota(user.id, appId)) return json({ message: "制作额度已用完或同时制作作品过多，请稍后再试" }, 429);
           const previous = structuredClone(task);
           task.publishEpoch = crypto.randomUUID(); task.requestId = input.requestId; task.awaitingRoundStart = true; task.dispatchVersion = dispatchVersion; task.deliveryWaitStartedAt = undefined;
