@@ -344,6 +344,7 @@ export class Posts extends DurableObject<Env> {
       }
       if (url.pathname === "/v1/application-bookmarks" && request.method === "GET") {
         const viewer = await authenticatedUser(request, this.env);
+        if (!viewer) return json({ message: "请先登录" }, 401);
         const prefix = `bookmark:${viewer.id}:`;
         const cursor = url.searchParams.get("cursor") || undefined;
         if (cursor && !/^[a-f0-9]{64}$/.test(cursor)) throw new InputError("分页标识无效");
