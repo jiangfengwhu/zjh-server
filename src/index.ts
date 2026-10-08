@@ -577,6 +577,16 @@ export class Workshop extends DurableObject<Env> {
   private async handle(request: Request): Promise<Response> {
     try {
       const path = new URL(request.url).pathname;
+      if (path === "/internal/application-icons" && request.method === "GET") {
+        const ids = [...new Set((new URL(request.url).searchParams.get("ids") || "").split(","))];
+        if (!ids.length || ids.length > 30 || ids.some(id => !/^[a-z][a-z0-9-]{0,63}$/.test(id))) return json({ message: "应用标识无效" }, 400);
+        const entries = await this.ctx.storage.get<MarketEntry | string>(ids.flatMap(id => [`shared:${id}`, `application-icon:${id}`]));
+        return json({ icons: ids.flatMap(appId => {
+          const item = entries.get(`shared:${appId}`) as MarketEntry | undefined;
+          return item ? [{ appId, icon: item.manifest.icon, iconUrl: entries.get(`application-icon:${appId}`) || item.iconUrl }] : [];
+        }) }, 200);
+      }
+
       if (path === "/v1/application-updates" && request.method === "GET") {
         const ids = [...new Set((new URL(request.url).searchParams.get("ids") || "").split(","))];
         if (!ids.length || ids.length > 100 || ids.some(id => !/^[a-z][a-z0-9-]{0,63}$/.test(id))) return json({ message: "应用列表无效" }, 400);

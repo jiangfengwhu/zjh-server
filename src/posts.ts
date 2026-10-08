@@ -354,10 +354,18 @@ export class Posts extends DurableObject<Env> {
         const pointers = keys.length ? await this.ctx.storage.get<string>(keys.map(key => `id:${key.slice(prefix.length)}`)) : new Map<string, string>();
         const locations = [...new Set(pointers.values())];
         const posts = locations.length ? await this.ctx.storage.get<Post>(locations) : new Map<string, Post>();
-        return json({ applications: keys.flatMap(key => {
+        const applications = keys.flatMap(key => {
           const post = posts.get(pointers.get(`id:${key.slice(prefix.length)}`) ?? "");
           return post?.applicationDiscussion && post.application ? [{ ...post.application, discussionId: post.id }] : [];
-        }), nextCursor: saved.size > 30 ? keys.at(-1)!.slice(prefix.length) : null });
+        });
+        if (applications.length) {
+          const response = await this.env.WORKSHOP.getByName("dynamic").fetch(new Request(`https://workshop.internal/internal/application-icons?ids=${applications.map(item => item.appId).join(",")}`));
+          if (!response.ok) throw new InputError("常用应用图标暂时不可用，请重试", 503);
+          const result = await response.json() as { icons: Array<Pick<ApplicationLink, "appId" | "icon" | "iconUrl">> };
+          const icons = new Map(result.icons.map(item => [item.appId, item]));
+          for (const item of applications) Object.assign(item, icons.get(item.appId));
+        }
+        return json({ applications, nextCursor: saved.size > 30 ? keys.at(-1)!.slice(prefix.length) : null });
       }
       const applicationId = url.pathname.match(/^\/v1\/application-discussions\/([a-z][a-z0-9-]{0,63})$/)?.[1];
       if (applicationId && request.method === "GET") {
@@ -730,7 +738,7 @@ export class Posts extends DurableObject<Env> {
   private async applicationDiscussion(appId: string, viewer: User | null) {
     const response = await this.env.WORKSHOP.getByName("dynamic").fetch(new Request(`https://workshop.internal/v1/market?appId=${appId}&detail=1`));
     if (!response.ok) throw new InputError("这个作品已撤回或暂未公开", response.status === 404 ? 404 : 503);
-    const { item } = await response.json() as { item: { manifest: { appId: string; releaseId: string; appName: string; description: string; accent: string }; title: string; summary: string; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; iconUrl?: string } };
+    const { item } = await response.json() as { item: { manifest: { appId: string; releaseId: string; appName: string; description: string; accent: string; icon?: ApplicationLink["icon"] }; title: string; summary: string; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; iconUrl?: string } };
     if (!item?.authorId || item.manifest.appId !== appId) throw new InputError("作品信息暂时不可用", 503);
     const id = await digest(`application-discussion:${appId}`);
     return this.queue.run(`post:${id}`, async () => {
@@ -740,7 +748,7 @@ export class Posts extends DurableObject<Env> {
         id, applicationDiscussion: true,
         author: { id: item.authorId!, name: item.authorName, avatarUrl: item.authorAvatarUrl ?? null },
         body: item.summary || item.manifest.description, images: [], createdAt: prior?.createdAt ?? Date.now(),
-        application: { appId, releaseId: item.manifest.releaseId, title: item.title || item.manifest.appName, summary: item.summary || item.manifest.description, accent: item.manifest.accent, iconUrl: item.iconUrl },
+        application: { appId, releaseId: item.manifest.releaseId, title: item.title || item.manifest.appName, summary: item.summary || item.manifest.description, accent: item.manifest.accent, icon: item.manifest.icon, iconUrl: item.iconUrl },
       };
       if (JSON.stringify(prior) !== JSON.stringify(post)) await this.ctx.storage.transaction(async storage => {
         await storage.put(key, post);
