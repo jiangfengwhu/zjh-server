@@ -36,6 +36,7 @@ APP_DATA 使用 SQLite Durable Objects。私有实例按 userId 分配，内部�
 | --- | --- |
 | /v1/auth/*、/v1/account | 登录与资料，账号凭证由宿主保管 |
 | POST /v1/app-data/<appId>/<private\|public>/<collection> | 登录用户的应用云数据；JSON body 的 operation 为 create/get/list/update/remove |
+| GET /v1/application-bookmarks | 当前账号的常用应用分页，复用作品收藏记录，游标为本账号收藏项标识 |
 | /v1/posts、/v1/notifications、/v1/profiles | 动态、互动、公开身份及关注／粉丝分页 |
 | /v1/messages、/v1/messages/<用户 ID> | 私信会话、文字发送与历史；登录鉴权、幂等发送 |
 | /v1/workshop、/v1/works、/v1/jules | 按账号和 appId 管理制作，同应用复用会话并串行写入 |

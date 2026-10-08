@@ -342,6 +342,21 @@ export class Posts extends DurableObject<Env> {
           ...posts,
         });
       }
+      if (url.pathname === "/v1/application-bookmarks" && request.method === "GET") {
+        const viewer = await authenticatedUser(request, this.env);
+        const prefix = `bookmark:${viewer.id}:`;
+        const cursor = url.searchParams.get("cursor") || undefined;
+        if (cursor && !/^[a-f0-9]{64}$/.test(cursor)) throw new InputError("分页标识无效");
+        const saved = await this.ctx.storage.list<boolean>({ prefix, limit: 31, ...(cursor ? { startAfter: prefix + cursor } : {}) });
+        const keys = [...saved.keys()].slice(0, 30);
+        const pointers = keys.length ? await this.ctx.storage.get<string>(keys.map(key => `id:${key.slice(prefix.length)}`)) : new Map<string, string>();
+        const locations = [...new Set(pointers.values())];
+        const posts = locations.length ? await this.ctx.storage.get<Post>(locations) : new Map<string, Post>();
+        return json({ applications: keys.flatMap(key => {
+          const post = posts.get(pointers.get(`id:${key.slice(prefix.length)}`) ?? "");
+          return post?.applicationDiscussion && post.application ? [{ ...post.application, discussionId: post.id }] : [];
+        }), nextCursor: saved.size > 30 ? keys.at(-1)!.slice(prefix.length) : null });
+      }
       const applicationId = url.pathname.match(/^\/v1\/application-discussions\/([a-z][a-z0-9-]{0,63})$/)?.[1];
       if (applicationId && request.method === "GET") {
         const viewer = request.headers.has("Authorization") ? await authenticatedUser(request, this.env) : null;
