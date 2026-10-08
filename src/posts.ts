@@ -30,6 +30,7 @@ type ApplicationLink = {
   accent: string;
 };
 type Post = {
+  applicationDiscussion?: boolean;
   id: string;
   author: Author;
   body: string;
@@ -341,13 +342,19 @@ export class Posts extends DurableObject<Env> {
           ...posts,
         });
       }
+      const applicationId = url.pathname.match(/^\/v1\/application-discussions\/([a-z][a-z0-9-]{0,63})$/)?.[1];
+      if (applicationId && request.method === "GET") {
+        const viewer = request.headers.has("Authorization") ? await authenticatedUser(request, this.env) : null;
+        return await this.applicationDiscussion(applicationId, viewer);
+      }
       const target = url.pathname.match(
-        /^\/v1\/posts\/([a-f0-9]{64})(?:\/(like|comments)(?:\/([a-f0-9]{64}))?)?$/
+        /^\/v1\/posts\/([a-f0-9]{64})(?:\/(like|bookmark|comments)(?:\/([a-f0-9]{64}))?)?$/
       );
       if (
         target &&
         request.method === "GET" &&
         target[2] !== "like" &&
+        target[2] !== "bookmark" &&
         !target[3]
       ) {
         const post = await this.findPost(target[1]);
@@ -449,6 +456,15 @@ export class Posts extends DurableObject<Env> {
         if (url.pathname === "/v1/posts" && request.method === "POST")
           return this.publish(request, user);
         const match = url.pathname.match(/^\/v1\/posts\/([a-f0-9]{64})$/);
+        if (target && target[2] === "bookmark" && !target[3] && ["POST", "DELETE"].includes(request.method)) {
+          return this.queue.run(`post:${target[1]}`, async () => {
+            await this.findPost(target[1]);
+            const key = `bookmark:${user.id}:${target[1]}`;
+            if (request.method === "POST") await this.ctx.storage.put(key, true);
+            else await this.ctx.storage.delete(key);
+            return json({ saved: request.method === "POST" });
+          });
+        }
         if (match && request.method === "DELETE")
           return this.queue.run(`post:${match[1]}`, () =>
             this.remove(match[1], user)
@@ -693,6 +709,29 @@ export class Posts extends DurableObject<Env> {
     }
     return counts;
   }
+  /** One discussion per application, across releases; kept out of the community timeline. */
+  private async applicationDiscussion(appId: string, viewer: User | null) {
+    const response = await this.env.WORKSHOP.getByName("dynamic").fetch(new Request(`https://workshop.internal/v1/market?appId=${appId}&detail=1`));
+    if (!response.ok) throw new InputError("这个作品已撤回或暂未公开", response.status === 404 ? 404 : 503);
+    const { item } = await response.json() as { item: { manifest: { appId: string; releaseId: string; appName: string; description: string; accent: string }; title: string; summary: string; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; iconUrl?: string } };
+    if (!item?.authorId || item.manifest.appId !== appId) throw new InputError("作品信息暂时不可用", 503);
+    const id = await digest(`application-discussion:${appId}`);
+    return this.queue.run(`post:${id}`, async () => {
+      const key = `application-discussion:${appId}`;
+      const prior = await this.ctx.storage.get<Post>(key);
+      const post: Post = {
+        id, applicationDiscussion: true,
+        author: { id: item.authorId!, name: item.authorName, avatarUrl: item.authorAvatarUrl ?? null },
+        body: item.summary || item.manifest.description, images: [], createdAt: prior?.createdAt ?? Date.now(),
+        application: { appId, releaseId: item.manifest.releaseId, title: item.title || item.manifest.appName, summary: item.summary || item.manifest.description, accent: item.manifest.accent, iconUrl: item.iconUrl },
+      };
+      if (JSON.stringify(prior) !== JSON.stringify(post)) await this.ctx.storage.transaction(async storage => {
+        await storage.put(key, post);
+        await storage.put(`id:${id}`, key);
+      });
+      return json({ post: await this.decorate(post, viewer) });
+    });
+  }
   private async decorate(post: Post, viewer: User | null) {
     const stats = (await this.ctx.storage.get<Stats>(`stats:${post.id}`)) ?? {
       likes: 0,
@@ -707,6 +746,7 @@ export class Posts extends DurableObject<Env> {
       likeCount: stats.likes,
       commentCount: stats.comments,
       liked,
+      saved: viewer ? !!await this.ctx.storage.get(`bookmark:${viewer.id}:${post.id}`) : false,
     };
   }
   private async like(id: string, user: User, wanted: boolean) {
@@ -736,7 +776,7 @@ export class Posts extends DurableObject<Env> {
           postId: id,
           commentId: "",
           kind: "like",
-          body: "赞了你的动态",
+          body: post.applicationDiscussion ? "赞了你的作品" : "赞了你的动态",
           postPreview: (post.body || post.application?.title || (post.content ? "HTML 动态" : "图片动态")).slice(0, 100),
           createdAt: Date.now(),
           read: false,
@@ -1121,6 +1161,7 @@ export class Posts extends DurableObject<Env> {
   private async remove(id: string, user: User) {
     const key = await this.ctx.storage.get<string>(`id:${id}`);
     const post = key ? await this.ctx.storage.get<Post>(key) : undefined;
+    if (post?.applicationDiscussion) throw new InputError("作品讨论随作品保留，不能作为动态删除", 403);
     if (!post) {
       await this.clearPostNotices(id);
       return json({ deleted: true });

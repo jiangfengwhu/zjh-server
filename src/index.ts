@@ -34,7 +34,8 @@ export default {
       if (["GET", "HEAD"].includes(request.method) && url.pathname === "/download") return downloadLatestApk(env);
       if (["GET", "HEAD"].includes(request.method) && /^\/applications\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return readSharedApplication(request, env);
       if (/^\/v1\/(auth\/(?:code|verify|logout)|account(?:\/avatar)?)$/.test(url.pathname)) return env.ACCOUNTS.getByName("accounts").fetch(request);
-      if (/^\/v1\/(posts(?:\/[a-f0-9]{64}(?:\/(?:like|comments)(?:\/[a-f0-9]{64})?)?)?|post-media)$/.test(url.pathname)) return env.POSTS.getByName("timeline").fetch(request);
+      if (/^\/v1\/(posts(?:\/[a-f0-9]{64}(?:\/(?:like|bookmark|comments)(?:\/[a-f0-9]{64})?)?)?|post-media)$/.test(url.pathname)) return env.POSTS.getByName("timeline").fetch(request);
+      if (/^\/v1\/application-discussions\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.POSTS.getByName("timeline").fetch(request);
       if (/^\/v1\/profiles\/[a-f0-9-]{36}(?:\/(?:follow|followers|following))?$/.test(url.pathname)) return env.POSTS.getByName("timeline").fetch(request);
       if (/^\/v1\/messages(?:\/(?:live|unread|[a-f0-9-]{36}(?:\/read)?))?$/.test(url.pathname)) return env.POSTS.getByName("timeline").fetch(request);
       if (/^\/v1\/notifications(?:\/(?:unread|read))?$/.test(url.pathname)) return env.POSTS.getByName("timeline").fetch(request);
