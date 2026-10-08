@@ -122,3 +122,27 @@ test("document and storage quotas reject writes without partially updating recor
     assert.deepEqual((await f.call("alice", "private", { operation: "get", id: result.id })).result, result);
   } finally { f.close(); }
 });
+
+test("long scalar values still produce usable pagination cursors", async () => {
+  const f = fixture();
+  try {
+    for (const suffix of ["1", "2"]) await f.call("alice", "private", { operation: "create", data: { text: "x".repeat(30000) + suffix } });
+    const query = { limit: 1, orderBy: { field: "text", direction: "asc" } };
+    const first = await f.call("alice", "private", { operation: "list", query });
+    assert.equal(first.status, 200); assert.ok(first.result.nextCursor.length > 30000);
+    const second = await f.call("alice", "private", { operation: "list", query: { ...query, cursor: first.result.nextCursor } });
+    assert.equal(second.status, 200); assert.equal(second.result.items.length, 1);
+    assert.notEqual(second.result.items[0].id, first.result.items[0].id);
+    assert.equal(second.result.nextCursor, null);
+  } finally { f.close(); }
+});
+
+test("failed mutations count toward durable rate limits without changing business data", async () => {
+  const f = fixture();
+  try {
+    for (let index = 0; index < 120; index++) assert.equal((await f.call("alice", "private", { operation: "update", id: "33333333-3333-4333-8333-333333333333", data: {} })).status, 404);
+    assert.equal((await f.call("alice", "private", { operation: "list" })).status, 429);
+    assert.equal(f.stores.get(`user:${users.alice}`).db.prepare("SELECT COUNT(*) AS count FROM records").get().count, 0);
+    assert.equal((await f.call("bob", "private", { operation: "list" })).status, 200);
+  } finally { f.close(); }
+});
