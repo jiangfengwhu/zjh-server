@@ -667,6 +667,25 @@ export class Workshop extends DurableObject<Env> {
         if (category && category !== "official" && !MARKET_CATEGORIES.includes(category) || query.length > 80) return json({ message: "市场筛选无效" }, 400);
         if (authorId && !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(authorId)) return json({ error: "author id invalid" }, 400);
         if (appId && !/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return json({ error: "application id invalid" }, 400);
+        if (path === "/v1/market" && appId && params.get("detail") === "1") {
+          const viewer = request.headers.has("Authorization") ? await authenticatedUser(request, this.env) : null;
+          const [published, task, downloads, iconUrl] = await Promise.all([
+            this.ctx.storage.get<MarketEntry>(`shared:${appId}`), this.ctx.storage.get<WorkshopTask>(`task:${appId}`),
+            this.ctx.storage.get<number>(`downloads:${appId}`), this.ctx.storage.get<string>(`application-icon:${appId}`)
+          ]);
+          const owned = !!viewer && task?.ownerId === viewer.id;
+          const candidate = owned ? await this.candidate(appId) : null;
+          const manifest = published?.manifest ?? candidate;
+          if (!manifest || appId === "jolly") return json({ message: "这个应用已撤回或暂未上架" }, 404);
+          const authorId = published?.authorId ?? task?.ownerId;
+          const profiles = authorId ? await publicProfiles([authorId], this.env).catch(() => new Map()) : new Map();
+          const author = authorId ? profiles.get(authorId) : undefined;
+          const item = { ...published, manifest, title: published?.title ?? manifest.appName, summary: published?.summary ?? manifest.description,
+            authorId, authorName: author?.name ?? published?.authorName ?? "创作者", authorAvatarUrl: author?.avatarUrl ?? published?.authorAvatarUrl,
+            originalAppId: published?.originalAppId ?? task?.originalAppId ?? null, downloadCount: downloads ?? 0, iconUrl: iconUrl ?? published?.iconUrl, owned,
+            sharing: owned ? { shared: published?.authorId === viewer!.id ? published : null, application: candidate, iconUrl } : undefined };
+          const response = json({ item }, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
+        }
         const selected = appId ? await this.ctx.storage.get<MarketEntry>(`shared:${appId}`) : undefined;
         const entries = appId ? selected ? [selected] : [] : [...(await this.ctx.storage.list<MarketEntry>({ prefix: "shared:" })).values()];
         for (const entry of entries) {
@@ -689,14 +708,15 @@ export class Workshop extends DurableObject<Env> {
         const visible = paged ? remaining.slice(0, limit) : remaining;
         const last = visible.at(-1);
         const nextCursor = paged && last && remaining.length > limit ? btoa(JSON.stringify({ at: last.publishedAt || 0, id: last.manifest.appId, filter: JSON.stringify([category, encodeURIComponent(query), authorId, appId]) })) : undefined;
-        // Public browsing never authenticates the visitor. Profile lookup is optional enrichment.
-        try {
-          const profiles = await publicProfiles([...new Set(visible.map(entry => entry.authorId).filter((id): id is string => Boolean(id)))], this.env);
-          for (const entry of visible) { const profile = entry.authorId ? profiles.get(entry.authorId) : undefined; if (profile) { entry.authorName = profile.name; entry.authorAvatarUrl = profile.avatarUrl; } }
-        } catch { /* Keep published snapshots available if the account service is unavailable. */ }
-        if (path === "/v1/market" && visible.length) {
-          const counts = await this.ctx.storage.get<number>(visible.map(entry => `downloads:${entry.manifest.appId}`));
-          for (const entry of visible) entry.downloadCount = counts.get(`downloads:${entry.manifest.appId}`) ?? 0;
+        // Independent public enrichments share one wait; profile failures keep snapshots usable.
+        const [profiles, counts] = await Promise.all([
+          publicProfiles([...new Set(visible.map(entry => entry.authorId).filter((id): id is string => Boolean(id)))], this.env).catch(() => new Map()),
+          path === "/v1/market" && visible.length ? this.ctx.storage.get<number>(visible.map(entry => `downloads:${entry.manifest.appId}`)) : Promise.resolve(new Map<string, number>())
+        ]);
+        for (const entry of visible) {
+          const profile = entry.authorId ? profiles.get(entry.authorId) : undefined;
+          if (profile) { entry.authorName = profile.name; entry.authorAvatarUrl = profile.avatarUrl; }
+          if (path === "/v1/market") entry.downloadCount = counts.get(`downloads:${entry.manifest.appId}`) ?? 0;
         }
         const response = json({ applications: path === "/v1/applications" ? visible.map(entry => entry.manifest) : visible, nextCursor }, 200);
         response.headers.set("Cache-Control", "no-store"); return response;
