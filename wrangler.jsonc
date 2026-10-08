@@ -21,6 +21,10 @@
       {
         "name": "POSTS",
         "class_name": "Posts"
+      },
+      {
+        "name": "APP_DATA",
+        "class_name": "ApplicationDatabase"
       }
     ]
   },
@@ -66,6 +70,10 @@
       "new_sqlite_classes": [
         "Posts"
       ]
+    },
+    {
+      "tag": "v6-application-data",
+      "new_sqlite_classes": ["ApplicationDatabase"]
     }
   ],
   "observability": {

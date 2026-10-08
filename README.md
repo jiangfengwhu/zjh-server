@@ -24,11 +24,18 @@ Secrets 用 `npx wrangler secret put <NAME>` 交互配置，值不写入代码�
 
 GitHub/Jules 集成仅开放 zjh-plugin；云端不获得 R2、Wrangler 或全局发布权限。
 
+## 应用云数据
+
+APP_DATA 使用 SQLite Durable Objects。私有实例按 userId 分配，内部再按 appId 隔离；公开实例按 appId 分配。入口从宿主登录 Token 获取用户身份，只允许已公开应用或当前作者的作品访问，不使用发布授权。公开记录仅创建者可改删，客户端不能覆盖归属和版本字段。集合首次写入自动创建；单条 JSON ≤32 KB，每个实例业务数据 ≤50 MB、记录 ≤10 万，每应用集合 ≤100；每用户每实例每分钟 ≤120 次请求。写入 requestId 一小时去重，最多保留 2000 条去重结果，超出时拒绝新写入而不提前丢弃旧结果。分页使用绑定账号、应用、集合和条件的游标。
+
+更新及卸载应用不删除云数据。现有 development-reset 仅清理其原有范围，不删除独立 APP_DATA 业务库。业务数据不进入日志；账号 Token 不提供给 plugin。安全回归检查：`node --test tests/applicationData.test.mjs`，使用本地 SQLite，不访问线上数据。
+
 ## 接口边界
 
 | 接口 | 职责 |
 | --- | --- |
 | /v1/auth/*、/v1/account | 登录与资料，账号凭证由宿主保管 |
+| POST /v1/app-data/<appId>/<private\|public>/<collection> | 登录用户的应用云数据；JSON body 的 operation 为 create/get/list/update/remove |
 | /v1/posts、/v1/notifications、/v1/profiles | 动态、互动、公开身份及关注／粉丝分页 |
 | /v1/messages、/v1/messages/<用户 ID> | 私信会话、文字发送与历史；登录鉴权、幂等发送 |
 | /v1/workshop、/v1/works、/v1/jules | 按账号和 appId 管理制作，同应用复用会话并串行写入 |

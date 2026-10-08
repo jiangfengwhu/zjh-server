@@ -8,6 +8,8 @@ import { issuePublisherGrant, readPublisherGrant, redactPublisherGrants, publish
 export { Accounts } from "./accounts";
 export { Posts } from "./posts";
 import { readPostImage, readSharedPost } from "./posts";
+import { applicationData } from "./applicationData";
+export { ApplicationDatabase } from "./applicationData";
 
 /** 清单类的键：整套清单和 vendor 的模块编号表。格式变了就换前缀（v3/…），旧版本的手机继续读旧前缀。 */
 const JSON_KEY = /^v1\/(?:release|runtime|apk|maps\/vendor\.json|applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|releases\/[a-f0-9]{64}))$/;
@@ -27,6 +29,7 @@ export default {
   async fetch(request, env): Promise<Response> {
     const url = new URL(request.url);
     try {
+      if (url.pathname.startsWith("/v1/app-data/")) return applicationData(request, env);
       if (["GET", "HEAD"].includes(request.method) && url.pathname === "/.well-known/assetlinks.json") return androidAssetLinks();
       if (["GET", "HEAD"].includes(request.method) && url.pathname === "/download") return downloadLatestApk(env);
       if (["GET", "HEAD"].includes(request.method) && /^\/applications\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return readSharedApplication(request, env);
@@ -274,6 +277,14 @@ const MARKET_CATEGORIES = ["tools", "productivity", "life", "creative", "other"]
 type MarketEntry = { downloadCount?: number; iconUrl?: string; manifest: ApplicationRelease; title: string; summary: string; category?: string; screenshots?: string[]; publishedAt?: number; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null; sourceCommit?: string; sourceBranch?: string };
 
 export class Workshop extends DurableObject<Env> {
+  async canUseCloud(appId: string, userId: string): Promise<boolean> {
+    if (this.resetting || !/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return false;
+    const [published, task] = await Promise.all([
+      this.ctx.storage.get<MarketEntry>(`shared:${appId}`),
+      this.ctx.storage.get<WorkshopTask>(`task:${appId}`),
+    ]);
+    return !!published || task?.ownerId === userId;
+  }
   private monitoring: Promise<void> | undefined;
   private async armMonitor(delay = 60000) {
     const alarm = await this.ctx.storage.getAlarm();
