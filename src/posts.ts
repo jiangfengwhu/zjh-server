@@ -343,6 +343,7 @@ export class Posts extends DurableObject<Env> {
         });
       }
       if (url.pathname === "/v1/application-bookmarks" && request.method === "GET") {
+        if (!/^Bearer [a-f0-9]{64}$/.test(request.headers.get("Authorization") || "")) return json({ message: "请先登录" }, 401);
         const viewer = await authenticatedUser(request, this.env);
         if (!viewer) return json({ message: "请先登录" }, 401);
         const prefix = `bookmark:${viewer.id}:`;
