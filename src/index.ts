@@ -623,7 +623,7 @@ export class Workshop extends DurableObject<Env> {
       if (publisherRoute && request.method === "POST") {
         const grant = await readPublisherGrant(request, this.env.OFFICIAL_PUBLISH_TOKEN);
         const task = await this.ctx.storage.get<WorkshopTask>(`task:${publisherRoute[1]}`);
-        if (!grant || grant.appId !== publisherRoute[1] || !publisherGrantActive(grant, task)) return json({ message: "本轮发布授权已失效，请在紫金花继续制作后使用新任务提供的发布命令" }, 403);
+        if (!grant || grant.appId !== publisherRoute[1] || !publisherGrantActive(grant, task)) return json({ message: "本轮发布授权已失效，请在生花继续制作后使用新任务提供的发布命令" }, 403);
         const token = await issuePublisherGrant({ appId: grant.appId, ownerId: grant.ownerId, epoch: grant.epoch }, this.env.OFFICIAL_PUBLISH_TOKEN, Math.min(30 * 60000, grant.expiresAt - Date.now()));
         const response = json({ token }, 200);
         response.headers.set("Cache-Control", "no-store");
@@ -689,7 +689,7 @@ export class Workshop extends DurableObject<Env> {
         const selected = appId ? await this.ctx.storage.get<MarketEntry>(`shared:${appId}`) : undefined;
         const entries = appId ? selected ? [selected] : [] : [...(await this.ctx.storage.list<MarketEntry>({ prefix: "shared:" })).values()];
         for (const entry of entries) {
-          if ((OFFICIAL_APPLICATIONS as readonly string[]).includes(entry.manifest.appId)) { entry.authorId = OFFICIAL_ACCOUNT_ID; entry.authorName = "紫金花官方"; entry.authorAvatarUrl = null; }
+          if ((OFFICIAL_APPLICATIONS as readonly string[]).includes(entry.manifest.appId)) { entry.authorId = OFFICIAL_ACCOUNT_ID; entry.authorName = "生花官方"; entry.authorAvatarUrl = null; }
           entry.authorOfficial = entry.authorId === OFFICIAL_ACCOUNT_ID;
         }
         // Jolly is built into the host; archived releases are retained but no longer offered as an application.
@@ -818,7 +818,7 @@ export class Workshop extends DurableObject<Env> {
         const manifest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/releases/${releaseId}`, "json");
         if (!manifest || manifest.appId !== appId || manifest.releaseId !== releaseId || manifest.source.dirty) return json({ message: "指定版本尚未上传或无效" }, 409);
         const prior = await this.ctx.storage.get<MarketEntry>(`shared:${appId}`);
-        const entry: MarketEntry = { manifest, title: manifest.appName, summary: manifest.description, category: prior?.category || (appId === "jolly" ? "creative" : "other"), screenshots: prior?.screenshots || [], publishedAt: prior?.manifest.releaseId === releaseId ? prior.publishedAt || Date.now() : Date.now(), authorId: OFFICIAL_ACCOUNT_ID, authorName: "紫金花官方", authorOfficial: true, originalAppId: null };
+        const entry: MarketEntry = { manifest, title: manifest.appName, summary: manifest.description, category: prior?.category || (appId === "jolly" ? "creative" : "other"), screenshots: prior?.screenshots || [], publishedAt: prior?.manifest.releaseId === releaseId ? prior.publishedAt || Date.now() : Date.now(), authorId: OFFICIAL_ACCOUNT_ID, authorName: "生花官方", authorOfficial: true, originalAppId: null };
         await this.ctx.storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${releaseId}`]: true });
         await this.ctx.storage.delete(`withdrawn:${appId}`);
         return json({ appId, public: releaseId }, 200);

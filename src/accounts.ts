@@ -36,7 +36,7 @@ export class Accounts extends DurableObject<AccountEnv> {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
       const prior = await ctx.storage.get<User>(`user:${OFFICIAL_ACCOUNT_ID}`);
-      const user: User = { ...(prior ?? { id: OFFICIAL_ACCOUNT_ID, name: "紫金花官方", avatarUrl: null, createdAt: Date.now() }), email: null };
+      const user: User = { ...(prior ?? { id: OFFICIAL_ACCOUNT_ID, name: "生花官方", avatarUrl: null, createdAt: Date.now() }), email: null };
       await ctx.storage.put(`user:${OFFICIAL_ACCOUNT_ID}`, user);
     });
   }
@@ -52,7 +52,7 @@ export class Accounts extends DurableObject<AccountEnv> {
         const official = await this.ctx.storage.get<User>(`user:${OFFICIAL_ACCOUNT_ID}`);
         await this.ctx.storage.deleteAll();
         await this.ctx.storage.deleteAlarm();
-        await this.ctx.storage.put(`user:${OFFICIAL_ACCOUNT_ID}`, official ?? { id: OFFICIAL_ACCOUNT_ID, email: null, name: "紫金花官方", avatarUrl: null, createdAt: Date.now() });
+        await this.ctx.storage.put(`user:${OFFICIAL_ACCOUNT_ID}`, official ?? { id: OFFICIAL_ACCOUNT_ID, email: null, name: "生花官方", avatarUrl: null, createdAt: Date.now() });
         return json({ reset: true, retainedAccounts: [OFFICIAL_ACCOUNT_ID] });
       } finally { this.resetting = false; }
     }
@@ -110,7 +110,7 @@ export class Accounts extends DurableObject<AccountEnv> {
         const value = crypto.getRandomValues(new Uint32Array(1))[0] % 1000000; const code = value.toString().padStart(6, "0"); const salt = random();
         const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 12000);
         let response: Response;
-        try { response = await fetch("https://api.resend.com/emails", { method: "POST", signal: controller.signal, headers: { Authorization: `Bearer ${this.env.RESEND_API_KEY}`, "Content-Type": "application/json" }, body: JSON.stringify({ from: this.env.MAIL_FROM, to: [email], subject: "你的紫金花登录验证码", text: `你的登录验证码是 ${code}，10 分钟内有效。请勿向他人提供验证码。如果不是你发起的登录，请忽略这封邮件。` }) }); }
+        try { response = await fetch("https://api.resend.com/emails", { method: "POST", signal: controller.signal, headers: { Authorization: `Bearer ${this.env.RESEND_API_KEY}`, "Content-Type": "application/json" }, body: JSON.stringify({ from: this.env.MAIL_FROM, to: [email], subject: "你的生花登录验证码", text: `你的登录验证码是 ${code}，10 分钟内有效。请勿向他人提供验证码。如果不是你发起的登录，请忽略这封邮件。` }) }); }
         catch { return json({ message: "邮件暂时未能发送，请稍后重试" }, 502); }
         finally { clearTimeout(timer); }
         if (!response.ok) return json({ message: "邮件暂时未能发送，请稍后重试" }, 502);
