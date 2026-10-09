@@ -1,3 +1,4 @@
+import { ApplicationShareError, applicationSelection, resolveApplicationShare, applicationShareQuery, type ApplicationLink } from "./applicationSharing";
 import { getMany } from "./storageBatch";
 import { sendLive, sendAccountLive } from "./live";
 import { sharedLinkActions, sharedLinkStyles } from "./sharedLinks";
@@ -21,15 +22,6 @@ type Media = {
   url: string;
   createdAt: number;
   postId?: string;
-};
-type ApplicationLink = {
-  iconUrl?: string;
-  icon?: { sha256: string; bytes: number; format: "svg" };
-  appId: string;
-  releaseId: string;
-  title: string;
-  summary: string;
-  accent: string;
 };
 type Post = {
   applicationDiscussion?: boolean;
@@ -1032,7 +1024,7 @@ export class Posts extends DurableObject<Env> {
       imageIds?: unknown;
       requestId?: unknown;
       content?: unknown;
-      application?: { appId?: unknown; releaseId?: unknown };
+      application?: unknown;
     };
     try {
       input = JSON.parse(
@@ -1060,16 +1052,8 @@ export class Posts extends DurableObject<Env> {
         error instanceof Error ? error.message : "HTML 内容无效"
       );
     }
-    const selection = input.application;
-    if (
-      selection != null &&
-      (typeof selection !== "object" ||
-        typeof selection.appId !== "string" ||
-        !/^[a-z][a-z0-9-]{0,63}$/.test(selection.appId) ||
-        typeof selection.releaseId !== "string" ||
-        !/^[a-f0-9]{64}$/.test(selection.releaseId))
-    )
-      throw new InputError("附带应用无效");
+    let selection;
+    try { selection = applicationSelection(input.application); } catch (error) { if (error instanceof ApplicationShareError) throw new InputError(error.message, error.status); throw error; }
     if (
       Array.from(body).length > 2000 ||
       !Array.isArray(ids) ||
@@ -1091,6 +1075,7 @@ export class Posts extends DurableObject<Env> {
               application: {
                 appId: selection.appId,
                 releaseId: selection.releaseId,
+                ...(selection.params ? { params: selection.params } : {}),
               },
             }
           : {}),
@@ -1110,36 +1095,7 @@ export class Posts extends DurableObject<Env> {
     await this.rate(user.id, "publish", 5);
     let application: ApplicationLink | undefined;
     if (selection) {
-      const response = await this.env.WORKSHOP.getByName("dynamic").fetch(
-        new Request(
-          `https://workshop.internal/v1/market?appId=${selection.appId}`
-        )
-      );
-      if (!response.ok) throw new InputError("应用市场暂时不可用，请重试", 503);
-      const result = (await response.json()) as {
-        applications: Array<{
-          authorId: string | null;
-          title?: string;
-          summary?: string;
-          manifest: Pick<ApplicationLink, "appId" | "releaseId" | "accent"> & { appName: string; description: string };
-        }>;
-      };
-      const entry = result.applications[0];
-      if (!entry || entry.authorId !== user.id)
-        throw new InputError("只能附带自己已上架的应用", 403);
-      if (entry.manifest.releaseId !== selection.releaseId)
-        throw new InputError("公开版本已变化，请重新选择应用", 409);
-      application = {
-        iconUrl: (entry as { iconUrl?: string }).iconUrl,
-        icon: (entry.manifest as { icon?: ApplicationLink["icon"] }).icon,
-        appId: entry.manifest.appId,
-        releaseId: entry.manifest.releaseId,
-        title: (entry.title || entry.manifest.appName).slice(0, 60),
-        summary: (entry.summary ?? entry.manifest.description ?? "").slice(0, 300),
-        accent: /^#[a-f0-9]{6}$/i.test(entry.manifest.accent)
-          ? entry.manifest.accent
-          : "#A77C45",
-      };
+      try { application = await resolveApplicationShare(this.env, selection); } catch (error) { if (error instanceof ApplicationShareError) throw new InputError(error.message, error.status); throw error; }
     }
     const media = await Promise.all(
       ids.map((id) => this.ctx.storage.get<Media>(`media:${id}`))
@@ -1295,7 +1251,7 @@ export async function readSharedPost(request: Request, env: Env) {
   const app = post?.application
     ? `<section><h2>应用 · ${escape(post.application.title)}</h2><p>${escape(
         post.application.summary
-      )}</p><p class="date"><a href="/applications/${escape(post.application.appId)}">查看作品详情</a></p></section>`
+      )}</p><p class="date"><a href="/applications/${escape(post.application.appId)}${escape(applicationShareQuery(post.application.params))}">打开应用</a></p></section>`
     : "";
   const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(
     post ? post.author.name + "的动态" : "动态不存在"

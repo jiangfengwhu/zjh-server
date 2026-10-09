@@ -59,3 +59,44 @@ test('progress output cache isolates rounds and avoids repeat history traversal'
 
 test('discovery social outage still returns published applications and 50-item batch respects storage limits',async()=>{const f=fixture();try{for(let n=0;n<50;n++)await f.workshopCtx.storage.put('shared:app-'+n,market('app-'+n));let response=await f.call('/v1/discovery?limit=50',true);let page=await response.json();assert.equal(page.applications.length,50);assert.ok(page.applications.every(item=>item.discussion));f.env.POSTS.getByName=()=>({fetch:async()=>new Response('unavailable',{status:503})});response=await f.call('/v1/discovery',true);page=await response.json();assert.equal(response.status,200);assert.equal(page.applications.length,24);assert.equal(page.applications[0].discussion,undefined)}finally{await f.workshopCtx.flush();await f.postsCtx.flush();f.close()}});
 test('message incremental pages are pair-scoped and GET does not mark them read',async()=>{const f=fixture();try{const pair=[alice,bob].sort().join(':');for(let n=0;n<55;n++){const id=String(n+1).padStart(64,'0'),message={id,senderId:bob,body:'message '+n,createdAt:100+n},key='dm:'+pair+':'+String(100+n).padStart(13,'0')+':'+id;await f.postsCtx.storage.put({[key]:message,['dm-id:'+pair+':'+id]:key})}await f.postsCtx.storage.put('dm-unread:'+alice,55);const after=String(1).padStart(64,'0');let page=await(await f.call('/v1/messages/'+bob+'?after='+after,true)).json();assert.equal(page.messages.length,50);assert.equal(page.messages[0].createdAt,101);assert.equal(page.hasMoreNew,true);assert.equal(await f.postsCtx.storage.get('dm-unread:'+alice),55);page=await(await f.call('/v1/messages/'+bob+'?after='+page.messages.at(-1).id,true)).json();assert.equal(page.messages.length,4);assert.equal(page.hasMoreNew,false);assert.equal((await f.call('/v1/messages/33333333-3333-4333-8333-333333333333?after='+after,true)).status,404)}finally{await f.postsCtx.flush();f.close()}});
+
+
+test('community can attach another authors public application with immutable entry params',async()=>{
+ const f=fixture();try{
+  await f.workshopCtx.storage.put('shared:app-share',market('app-share'));
+  const selection={appId:'app-share',releaseId:'b'.repeat(64),params:{room:'房间 😺',level:3}};
+  const publish=(application=selection,requestId='share-post-000001',auth=true)=>f.posts.fetch(new Request('https://test/v1/posts',{method:'POST',headers:{...(auth?headers:{}),'Content-Type':'application/json'},body:JSON.stringify({body:'',imageIds:[],requestId,application})}));
+  let response=await publish();assert.equal(response.status,201);const first=await response.json();
+  assert.equal(first.post.author.id,alice);assert.equal(first.post.application.author.id,bob);assert.deepEqual(first.post.application.params,selection.params);
+  response=await publish();assert.equal(response.status,200);assert.equal((await response.json()).post.id,first.post.id);
+  assert.equal((await publish({...selection,params:{level:4}})).status,409);
+  assert.equal((await publish(selection,'share-post-000002',false)).status,401);
+  assert.equal((await publish({...selection,appId:'app-private'},'share-post-000003')).status,404);
+  assert.equal((await publish({...selection,releaseId:'c'.repeat(64)},'share-post-000004')).status,409);
+  assert.equal((await publish({...selection,params:{text:'😺'.repeat(1024)}},'share-post-000005')).status,400);
+ }finally{await f.workshopCtx.flush();await f.postsCtx.flush();f.close()}
+});
+test('friend cards preserve params, reject private applications and retry without duplicate messages',async()=>{
+ const f=fixture();try{
+  await f.workshopCtx.storage.put('shared:app-share',market('app-share'));
+  const selection={appId:'app-share',releaseId:'b'.repeat(64),params:{level:5}};
+  const send=(application=selection,requestId='share-message-00001',auth=true)=>f.posts.fetch(new Request('https://test/v1/messages/'+bob,{method:'POST',headers:{...(auth?headers:{}),'Content-Type':'application/json'},body:JSON.stringify({body:'',requestId,application})}));
+  let response=await send();assert.equal(response.status,201);const first=await response.json();assert.deepEqual(first.message.application.params,selection.params);assert.equal(first.message.application.author.id,bob);
+  response=await send();assert.equal(response.status,200);assert.equal((await response.json()).message.id,first.message.id);assert.equal(await f.postsCtx.storage.get('dm-unread:'+bob),1);
+  assert.equal((await send({...selection,params:{level:6}})).status,409);
+  assert.equal((await send(selection,'share-message-00002',false)).status,401);
+  assert.equal((await send({...selection,appId:'app-private'},'share-message-00003')).status,404);
+  const page=await(await f.call('/v1/messages/'+bob,true)).json();assert.deepEqual(page.messages[0].application.params,selection.params);
+  // Retries of an already accepted card still work after withdrawal.
+  f.env.WORKSHOP.getByName=()=>({fetch:async()=>Response.json({applications:[]})});assert.equal((await send()).status,200);
+ }finally{await f.workshopCtx.flush();await f.postsCtx.flush();f.close()}
+});
+test('public landing page preserves params in Android intent and browser fallback',async()=>{
+ const f=fixture();try{
+  await f.workshopCtx.storage.put('shared:app-share',market('app-share'));
+  const params=encodeURIComponent(JSON.stringify({item:"O'Brien 中文 😺",room:'x&y#z'}));
+  const response=await f.call('/applications/app-share?p='+params);assert.equal(response.status,200);const html=await response.text();
+  assert.ok(html.includes('intent://applications/app-share?p='));assert.ok(html.includes('browser_fallback_url=https%3A%2F%2Fzijinhua.297782.xyz%2Fapplications%2Fapp-share%3Fp%3D'));
+  assert.ok(html.includes('%27'));assert.equal((await f.call('/applications/app-share?p=null')).status,400);assert.equal((await f.call('/applications/app-share?p=%7B%7D&p=%7B%7D')).status,400);
+ }finally{await f.workshopCtx.flush();await f.postsCtx.flush();f.close()}
+});
