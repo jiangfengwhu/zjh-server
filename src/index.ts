@@ -58,7 +58,7 @@ export default {
       if (request.method === "PUT" && /^\/v1\/market-icon\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "PUT" && /^\/v1\/market-media\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if ((request.method === "GET" || request.method === "HEAD") && /^\/v1\/avatars\/[a-f0-9-]{36}\/[a-f0-9]{64}$/.test(url.pathname)) return readAvatar(request, env);
-      if (request.method === "PUT" && url.pathname === "/v1/catalog") return env.WORKSHOP.getByName("dynamic").fetch(request);
+      if (url.pathname === "/v1/maintenance-sdk-migration" || request.method === "PUT" && url.pathname === "/v1/catalog") return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "PUT" && /^\/v1\/application-blobs\/[a-z][a-z0-9-]{0,63}\/[a-f0-9]{64}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && /^\/v1\/application-publisher\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && /^\/v1\/application-download\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
@@ -288,6 +288,60 @@ type SourceProof = { commit: string; branch: string; tree?: string; applicationT
 type MarketEntry = { downloadCount?: number; iconUrl?: string; manifest: ApplicationRelease; title: string; summary: string; category?: string; screenshots?: string[]; publishedAt?: number; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null; sourceCommit?: string; sourceBranch?: string };
 
 export class Workshop extends DurableObject<Env> {
+  private async migrateSdk(request: Request): Promise<Response> {
+    if (request.method !== "POST" || !await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN)) return json({ error: "unauthorized" }, 403);
+    const { dryRun } = await request.json() as { dryRun?: boolean };
+    return this.ctx.blockConcurrencyWhile(async () => {
+      let manifests = 0;
+      const migrate = (value: any): boolean => {
+        if (!value || typeof value !== "object") return false;
+        let changed = false;
+        if (typeof value.appId === "string" && typeof value.releaseId === "string" && value.bundle && value.modules && value.requires?.sdk !== undefined) {
+          if (!/^\d+\.\d+\.\d+$/.test(value.requires.sdk) || value.sdk !== undefined && value.sdk !== value.requires.sdk) throw new Error("SDK migration conflict");
+          value.sdk = value.requires.sdk; delete value.requires; manifests++; changed = true;
+        }
+        for (const child of Object.values(value)) changed = migrate(child) || changed;
+        return changed;
+      };
+      const durable: Array<{ key: string; before: unknown; after: unknown }> = [];
+      let startAfter: string | undefined;
+      do {
+        const page = await this.ctx.storage.list({ startAfter, limit: 128 });
+        for (const [key, before] of page) {
+          if (key.startsWith("sdk-migration-backup:")) continue;
+          const after = structuredClone(before);
+          if (migrate(after)) durable.push({ key, before, after });
+        }
+        startAfter = page.size === 128 ? [...page.keys()].at(-1) : undefined;
+      } while (startAfter);
+      const catalog: Array<{ key: string; before: string; after: string; expiration?: number }> = [];
+      let cursor: string | undefined;
+      do {
+        const page = await this.env.CATALOG.list({ prefix: "v1/applications/", cursor, limit: 128 });
+        for (const item of page.keys) {
+          const before = await this.env.CATALOG.get(item.name);
+          if (!before) continue;
+          const value = JSON.parse(before);
+          if (migrate(value)) catalog.push({ key: item.name, before, after: JSON.stringify(value), expiration: item.expiration });
+        }
+        cursor = page.list_complete ? undefined : page.cursor;
+      } while (cursor);
+      if (!dryRun) {
+        // Retain original records before changing metadata; release IDs and all pointers stay stable.
+        for (const record of catalog) {
+          await this.ctx.storage.put(`sdk-migration-backup:kv:${record.key}`, record.before);
+          await this.env.CATALOG.put(record.key, record.after, record.expiration ? { expiration: record.expiration } : undefined);
+        }
+        await this.ctx.storage.transaction(async storage => {
+          for (const record of durable) {
+            await storage.put(`sdk-migration-backup:do:${record.key}`, record.before);
+            await storage.put(record.key, record.after);
+          }
+        });
+      }
+      return json({ dryRun: !!dryRun, manifests, durableRecords: durable.length, catalogRecords: catalog.length }, 200);
+    });
+  }
   private marketIndex = new MarketIndex(this.ctx);
   async canUseCloud(appId: string, userId: string): Promise<boolean> {
     if (this.resetting || !/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return false;
@@ -400,6 +454,7 @@ export class Workshop extends DurableObject<Env> {
   private writes = new Set<Promise<Response>>();
   async fetch(request: Request): Promise<Response> {
     await this.marketIndex.ensure();
+    if (new URL(request.url).pathname === "/v1/maintenance-sdk-migration") return this.migrateSdk(request);
     if (new URL(request.url).pathname === "/v1/development-reset") return this.reset(request);
     if (this.resetting) return json({ message: "开发数据正在重置，请稍后重试" }, 503);
     const path = new URL(request.url).pathname;
