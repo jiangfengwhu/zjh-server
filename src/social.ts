@@ -3,7 +3,8 @@ import { sendAccountLive } from "./live";
 import { publicProfiles, type User } from "./accounts";
 
 type Author = Pick<User, "id" | "name" | "avatarUrl">;
-type Message = { application?: ApplicationLink; id: string; senderId: string; body: string; createdAt: number };
+type SharedPost = { id: string; body: string; author: Author; imageUrl?: string };
+type Message = { post?: SharedPost; application?: ApplicationLink; id: string; senderId: string; body: string; createdAt: number };
 type Conversation = { peerId: string; lastMessage: Message; unreadCount: number; readThrough?: string };
 export class SocialError extends Error {
   constructor(message: string, readonly status = 400) { super(message); }
@@ -131,16 +132,25 @@ export class SocialInbox {
   }
   private async send(request: Request, user: User, peer: Author) {
     const input = await inputOf(request);
-    if (typeof input.body !== "string" || !input.body.trim() && !input.application || Array.from(input.body.trim()).length > 2000) throw new SocialError("请输入 1 到 2000 字的私信");
+    if (typeof input.body !== "string" || !input.body.trim() && !input.application && !input.postId || Array.from(input.body.trim()).length > 2000) throw new SocialError("请输入 1 到 2000 字的私信");
     if (typeof input.requestId !== "string" || !/^[a-zA-Z0-9-]{12,100}$/.test(input.requestId)) throw new SocialError("发送标识无效");
     const body = input.body.trim(), pair = pairKey(user.id, peer.id);
     const id = await digest(`${user.id}:${peer.id}:${input.requestId}`);
     let selection, application: ApplicationLink | undefined;
     const requestKey = `dm-request:${user.id}:${peer.id}:${input.requestId}`;
     try { selection = applicationSelection(input.application); } catch (error) { if (error instanceof ApplicationShareError) throw new SocialError(error.message, error.status); throw error; }
-    const matches = (prior: Message) => prior.body === body && JSON.stringify(applicationSelection(prior.application)) === JSON.stringify(selection);
+    const postId = input.postId;
+    if (postId !== undefined && (typeof postId !== "string" || !/^[a-f0-9]{64}$/.test(postId) || selection)) throw new SocialError("动态分享无效");
+    let post: SharedPost | undefined;
+    const matches = (prior: Message) => prior.post?.id === postId && prior.body === body && JSON.stringify(applicationSelection(prior.application)) === JSON.stringify(selection);
     const existing = await this.ctx.storage.get<Message>(requestKey);
     if (existing) { if (!matches(existing)) throw new SocialError("发送内容已改变，请重新发送", 409); return json({ message: existing }); }
+    if (postId) {
+      const key = await this.ctx.storage.get<string>(`id:${postId}`);
+      const source = key ? await this.ctx.storage.get<SharedPost & { applicationDiscussion?: boolean; content?: unknown; images?: Array<{ url: string }> }>(key) : undefined;
+      if (!source || source.applicationDiscussion) throw new SocialError("动态已删除或不可分享", 404);
+      post = { id: source.id, author: source.author, body: (source.body || (source.content ? "HTML 动态" : "分享动态")).slice(0, 200), imageUrl: source.images?.[0]?.url };
+    }
     if (selection) { try { application = await resolveApplicationShare(this.env, selection); } catch (error) { if (error instanceof ApplicationShareError) throw new SocialError(error.message, error.status); throw error; } }
     const result = await this.ctx.storage.transaction(async storage => {
       const requestKey = `dm-request:${user.id}:${peer.id}:${input.requestId}`;
@@ -154,7 +164,7 @@ export class SocialInbox {
       const sender = senderKey ? await storage.get<Conversation>(senderKey) : undefined;
       const recipientKey = await storage.get<string>(`inbox-id:${peer.id}:${user.id}`);
       const recipient = recipientKey ? await storage.get<Conversation>(recipientKey) : undefined;
-      const message: Message = { ...(application ? { application } : {}), id, senderId: user.id, body, createdAt: Math.max(Date.now(), (sender?.lastMessage.createdAt ?? 0) + 1) };
+      const message: Message = { ...(post ? { post } : {}), ...(application ? { application } : {}), id, senderId: user.id, body, createdAt: Math.max(Date.now(), (sender?.lastMessage.createdAt ?? 0) + 1) };
       const key = messageKey(pair, message);
       await storage.put(key, message);
       await storage.put(`dm-id:${pair}:${id}`, key);

@@ -100,3 +100,15 @@ test('public landing page preserves params in Android intent and browser fallbac
   assert.ok(html.includes('%27'));assert.equal((await f.call('/applications/app-share?p=null')).status,400);assert.equal((await f.call('/applications/app-share?p=%7B%7D&p=%7B%7D')).status,400);
  }finally{await f.workshopCtx.flush();await f.postsCtx.flush();f.close()}
 });
+
+test('post friend shares use canonical snapshots and idempotent authenticated sends',async()=>{
+ const f=fixture();try{
+  const created=await f.posts.fetch(new Request('https://test/v1/posts',{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({body:'真实动态',imageIds:[],requestId:'post-create-000001'})}));
+  assert.equal(created.status,201);const {post}=await created.json();
+  const send=(postId=post.id,requestId='post-message-00001',auth=true)=>f.posts.fetch(new Request('https://test/v1/messages/'+bob,{method:'POST',headers:{...(auth?headers:{}),'Content-Type':'application/json'},body:JSON.stringify({body:'',requestId,postId,post:{body:'伪造'}})}));
+  let response=await send();assert.equal(response.status,201);const first=await response.json();assert.equal(first.message.post.body,'真实动态');assert.equal(first.message.post.author.id,alice);
+  response=await send();assert.equal(response.status,200);assert.equal((await response.json()).message.id,first.message.id);assert.equal(await f.postsCtx.storage.get('dm-unread:'+bob),1);
+  assert.equal((await send('c'.repeat(64))).status,409);assert.equal((await send(post.id,'post-message-00002',false)).status,401);assert.equal((await send('c'.repeat(64),'post-message-00003')).status,404);
+  const key=await f.postsCtx.storage.get('id:'+post.id);await f.postsCtx.storage.delete(key);assert.equal((await send()).status,200);assert.equal((await send(post.id,'post-message-00004')).status,404);
+ }finally{await f.postsCtx.flush();f.close()}
+});
