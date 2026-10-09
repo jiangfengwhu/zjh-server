@@ -1,12 +1,14 @@
 import { DurableObject } from "cloudflare:workers";
 import { Buffer } from "node:buffer";
 import { authenticatedUser } from "./accounts";
+import { RoomConnections } from "./applicationRooms";
+import { FileRecords } from "./applicationFiles";
 
-type Scope = "private" | "public";
+type Scope = "private" | "public" | "room";
 type Scalar = string | number | boolean | null;
 type Document = { id: string; data: Record<string, unknown>; createdBy: string; createdAt: number; updatedAt: number; version: number };
 type Row = { id: string; data: string; created_by: string; created_at: number; updated_at: number; version: number; bytes: number };
-type Envelope = { appId: string; userId: string; scope: Scope; collection: string; input: Record<string, unknown> };
+type Envelope = { appId: string; userId: string; scope: Scope; collection: string; input: Record<string, unknown>; roomId?: string };
 const identifier = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const fieldIdentifier = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
 const recordId = /^[a-f0-9-]{36}$/;
@@ -88,11 +90,13 @@ export class ApplicationDatabase extends DurableObject<Env> {
   }
   async fetch(request: Request): Promise<Response> {
     try {
+      if (new URL(request.url).pathname === "/room") return new RoomConnections(this.ctx).connect(request);
       const envelope = await request.json() as Envelope;
-      if (!envelope || !/^[a-z][a-z0-9-]{0,63}$/.test(envelope.appId) || !recordId.test(envelope.userId) || !["private", "public"].includes(envelope.scope) || !identifier.test(envelope.collection) || !object(envelope.input)) invalid();
+      if (envelope?.scope === "room" && !identifier.test(envelope.roomId ?? "")) invalid("房间编号无效");
+      if (!envelope || !/^[a-z][a-z0-9-]{0,63}$/.test(envelope.appId) || !recordId.test(envelope.userId) || !["private", "public", "room"].includes(envelope.scope) || !identifier.test(envelope.collection) || !object(envelope.input)) invalid();
       const now = Date.now();
       this.ctx.storage.transactionSync(() => {
-        const tenant = envelope.scope === "private" ? `user:${envelope.userId}` : `app:${envelope.appId}`;
+        const tenant = envelope.scope === "private" ? `user:${envelope.userId}` : envelope.scope === "room" && identifier.test(envelope.roomId ?? "") ? `room:${envelope.appId}:${envelope.roomId}` : `app:${envelope.appId}`;
         const identity = this.ctx.storage.sql.exec<{ tenant: string }>("SELECT tenant FROM identity WHERE id=1").toArray()[0];
         if (identity && identity.tenant !== tenant) throw new DataError("FORBIDDEN", "数据空间不匹配", 403);
         this.ctx.storage.sql.exec("INSERT OR IGNORE INTO identity VALUES(1,?)", tenant);
@@ -103,6 +107,7 @@ export class ApplicationDatabase extends DurableObject<Env> {
         if (!await this.ctx.storage.getAlarm()) await this.ctx.storage.setAlarm(now + 3600000);
       })());
       const result = this.ctx.storage.transactionSync(() => this.execute(envelope, now));
+      if (envelope.scope === "room" && ["create", "update", "increment", "remove"].includes(String(envelope.input.operation))) new RoomConnections(this.ctx).changed(envelope.collection);
       return json({ result });
     } catch (error) {
       if (error instanceof DataError) return json({ code: error.code, message: error.message }, error.status);
@@ -110,10 +115,28 @@ export class ApplicationDatabase extends DurableObject<Env> {
       return json({ code: "UNAVAILABLE", message: "云数据操作暂不可用" }, 503);
     }
   }
+  async cloudGate(userId: string): Promise<boolean> {
+    try {
+      this.ctx.storage.transactionSync(() => {
+        const tenant = `user:${userId}`;
+        const row = this.ctx.storage.sql.exec<{ tenant: string }>("SELECT tenant FROM identity WHERE id=1").toArray()[0];
+        if (!recordId.test(userId) || row && row.tenant !== tenant) throw new Error("Tenant mismatch");
+        this.ctx.storage.sql.exec("INSERT OR IGNORE INTO identity VALUES(1,?)", tenant);
+        this.rate(userId, Date.now());
+      });
+      if (!await this.ctx.storage.getAlarm()) await this.ctx.storage.setAlarm(Date.now() + 3600000);
+      return true;
+    } catch { return false; }
+  }
+  async fileOperation(operation: string, userId: string, appId: string, input: Record<string, unknown>) { return new FileRecords(this.ctx, this.env).operation(operation, userId, appId, input); }
+  webSocketMessage(socket: WebSocket, message: string | ArrayBuffer) { new RoomConnections(this.ctx).message(socket, message); }
+  webSocketClose(socket: WebSocket) { new RoomConnections(this.ctx).closed(socket); }
+  webSocketError(socket: WebSocket) { new RoomConnections(this.ctx).closed(socket); }
   async alarm() {
     this.ctx.storage.sql.exec("DELETE FROM requests WHERE expires_at<=?", Date.now());
     this.ctx.storage.sql.exec("DELETE FROM rate WHERE window<?", Math.floor(Date.now() / 60000) - 1);
-    if (this.ctx.storage.sql.exec("SELECT 1 FROM requests LIMIT 1").toArray().length) await this.ctx.storage.setAlarm(Date.now() + 3600000);
+    const pendingFiles = await new FileRecords(this.ctx, this.env).cleanup();
+    if (pendingFiles || this.ctx.storage.sql.exec("SELECT 1 FROM requests LIMIT 1").toArray().length) await this.ctx.storage.setAlarm(Date.now() + 3600000);
   }
   private rate(userId: string, now: number) {
     const window = Math.floor(now / 60000);
@@ -125,7 +148,7 @@ export class ApplicationDatabase extends DurableObject<Env> {
     const { appId, userId, collection, input } = e;
     const op = input.operation;
     if (op === "list") return this.list(e);
-    if (!["get", "create", "update", "remove"].includes(String(op))) invalid("操作类型无效");
+    if (!["get", "create", "update", "increment", "remove"].includes(String(op))) invalid("操作类型无效");
     if (op !== "create" && (typeof input.id !== "string" || !recordId.test(input.id))) invalid("记录 ID 无效");
     const row = op === "create" ? undefined : this.ctx.storage.sql.exec<Row>("SELECT * FROM records WHERE app_id=? AND collection=? AND id=?", appId, collection, input.id as string).toArray()[0];
     if (op === "get") return row ? record(row) : null;
@@ -139,8 +162,8 @@ export class ApplicationDatabase extends DurableObject<Env> {
     }
     this.ctx.storage.sql.exec("DELETE FROM requests WHERE expires_at<=?", now);
     if (Number(this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM requests").one().count) >= 2000) throw new DataError("RATE_LIMITED", "写入过于频繁，请稍后再试", 429);
-    if (row && row.created_by !== userId) throw new DataError("FORBIDDEN", "只能修改自己创建的记录", 403);
-    if (!row && op === "update") throw new DataError("NOT_FOUND", "记录不存在", 404);
+    if (row && e.scope !== "room" && row.created_by !== userId) throw new DataError("FORBIDDEN", "只能修改自己创建的记录", 403);
+    if (!row && ["update", "increment"].includes(String(op))) throw new DataError("NOT_FOUND", "记录不存在", 404);
     if (input.expectedVersion !== undefined && row?.version !== input.expectedVersion) throw new DataError("CONFLICT", "记录已发生变化，请重新加载", 409);
     let result: Document | null = null;
     if (op === "remove") {
@@ -150,7 +173,18 @@ export class ApplicationDatabase extends DurableObject<Env> {
       }
     } else {
       document(input.data);
-      const data = document(op === "create" ? input.data : { ...JSON.parse(row!.data), ...(input.data as object) });
+      let patch = input.data as Record<string, unknown>;
+      if (op === "increment") {
+        patch = { ...JSON.parse(row!.data) };
+        const amounts = input.data as Record<string, unknown>;
+        if (!Object.keys(amounts).length || Object.keys(amounts).length > 32) invalid("计数字段数量无效");
+        for (const [field, amount] of Object.entries(amounts)) {
+          const current = Object.hasOwn(patch, field) ? patch[field] : 0;
+          if (!fieldIdentifier.test(field) || typeof amount !== "number" || !Number.isFinite(amount) || typeof current !== "number" || !Number.isFinite(current + amount)) invalid("只能累加有限数值字段");
+          Object.defineProperty(patch, field, { value: current + amount, enumerable: true, configurable: true, writable: true });
+        }
+      }
+      const data = document(op === "create" ? input.data : { ...JSON.parse(row!.data), ...patch });
       const bytes = new TextEncoder().encode(data).length;
       const usage = this.ctx.storage.sql.exec<{ bytes: number; records: number }>("SELECT bytes,records FROM usage WHERE id=1").one();
       if (usage.bytes + bytes - (row?.bytes ?? 0) > maxStorageBytes || !row && usage.records >= 100000) throw new DataError("QUOTA_EXCEEDED", "云存储空间已满", 413);
@@ -159,8 +193,8 @@ export class ApplicationDatabase extends DurableObject<Env> {
         if (count >= 100) throw new DataError("QUOTA_EXCEEDED", "应用集合数量已达上限", 413);
         this.ctx.storage.sql.exec("INSERT INTO collections VALUES(?,?)", appId, collection);
       }
-      result = { id: row?.id ?? crypto.randomUUID(), data: JSON.parse(data), createdBy: userId, createdAt: row?.created_at ?? now, updatedAt: now, version: (row?.version ?? 0) + 1 };
-      this.ctx.storage.sql.exec("INSERT INTO records VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(app_id,collection,id) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at,version=excluded.version,bytes=excluded.bytes", appId, collection, result.id, data, userId, result.createdAt, now, result.version, bytes);
+      result = { id: row?.id ?? crypto.randomUUID(), data: JSON.parse(data), createdBy: row?.created_by ?? userId, createdAt: row?.created_at ?? now, updatedAt: now, version: (row?.version ?? 0) + 1 };
+      this.ctx.storage.sql.exec("INSERT INTO records VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(app_id,collection,id) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at,version=excluded.version,bytes=excluded.bytes", appId, collection, result.id, data, result.createdBy, result.createdAt, now, result.version, bytes);
       this.ctx.storage.sql.exec("UPDATE usage SET bytes=bytes+?,records=records+? WHERE id=1", bytes - (row?.bytes ?? 0), row ? 0 : 1);
     }
     this.ctx.storage.sql.exec("INSERT INTO requests VALUES(?,?,?,?,?)", userId, input.requestId, signature, JSON.stringify(result), now + 3600000);

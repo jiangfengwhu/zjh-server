@@ -12,6 +12,8 @@ export { Accounts } from "./accounts";
 export { Posts } from "./posts";
 import { readPostImage, readSharedPost } from "./posts";
 import { applicationData } from "./applicationData";
+import { applicationFiles } from "./applicationFiles";
+import { applicationRooms } from "./applicationRooms";
 export { ApplicationDatabase } from "./applicationData";
 
 /** 清单类的键：整套清单和 vendor 的模块编号表。格式变了就换前缀（v3/…），旧版本的手机继续读旧前缀。 */
@@ -34,6 +36,8 @@ export default {
     try {
       const page = await pageBff(request, env);
       if (page) return page;
+      if (url.pathname.startsWith("/v1/app-files/")) return applicationFiles(request, env);
+      if (url.pathname.startsWith("/v1/app-rooms/")) return applicationRooms(request, env);
       if (url.pathname.startsWith("/v1/app-data/")) return applicationData(request, env);
       if (["GET", "HEAD"].includes(request.method) && url.pathname === "/.well-known/assetlinks.json") return androidAssetLinks();
       if (["GET", "HEAD"].includes(request.method) && url.pathname === "/download") return downloadLatestApk(env);

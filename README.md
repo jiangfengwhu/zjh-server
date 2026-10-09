@@ -30,12 +30,19 @@ APP_DATA 使用 SQLite Durable Objects。私有实例按 userId 分配，内部�
 
 更新及卸载应用不删除云数据。现有 development-reset 仅清理其原有范围，不删除独立 APP_DATA 业务库。业务数据不进入日志；账号 Token 不提供给 plugin。安全回归检查：`node --test tests/applicationData.test.mjs`，使用本地 SQLite，不访问线上数据。
 
+云文件复用 BLOBS 与用户 APP_DATA 实例，对象键包含 appId、ownerId 和文件 ID，避免账号间覆盖；每文件最大 10 MB，每账号每应用最大 100 MB、1000 个文件。公开文件返回 CDN URL；私有文件使用每文件独立 AES-GCM 密钥加密后存入同一公开桶，密钥只存在用户实例内，鉴权下载时解密，不向客户端返回密钥。未完成上传的预约由已有 alarm 回收。GET/DELETE 文件接口仅访问当前用户文件；公开分享使用返回的 URL。
+
+实时房间复用 APP_DATA，按 `room:<appId>:<roomId>` 分配实例，无新增生产绑定或迁移。入口先校验登录和应用访问，再通过用户实例限流。房间编号可分享，持有编号的登录参与者可以协作改删房间集合；不是私有群组的角色权限。集合写入在 SQLite 事务中执行，increment 支持幂等、版本冲突和数值字段原子累加；原 public 集合仍保留创建者写权限。WebSocket 使用休眠 API，身份与限流信息放在 attachment，序列保存在 SQLite；五分钟后重新鉴权，单房间最大 64 条连接，每账号最大 4 条。事件最大 16 KB，每连接每分钟 120 次，只实时广播，不提供离线重放。集合变动仅推送失效通知，重连后客户端重新读取快照。
+
 ## 接口边界
 
 | 接口 | 职责 |
 | --- | --- |
 | /v1/auth/*、/v1/account | 登录与资料，账号凭证由宿主保管 |
-| POST /v1/app-data/<appId>/<private\|public>/<collection> | 登录用户的应用云数据；JSON body 的 operation 为 create/get/list/update/remove |
+| POST /v1/app-data/<appId>/<private\|public>/<collection> | 登录用户的应用云数据；JSON body 的 operation 为 create/get/list/update/increment/remove |
+| /v1/app-files/<appId>/<id>、GET .../content | 账号鉴权的文件上传、元数据、删除与下载 |
+| GET /v1/app-rooms/<appId>/<roomId>/live | 鉴权的实时房间 WebSocket |
+| POST /v1/app-rooms/<appId>/<roomId>/data/<collection> | 房间共享集合，支持 CRUD、原子计数与版本冲突 |
 | GET /v1/application-bookmarks | 当前账号的常用应用分页，复用作品收藏记录，游标为本账号收藏项标识 |
 | /v1/posts、/v1/notifications、/v1/profiles | 动态、互动、公开身份及关注／粉丝分页 |
 | /v1/messages、/v1/messages/<用户 ID> | 私信会话、文字发送与历史；登录鉴权、幂等发送 |
