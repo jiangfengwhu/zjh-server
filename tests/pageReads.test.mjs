@@ -23,6 +23,31 @@ function context(){
 }
 function fixture(){const workshopCtx=context(),postsCtx=context();const env={ACCOUNTS:{getByName:()=>({fetch:async req=>{if(new URL(req.url).pathname==='/internal/profiles'){const {ids}=await req.json();return Response.json({profiles:ids.map(id=>({id,name:id===alice?'Alice':'Bob',avatarUrl:null}))});}return Response.json(req.headers.get('Authorization')==='Bearer '+token?{user:{id:alice,name:'Alice',avatarUrl:null}}:{},{status:req.headers.get('Authorization')==='Bearer '+token?200:401})}})},CATALOG:{get:async()=>null},BLOBS:{},WORKSHOP:{getByName:()=>workshop},POSTS:{getByName:()=>posts}};const workshop=new Workshop(workshopCtx,env),posts=new Posts(postsCtx,env);return {env,workshop,posts,workshopCtx,postsCtx,call:(path,auth=false)=>worker.fetch(new Request('https://test'+path,{headers:auth?headers:{}}),env),close(){workshopCtx.close();postsCtx.close()}};}
 const market=(id,title='离谱鉴宝',at=100,author=bob)=>({manifest:{appId:id,releaseId:'b'.repeat(64),appName:title,description:'简介',accent:'#fff',source:{commit:'c'.repeat(40),dirty:false}},title,summary:'AI 萌星物语 😺',authorId:author,authorName:'Bob',publishedAt:at,category:'other'});
+
+test('batch notification reads are idempotent, account-scoped and exclude later arrivals',async()=>{
+ const f=fixture();try{
+  const ids=[1,2,3,4].map(n=>String(n).padStart(64,'0'));
+  const keys=ids.map(id=>'notice:'+alice+':0000000000001:'+id);
+  for(let i=0;i<ids.length;i++)await f.postsCtx.storage.put({[keys[i]]:{id:ids[i],kind:i===0?'work-ready':'like',read:i===2,createdAt:i===3?Date.now()+60000:1},['notice-id:'+alice+':'+ids[i]]:keys[i]});
+  const foreign='notice:'+bob+':0000000000001:'+ids[0];await f.postsCtx.storage.put({[foreign]:{kind:'like',read:false,createdAt:1},['notice-id:'+alice+':'+String(5).padStart(64,'0')]:foreign});
+  await f.postsCtx.storage.put({['notice-unread:'+alice]:3,['notice-unread-categories:'+alice]:{creation:1,interaction:2}});
+  const request=()=>new Request('https://test/v1/notifications/read',{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({ids:[...ids,ids[0],String(5).padStart(64,'0')]})});
+  let result=await(await f.posts.fetch(request())).json();assert.deepEqual(result.unreadByCategory,{creation:0,interaction:1});assert.equal(result.unreadCount,1);
+  assert.equal((await f.postsCtx.storage.get(keys[3])).read,false);assert.equal((await f.postsCtx.storage.get(foreign)).read,false);
+  result=await(await f.posts.fetch(request())).json();assert.equal(result.unreadCount,1);
+ }finally{await f.postsCtx.flush();f.close()}
+});
+
+test('batch notification records and counters roll back together on write failure',async()=>{
+ const f=fixture();try{
+  const id='1'.repeat(64),key='notice:'+alice+':0000000000001:'+id;
+  await f.postsCtx.storage.put({[key]:{id,kind:'like',read:false,createdAt:1},['notice-id:'+alice+':'+id]:key,['notice-unread:'+alice]:1,['notice-unread-categories:'+alice]:{creation:0,interaction:1}});
+  const original=f.postsCtx.storage.put;f.postsCtx.storage.put=async(key,value)=>{if(typeof key==='object'&&Object.hasOwn(key,'notice-unread:'+alice))throw Error('counter write failure');return original(key,value)};
+  const response=await f.posts.fetch(new Request('https://test/v1/notifications/read',{method:'POST',headers,body:JSON.stringify({ids:[id]})}));assert.equal(response.status,503);
+  assert.equal((await f.postsCtx.storage.get(key)).read,false);assert.equal(await f.postsCtx.storage.get('notice-unread:'+alice),1);
+  assert.deepEqual(await f.postsCtx.storage.get('notice-unread-categories:'+alice),{creation:0,interaction:1});
+ }finally{await f.postsCtx.flush();f.close()}
+});
 test('market migration, Unicode substring, stable cursors, edit and withdrawal',async()=>{const c=context();try{await c.storage.put({'shared:app-a':market('app-a'),'shared:app-b':market('app-b','其他',100),'shared:jolly':market('jolly')});const index=new MarketIndex(c);await index.ensure();assert.equal(index.page({limit:1}).total,2);assert.deepEqual(index.page({query:'萌星',limit:10}).rows.map(r=>r.app_id),['app-a','app-b']);assert.equal(index.page({query:'😺',limit:10}).total,2);assert.equal(index.page({query:'宝 萌',limit:10}).total,0);const first=index.page({limit:1}).rows[0];assert.deepEqual(index.page({after:{at:first.at,id:first.app_id},limit:1}).rows.map(r=>r.app_id),['app-b']);index.put(market('app-a','新版'));assert.equal(index.page({query:'离谱',limit:10}).total,0);index.remove('app-b');assert.equal(index.page({}).total,1);const scans=c.lists();await new MarketIndex(c).ensure();assert.equal(c.lists(),scans)}finally{c.close()}});
 test('canonical KV and SQL updates roll back together',async()=>{const c=context();try{const i=new MarketIndex(c);await i.ensure();await assert.rejects(c.storage.transaction(async st=>{await st.put('shared:app-a',market('app-a'));i.put(market('app-a'));throw Error('abort')}));assert.equal(await c.storage.get('shared:app-a'),undefined);assert.equal(i.page({}).total,0)}finally{c.close()}});
 test('following index finds sparse older authors beyond 5000 posts and respects unfollow',async()=>{const c=context();try{for(let n=0;n<5100;n++)await c.storage.put('post:'+String(n).padStart(13,'0')+':'+String(n).padStart(64,'0'),{author:{id:n===5099?bob:alice}});await c.storage.put('follow:viewer:'+bob,true);const i=new TimelineIndex(c);await i.ensure();const scans=c.lists();assert.equal(i.posts({viewer:'viewer',limit:51}).length,1);assert.equal(i.posts({author:bob,limit:51}).length,1);i.follow('viewer',bob,false);assert.equal(i.posts({viewer:'viewer',limit:51}).length,0);assert.equal(c.lists(),scans);const plan=c.storage.sql.exec('EXPLAIN QUERY PLAN SELECT p.key FROM timeline_read p WHERE p.author_id IN (SELECT author_id FROM timeline_follow WHERE viewer=?) ORDER BY p.key LIMIT 51','viewer').toArray();assert.ok(plan.some(row=>row.detail.includes('timeline_read_author')));const key=i.posts({author:bob,limit:1})[0];i.removePost(key);assert.equal(i.posts({author:bob,limit:1}).length,0)}finally{c.close()}});

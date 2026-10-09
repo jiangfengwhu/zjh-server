@@ -608,23 +608,33 @@ export class Posts extends DurableObject<Env> {
       throw new InputError("通知标识无效");
     const before = Date.now();
     const ids = input.ids as string[] | undefined;
-    const mark = async (keys: string[]) =>
-      this.ctx.storage.transaction(async (storage) => {
-        for (const key of keys) {
-          const notice = await storage.get<Notice>(key);
-          if (notice && !notice.read && notice.createdAt <= before) {
-            await storage.put(key, { ...notice, read: true });
-            await this.changeUnread(storage, user.id, notice.kind, -1);
-          }
+    const mark = async (keys: string[]) => {
+      const changed = await this.ctx.storage.transaction(async (storage) => {
+        const records = keys.length ? await storage.get<Notice>([...new Set(keys)]) : new Map<string, Notice>();
+        const updates: Record<string, Notice> = {};
+        const removed = { creation: 0, interaction: 0 };
+        for (const [key, notice] of records) {
+          if (!key.startsWith(`notice:${user.id}:`) || notice.read || notice.createdAt > before) continue;
+          updates[key] = { ...notice, read: true };
+          removed[notice.kind.startsWith("work-") ? "creation" : "interaction"]++;
         }
+        const count = removed.creation + removed.interaction;
+        if (!count) return false;
+        const totalKey = `notice-unread:${user.id}`, categoryKey = `notice-unread-categories:${user.id}`;
+        const counters = await storage.get<number | { creation: number; interaction: number }>([totalKey, categoryKey]);
+        await storage.put(updates);
+        const values: Record<string, unknown> = { [totalKey]: Math.max(0, ((counters.get(totalKey) as number | undefined) ?? 0) - count) };
+        const categories = counters.get(categoryKey) as { creation: number; interaction: number } | undefined;
+        if (categories) values[categoryKey] = { creation: Math.max(0, categories.creation - removed.creation), interaction: Math.max(0, categories.interaction - removed.interaction) };
+        await storage.put(values);
+        return true;
       });
+      if (changed) this.noticeChanges.add(user.id);
+    };
     if (ids) {
-      const keys = await Promise.all(
-        [...new Set(ids)].map((id) =>
-          this.ctx.storage.get<string>(`notice-id:${user.id}:${id}`)
-        )
-      );
-      await mark(keys.filter((key): key is string => !!key));
+      const indexes = [...new Set(ids)].map(id => `notice-id:${user.id}:${id}`);
+      const keys = indexes.length ? await this.ctx.storage.get<string>(indexes) : new Map<string, string>();
+      await mark([...keys.values()]);
     } else {
       let cursor: string | undefined;
       while (true) {
