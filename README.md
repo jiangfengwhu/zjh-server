@@ -58,7 +58,7 @@ APP_DATA 使用 SQLite Durable Objects。私有实例按 userId 分配，内部�
 
 通知 category=creation/interaction 使用独立分页游标；不传 category 返回全部通知。通知列表、未读查询与标记已读均返回 unreadByCategory（creation/interaction 未读数）；点赞、评论、回复归入互动，重复点赞不生成通知，取消点赞清理对应通知。制作状态携带 submissionId/startedAt，旧轮终态不能覆盖新提交；继续修改的 requestId 绑定账号、应用、会话与正文，成功重试不再次提交。
 
-候选发布必须提供 expectedReleases 原子基线，冲突返回 409；candidate 为权威候选，latest 为私有镜像，不检查应用提交祖先。市场、安装及 APK seed 只消费公开版本；官方身份由服务端生成。
+候选发布必须提供 expectedReleases 原子基线，冲突返回 409；candidate 为权威候选，latest 为私有镜像，不检查应用提交祖先。市场与安装只消费公开版本，APK 只内置宿主 vendor/app 包；官方身份由服务端生成。
 
 任务命令保存应用本轮身份，发布脚本通过 POST /v1/application-publisher/<appId> 自动获取最长 30 分钟的发布授权，期限不超过任务凭据；账号、应用与 publishEpoch 必须一致。同一轮 working/ready 状态允许重复发布，停止或开始新一轮立即使旧授权失效。任务提示明确要求完成开发和清单后再发布，不发布初始化模板。
 
@@ -74,9 +74,7 @@ Jolly 紧凑查询先返回本轮状态，历史在后台预热；尚未确认�
 
 GET /v1/messages/live 以 Authorization 头建立 WebSocket，复用 Posts 的休眠连接。推送 ready/message/read/notification/feed/work 事件；账号事件带递增 version、私信总未读及通知分类数量，作品事件带 appId。正文须通过鉴权接口读取；过期连接在下一次事件时关闭并由客户端重新鉴权连接，不使用定时查询。客户端合并短时事件，仅刷新可见列表，首页新动态由用户点击提示后展示；后台关闭连接，重连补同步。
 
-制作与继续修改每轮从 npm 的 `@zijinhua/app-sdk/latest` 选择稳定版本，任务开头注入安装确切版本的命令。获取失败时不占用额度、不创建制作轮次；原请求重试仍复用已有结果。SDK 更新不合并 plugin main，版本的宿主兼容性由维护者发布 latest 前核对。
-
-任务 SDK 使用 npm latest，大版本必须与线上宿主 release.applications.sdk 一致，完整版本不得高于线上宿主。每次 SDK 发布先更新配套宿主，再发布 npm latest；手机运行时使用实际加载的宿主版本判断兼容。作品清单 sdk 记录实际 SDK 包版本，不接受旧 requires 字段，不维护独立的最低平台版本。API/共享库/原生的破坏性升级统一反映到 SDK 大版本。
+制作与继续修改每轮从 npm 的 `@zijinhua/app-sdk/latest` 选择稳定版本，核对其与线上宿主 release.applications.sdk 兼容，再注入安装确切版本的命令；不用请求手机的 SDK 版本选包。获取或兼容核对失败时不占用额度、不创建制作轮次；原请求重试仍复用已有结果。SDK 兼容规则与发布顺序统一见 [dynamic README](https://github.com/jiangfengwhu/zjh-dynamic/blob/main/README.md)。SDK 更新不合并 plugin main。新应用准备使用 init，继续修改使用 authorize；完成开发后统一执行不带授权参数的 publish:application 命令，必须返回 published: true 才算完成。
 
 GET /v1/application-discussions/<appId> 返回已公开作品的独立讨论及当前账号的点赞、收藏状态；讨论按应用 ID 跨版本保留，不进入社区时间线。点赞、评论复用 /v1/posts/<id>/like、comments；POST/DELETE /v1/posts/<id>/bookmark 幂等收藏/取消收藏。讨论不能作为动态删除，读作品讨论时重新校验公开状态。复用既有 Posts 存储与账号鉴权，不新增绑定。
 
