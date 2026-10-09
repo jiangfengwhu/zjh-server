@@ -497,7 +497,7 @@ export class Workshop extends DurableObject<Env> {
     const preparation = initialize
       ? `初始化：npm run init:application -- ${task.appId} '${grant}'。不要发布初始化模板。`
       : `先更新本轮授权：npm exec -- zjh-app authorize ${task.appId} '${grant}'。无需重新初始化应用。`;
-    return `${preparation} 完成开发并更新 application.json 后，必须执行 npm run publish:application -- ${task.appId}。只有返回 published: true 才能报告完成；发布失败须修复并重试，无法解决时明确说明尚未发布及阻塞原因。授权由工具保存在本地，不得在回复、日志或代码中复述授权。`;
+    return `${preparation} 完成开发并更新 application.json 后，必须执行 npm run publish:application -- ${task.appId}。只有返回 published: true 才能报告完成；发布失败须修复并重试，无法解决时明确说明尚未发布及阻塞原因。`;
   }
   private async recoverSession(task: WorkshopTask): Promise<WorkshopTask> {
     if (task.session || !task.creationTitle) return task;
