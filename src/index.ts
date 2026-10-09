@@ -318,21 +318,19 @@ export class Workshop extends DurableObject<Env> {
       let cursor: string | undefined;
       do {
         const page = await this.env.CATALOG.list({ prefix: "v1/applications/", cursor, limit: 128 });
-        await Promise.all(page.keys.map(async item => {
+        for (const item of page.keys) {
           const before = await this.env.CATALOG.get(item.name);
-          if (!before) return;
+          if (!before) continue;
           const value = JSON.parse(before);
           if (migrate(value)) catalog.push({ key: item.name, before, after: JSON.stringify(value), expiration: item.expiration });
-        }));
+        }
         cursor = page.list_complete ? undefined : page.cursor;
       } while (cursor);
       if (!dryRun) {
         // Retain original records before changing metadata; release IDs and all pointers stay stable.
-        for (let offset = 0; offset < catalog.length; offset += 8) {
-          await Promise.all(catalog.slice(offset, offset + 8).map(async record => {
-            await this.ctx.storage.put(`sdk-migration-backup:kv:${record.key}`, record.before);
-            await this.env.CATALOG.put(record.key, record.after, record.expiration ? { expiration: record.expiration } : undefined);
-          }));
+        for (const record of catalog) {
+          await this.ctx.storage.put(`sdk-migration-backup:kv:${record.key}`, record.before);
+          await this.env.CATALOG.put(record.key, record.after, record.expiration ? { expiration: record.expiration } : undefined);
         }
         await this.ctx.storage.transaction(async storage => {
           for (const record of durable) {
