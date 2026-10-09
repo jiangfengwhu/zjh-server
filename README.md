@@ -76,7 +76,7 @@ GET /v1/messages/live 以 Authorization 头建立 WebSocket，复用 Posts 的�
 
 制作与继续修改每轮从 npm 的 `@zijinhua/app-sdk/latest` 选择稳定版本，任务开头注入安装确切版本的命令。获取失败时不占用额度、不创建制作轮次；原请求重试仍复用已有结果。SDK 更新不合并 plugin main，版本的宿主兼容性由维护者发布 latest 前核对。
 
-任务 SDK 的 npm 大版本必须与当前生效宿主 release.applications.sdk 一致；切换发布渠道期间不下发不匹配的 SDK。作品清单 requires 只要求 sdk，API/共享库/原生的破坏性升级统一反映到 SDK 大版本。
+任务 SDK 使用 npm latest，大版本必须与线上宿主 release.applications.sdk 一致，完整版本不得高于线上宿主。每次 SDK 发布先更新配套宿主，再发布 npm latest；手机运行时使用实际加载的宿主版本判断兼容。作品清单 sdk 记录实际 SDK 包版本，不接受旧 requires 字段，不维护独立的最低平台版本。API/共享库/原生的破坏性升级统一反映到 SDK 大版本。
 
 GET /v1/application-discussions/<appId> 返回已公开作品的独立讨论及当前账号的点赞、收藏状态；讨论按应用 ID 跨版本保留，不进入社区时间线。点赞、评论复用 /v1/posts/<id>/like、comments；POST/DELETE /v1/posts/<id>/bookmark 幂等收藏/取消收藏。讨论不能作为动态删除，读作品讨论时重新校验公开状态。复用既有 Posts 存储与账号鉴权，不新增绑定。
 

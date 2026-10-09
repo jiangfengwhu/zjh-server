@@ -880,7 +880,7 @@ export class Workshop extends DurableObject<Env> {
           const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(content)));
           const identity = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
           if ((document.source.dirty || document.source.tree !== undefined) && !/^[a-f0-9]{40}$/.test(document.source.tree)) return json({ error: "application source tree invalid" }, 400);
-          if (identity !== releaseId || document.format !== 1 || !/^[a-f0-9]{40}$/.test(document.source.commit) || !/^\d+\.\d+\.\d+$/.test(document.requires?.sdk ?? "")) return json({ error: "application integrity invalid" }, 400);
+          if (identity !== releaseId || document.format !== 1 || !/^[a-f0-9]{40}$/.test(document.source.commit) || !/^\d+\.\d+\.\d+$/.test(document.sdk ?? "") || document.requires !== undefined) return json({ error: "application integrity invalid" }, 400);
           if (document.source.repository !== "jiangfengwhu/zjh-plugin" || document.dataSchemaVersion !== 1) return json({ error: "application source or data schema invalid" }, 400);
           if (document.source.applicationTree !== undefined && !/^[a-f0-9]{40}$/.test(document.source.applicationTree)) return json({ error: "application source snapshot invalid" }, 400);
           for (const blob of [document.bundle, ...(document.assets ?? [])]) {
