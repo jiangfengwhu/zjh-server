@@ -55,7 +55,7 @@ APP_DATA 使用 SQLite Durable Objects。私有实例按 userId 分配，内部�
 
 任务命令保存应用本轮身份，发布脚本通过 POST /v1/application-publisher/<appId> 自动获取最长 30 分钟的发布授权，期限不超过任务凭据；账号、应用与 publishEpoch 必须一致。同一轮 working/ready 状态允许重复发布，停止或开始新一轮立即使旧授权失效。任务提示明确要求完成开发和清单后再发布，不发布初始化模板。
 
-宿主负责制作表单，Jolly 仅查进度。服务端注入授权与任务上下文，通用规则引用插件及 SDK 文档。Remix 锁定原作 releaseId/commit，分配独立身份与模块范围。共享 JS 环境不是恶意代码沙箱。
+宿主负责制作表单，Jolly 仅查进度。服务端注入授权与任务上下文，通用规则引用插件及 SDK 文档。Remix 来源由制作记录维护，客户端清单不填写原作字段，也不因这些字段缺失而拒绝发布。Remix 按原作 releaseId 锁定应用目录源码快照与确切提交，从已确认的原作分支启动新任务；缺失源码记录时明确报错，不退回 main。分支确认后回填对应公开版本的来源，原作后续提交不改变已锁定版本。分配独立身份与模块范围。共享 JS 环境不是恶意代码沙箱。
 
 Jolly 紧凑查询先返回本轮状态，历史在后台预热；尚未确认的新轮终态等待记录校验。本轮候选发布成功即标记可体验，并异步发送完成通知，不依赖用户刷新进度。Jules 未发布即失败的状态仍需查询上游才能获知；不定时查询，定时任务仅重试已生成但尚未送达的通知。/v1/works 默认只读本地快照，refresh=1 才查询上游。
 
@@ -72,3 +72,5 @@ GET /v1/messages/live 以 Authorization 头建立 WebSocket，复用 Posts 的�
 任务 SDK 的 npm 大版本必须与当前生效宿主 release.applications.sdk 一致；切换发布渠道期间不下发不匹配的 SDK。作品清单 requires 只要求 sdk，API/共享库/原生的破坏性升级统一反映到 SDK 大版本。
 
 GET /v1/application-discussions/<appId> 返回已公开作品的独立讨论及当前账号的点赞、收藏状态；讨论按应用 ID 跨版本保留，不进入社区时间线。点赞、评论复用 /v1/posts/<id>/like、comments；POST/DELETE /v1/posts/<id>/bookmark 幂等收藏/取消收藏。讨论不能作为动态删除，读作品讨论时重新校验公开状态。复用既有 Posts 存储与账号鉴权，不新增绑定。
+
+维护者可用 `POST /v1/application-source` 修复当前公开版本的源码定位，携带 appId、releaseId、commit、branch；接口核对应用目录快照和分支包含关系，不修改公开包或合入 PR。旧版本缺少应用目录快照时，须先在独立目录重建并确认 bundle 与全部 assets 一致，再携带 rebuiltBundleSha256、rebuiltAssets；可用 remixAppIds 指定需要同步来源记录的已有改编任务。接口仅接受维护者授权。

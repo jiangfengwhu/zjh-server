@@ -53,7 +53,7 @@ export default {
       if (request.method === "PUT" && /^\/v1\/application-blobs\/[a-z][a-z0-9-]{0,63}\/[a-f0-9]{64}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && /^\/v1\/application-publisher\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && /^\/v1\/application-download\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
-      if (/^\/v1\/applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|candidate|public|releases\/[a-f0-9]{64})$/.test(url.pathname) || ["/v1/official-release", "/v1/development-reset", "/v1/works", "/v1/market"].includes(url.pathname) || /^\/v1\/application-allocation\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
+      if (/^\/v1\/applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|candidate|public|releases\/[a-f0-9]{64})$/.test(url.pathname) || ["/v1/official-release", "/v1/application-source", "/v1/development-reset", "/v1/works", "/v1/market"].includes(url.pathname) || /^\/v1\/application-allocation\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "GET" && ["/v1/applications", "/v1/application-updates"].includes(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && url.pathname === "/v1/workshop") return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && url.pathname === "/v1/jules") {
@@ -238,7 +238,7 @@ function pathBeforeQuery(path: string): string {
   const index = path.indexOf("?");
   return index < 0 ? path : path.slice(0, index);
 }
-type ApplicationRelease = { icon?: { sha256: string; bytes: number; format: "svg" }; appId: string; releaseId: string; appName: string; description: string; version: string; releaseNotes: string; modules: { base: number }; source: { repository: string; commit: string; tree?: string; dirty: boolean } };
+type ApplicationRelease = { icon?: { sha256: string; bytes: number; format: "svg" }; appId: string; releaseId: string; appName: string; description: string; version: string; releaseNotes: string; modules: { base: number }; source: { repository: string; commit: string; tree?: string; applicationTree?: string; dirty: boolean } };
 type WorkshopTask = { awaitingRoundStart?: boolean; deliveryWaitStartedAt?: number; branch?: string; branchCommit?: string; roundRelease?: string; dispatchVersion?: string; originalBranch?: string; ownerId: string; appId: string; session: string; token: string; phase: "working" | "ready" | "paused"; previousCommit?: string; repair?: boolean; publishEpoch?: string; requestId?: string; creationTitle?: string; creationRejected?: boolean; title?: string; wish?: string; originalAppId?: string; originalReleaseId?: string; originalCommit?: string; startedAt?: number };
 type CloudSession = { name?: string; state?: string; url?: string; title?: string; createTime?: string; updateTime?: string; sourceContext?: { source?: string }; outputs?: { pullRequest?: { url?: string } }[] };
 type WorkSummary = { completed: boolean; state: string; delivery: string; message: string; application?: ApplicationRelease; stale?: boolean };
@@ -275,6 +275,7 @@ function summarizeWork(task: WorkshopTask, session: CloudSession, application: A
   return { completed: true, state: "COMPLETED", delivery: ready ? "update" : "unpublished", message: ready ? "作品已发布，可直接体验、继续修改或上架" : "等待本轮候选包发布", ...(ready ? { application } : {}) };
 }
 const MARKET_CATEGORIES = ["tools", "productivity", "life", "creative", "other"];
+type SourceProof = { commit: string; branch: string; tree?: string; applicationTree: string };
 type MarketEntry = { downloadCount?: number; iconUrl?: string; manifest: ApplicationRelease; title: string; summary: string; category?: string; screenshots?: string[]; publishedAt?: number; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null; sourceCommit?: string; sourceBranch?: string };
 
 export class Workshop extends DurableObject<Env> {
@@ -391,7 +392,7 @@ export class Workshop extends DurableObject<Env> {
     if (new URL(request.url).pathname === "/v1/development-reset") return this.reset(request);
     if (this.resetting) return json({ message: "开发数据正在重置，请稍后重试" }, 503);
     const path = new URL(request.url).pathname;
-    const pending = ["GET", "HEAD"].includes(request.method) ? this.handle(request) : this.write(request, path); this.writes.add(pending);
+    const pending = ["GET", "HEAD"].includes(request.method) && !path.startsWith("/v1/application-allocation/") ? this.handle(request) : this.write(request, path); this.writes.add(pending);
     try { return await pending; } finally { this.writes.delete(pending); }
   }
   private async reset(request: Request): Promise<Response> {
@@ -442,8 +443,9 @@ export class Workshop extends DurableObject<Env> {
     try {
       const raw = await request.clone().text();
       if (raw.length > (path === "/v1/catalog" ? 8_000_000 : 210_000)) return json({ message: "请求内容过大" }, 413);
-      const input = (raw ? JSON.parse(raw) : {}) as { appId?: string; objects?: CatalogObject[] };
-      const ids = path === "/v1/catalog" ? (input.objects ?? []).map(item => String(item.key).match(/^v1\/applications\/([^/]+)\//)?.[1]).filter((id): id is string => Boolean(id)) : [input.appId ?? path.split("/").pop() ?? "unknown"];
+      const input = (raw ? JSON.parse(raw) : {}) as { appId?: string; objects?: CatalogObject[]; remixAppIds?: string[] };
+      if (path === "/v1/application-source" && input.remixAppIds && (!Array.isArray(input.remixAppIds) || input.remixAppIds.length > 50 || input.remixAppIds.some(id => !/^[a-z][a-z0-9-]{0,63}$/.test(id)))) return json({ message: "源码修复任务无效" }, 400);
+      const ids = path === "/v1/catalog" ? (input.objects ?? []).map(item => String(item.key).match(/^v1\/applications\/([^/]+)\//)?.[1]).filter((id): id is string => Boolean(id)) : path === "/v1/application-source" ? [input.appId ?? "unknown", ...input.remixAppIds || []] : [input.appId ?? path.split("/").pop() ?? "unknown"];
       return this.queue.runAll(ids.length ? ids.map(id => `app:${id}`) : ["host"], () => this.handle(request));
     } catch { return json({ message: "请求格式不正确" }, 400); }
   }
@@ -554,19 +556,65 @@ export class Workshop extends DurableObject<Env> {
     // KV is a mirror, never the authority for a candidate that has not committed.
     return await this.ctx.storage.get<ApplicationRelease>(`candidate:${appId}`) ?? null;
   }
+  private async sourceTree(commit: string, appId: string): Promise<{ tree: string; applicationTree: string } | undefined> {
+    const root = await this.github(`git/trees/${commit}?recursive=1`);
+    const entry = root.tree?.find((item: { path?: string; type?: string }) => item.path === `apps/${appId}` && item.type === "tree");
+    return entry?.sha ? { tree: root.sha, applicationTree: entry.sha } : undefined;
+  }
+  private async rememberSource(application: ApplicationRelease, proof: SourceProof) {
+    // Source discovery can finish after the author has already shared a release.
+    await this.ctx.storage.transaction(async storage => {
+      await storage.put(`source-proof:${application.appId}:${application.releaseId}`, proof);
+      const shared = await storage.get<MarketEntry>(`shared:${application.appId}`);
+      if (shared?.manifest.releaseId === application.releaseId) {
+        await storage.put(`shared:${application.appId}`, { ...shared, sourceCommit: proof.commit, sourceBranch: proof.branch });
+      }
+    });
+  }
   private async recordBranch(task: WorkshopTask, session: CloudSession, application: ApplicationRelease) {
-    const proof = await this.ctx.storage.get<{ commit: string; tree?: string }>(`source-proof:${task.appId}:${application.releaseId}`);
-    if (task.branch && proof && proof.commit === task.branchCommit && (application.source.tree ? proof.tree === application.source.tree : !application.source.dirty && proof.commit === application.source.commit)) return;
+    const proof = await this.ctx.storage.get<SourceProof>(`source-proof:${task.appId}:${application.releaseId}`);
+    if (proof?.branch && proof.applicationTree && (application.source.applicationTree
+      ? proof.applicationTree === application.source.applicationTree
+      : proof.tree === application.source.tree)) {
+      await this.rememberSource(application, proof);
+      task.branch = proof.branch; task.branchCommit = proof.commit;
+      await this.saveTask(task); return;
+    }
     const urls = session.outputs?.map(output => output.pullRequest?.url).filter((url): url is string => /^https:\/\/github\.com\/jiangfengwhu\/zjh-plugin\/pull\/[0-9]+$/.test(url ?? "")) ?? [];
     for (const url of urls.reverse()) {
       const pr = await this.github(`pulls/${Number(url.split("/").pop())}`);
       if (pr.head?.repo?.full_name !== "jiangfengwhu/zjh-plugin" || !pr.head.ref || pr.head.ref === "main" || !pr.head.sha) continue;
-      const commit = await this.github(`git/commits/${pr.head.sha}`);
-      if (application.source.tree ? application.source.tree !== commit.tree?.sha : application.source.dirty || application.source.commit !== pr.head.sha) continue;
-      task.branch = pr.head.ref; task.branchCommit = pr.head.sha;
-      await this.ctx.storage.put(`source-proof:${task.appId}:${application.releaseId}`, { commit: pr.head.sha, tree: application.source.tree });
-      await this.saveTask(task); return;
+      const commits: string[] = [pr.head.sha];
+      if (application.source.applicationTree) {
+        const history = await this.github(`commits?sha=${encodeURIComponent(pr.head.ref)}&path=${encodeURIComponent("apps/" + task.appId)}&per_page=20`);
+        commits.push(...history.map((item: { sha: string }) => item.sha));
+      }
+      for (const commit of new Set(commits)) {
+        const source = await this.sourceTree(commit, task.appId);
+        if (!source) continue;
+        const matches = application.source.applicationTree ? source.applicationTree === application.source.applicationTree
+          : application.source.tree ? source.tree === application.source.tree : !application.source.dirty && application.source.commit === commit;
+        if (!matches) continue;
+        await this.rememberSource(application, { commit, branch: pr.head.ref, ...source });
+        task.branch = pr.head.ref; task.branchCommit = commit;
+        await this.saveTask(task); return;
+      }
     }
+  }
+  private async remixSource(shared: MarketEntry): Promise<SourceProof> {
+    let proof = await this.ctx.storage.get<SourceProof>(`source-proof:${shared.manifest.appId}:${shared.manifest.releaseId}`);
+    if (!proof?.branch || !proof.applicationTree) {
+      await this.queue.run(`app:${shared.manifest.appId}`, async () => {
+        const original = await this.ctx.storage.get<WorkshopTask>(`task:${shared.manifest.appId}`);
+        if (original?.session) await this.recordBranch(original, await this.session(original.session), shared.manifest);
+      });
+      proof = await this.ctx.storage.get<SourceProof>(`source-proof:${shared.manifest.appId}:${shared.manifest.releaseId}`);
+    }
+    if (!proof?.branch || !proof.applicationTree) throw new Error("原作公开版本的源码尚未定位，请稍后重试或联系作者；不会从 main 创建改编");
+    const comparison = await this.github(`compare/${proof.commit}...${encodeURIComponent(proof.branch)}`);
+    if (!["identical", "ahead"].includes(comparison.status)) throw new Error("原作分支已改变，无法定位公开版本，请联系作者");
+    await this.rememberSource(shared.manifest, proof);
+    return proof;
   }
   private async delivery(task: WorkshopTask, _session: CloudSession) {
     const application = await this.candidate(task.appId);
@@ -670,16 +718,53 @@ export class Workshop extends DurableObject<Env> {
         await this.env.BLOBS.put(`v1/app/${digest}`, bytes, { httpMetadata: { contentType: "application/octet-stream", cacheControl: "public,max-age=31536000,immutable" } });
         return json({ uploaded: true, bytes: size }, 200);
       }
+      if (path === "/v1/application-source" && request.method === "POST") {
+        if (!await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN)) return json({ message: "维护者权限不足" }, 403);
+        const input = await request.json() as { appId?: string; releaseId?: string; commit?: string; branch?: string; rebuiltBundleSha256?: string; rebuiltAssets?: Array<{ name: string; sha256: string; bytes: number }>; remixAppIds?: string[] };
+        const { appId, releaseId, commit, branch } = input;
+        if (!/^[a-z][a-z0-9-]{0,63}$/.test(appId || "") || !/^[a-f0-9]{64}$/.test(releaseId || "") || !/^[a-f0-9]{40}$/.test(commit || "") || !branch || branch.length > 200 || input.remixAppIds && (!Array.isArray(input.remixAppIds) || input.remixAppIds.length > 50 || input.remixAppIds.some(id => !/^[a-z][a-z0-9-]{0,63}$/.test(id)))) return json({ message: "源码修复参数无效" }, 400);
+        const shared = await this.ctx.storage.get<MarketEntry>(`shared:${appId}`);
+        if (!shared || shared.manifest.releaseId !== releaseId) return json({ message: "公开版本已改变，请重新核对" }, 409);
+        const application = shared.manifest;
+        const source = await this.sourceTree(commit!, appId!);
+        if (!source) return json({ message: "提交中没有该应用源码" }, 409);
+        const comparison = await this.github(`compare/${commit}...${encodeURIComponent(branch)}`);
+        if (!["identical", "ahead"].includes(comparison.status)) return json({ message: "指定分支不包含源码提交" }, 409);
+        const matches = application.source.applicationTree ? source.applicationTree === application.source.applicationTree
+          : application.source.tree ? source.tree === application.source.tree : !application.source.dirty && application.source.commit === commit;
+        if (!matches) {
+          // Legacy releases captured an unpushed whole-repository tree. Only a
+          // maintainer who reproduced the bundle AND every asset may repair it.
+          const artifacts = application as ApplicationRelease & { bundle: { sha256: string }; assets: Array<{ name: string; sha256: string; bytes: number }> };
+          const assets = (items: typeof artifacts.assets) => JSON.stringify(items.map(({ name, sha256, bytes }) => ({ name, sha256, bytes })).sort((a, b) => a.name.localeCompare(b.name)));
+          if (application.source.applicationTree || input.rebuiltBundleSha256 !== artifacts.bundle.sha256 || !Array.isArray(input.rebuiltAssets) || assets(input.rebuiltAssets) !== assets(artifacts.assets)) return json({ message: "源码未匹配；旧版本需先重建并核对包体与全部资源" }, 409);
+        }
+        await this.rememberSource(application, { commit: commit!, branch, ...source, tree: application.source.tree });
+        const repairedRemixes: string[] = [];
+        for (const id of input.remixAppIds || []) {
+          const task = await this.ctx.storage.get<WorkshopTask>(`task:${id}`);
+          if (task?.originalAppId !== appId || task.originalReleaseId !== releaseId) continue;
+          task.originalCommit = commit; task.originalBranch = branch;
+          await this.saveTask(task); repairedRemixes.push(id);
+        }
+        return json({ repaired: true, appId, releaseId, commit, branch, applicationTree: source.applicationTree, repairedRemixes }, 200);
+      }
       if (path.startsWith("/v1/application-allocation/")) {
         const appId = path.split("/").pop()!;
-        if (request.method === "POST") {
-          if (!await this.publisher(request, appId)) return json({ error: "unauthorized" }, 401);
-          return json({ appId, moduleBase: await this.allocate(appId) }, 200);
-        }
-        if (request.method !== "GET") return json({ error: "method" }, 405);
-        const base = await this.ctx.storage.get<number>(`allocation:${appId}`);
+        const manager = await this.publisher(request, appId);
+        if (request.method === "POST" && !manager) return json({ error: "unauthorized" }, 401);
+        if (!["GET", "POST"].includes(request.method)) return json({ error: "method" }, 405);
+        const base = request.method === "POST" ? await this.allocate(appId) : await this.ctx.storage.get<number>(`allocation:${appId}`);
         const task = await this.ctx.storage.get<WorkshopTask>(`task:${appId}`);
-        const origin = await this.publisher(request, appId) ? { title: task?.title, originalAppId: task?.originalAppId, originalReleaseId: task?.originalReleaseId, originalCommit: task?.originalCommit, originalBranch: task?.originalBranch, branch: task?.branch } : {};
+        if (manager && task?.originalAppId) {
+          const proof = await this.ctx.storage.get<SourceProof>(`source-proof:${task.originalAppId}:${task.originalReleaseId}`);
+          if (!proof?.branch || !proof.applicationTree) return json({ message: "原作公开版本的源码尚未定位，请联系作者或维护者" }, 409);
+          if (task.originalCommit !== proof.commit || task.originalBranch !== proof.branch) {
+            task.originalCommit = proof.commit; task.originalBranch = proof.branch;
+            await this.saveTask(task);
+          }
+        }
+        const origin = manager ? { title: task?.title, originalAppId: task?.originalAppId, originalReleaseId: task?.originalReleaseId, originalCommit: task?.originalCommit, originalBranch: task?.originalBranch, branch: task?.branch } : {};
         return base ? json({ appId, moduleBase: base, ...origin }, 200) : json({ error: "请先在 Jolly 创建这个应用的心愿" }, 404);
       }
       if ((path === "/v1/market" || path === "/v1/applications") && request.method === "GET") {
@@ -765,8 +850,7 @@ export class Workshop extends DurableObject<Env> {
           if ((document.source.dirty || document.source.tree !== undefined) && !/^[a-f0-9]{40}$/.test(document.source.tree)) return json({ error: "application source tree invalid" }, 400);
           if (identity !== releaseId || document.format !== 1 || !/^[a-f0-9]{40}$/.test(document.source.commit) || !/^\d+\.\d+\.\d+$/.test(document.requires?.sdk ?? "")) return json({ error: "application integrity invalid" }, 400);
           if (document.source.repository !== "jiangfengwhu/zjh-plugin" || document.dataSchemaVersion !== 1) return json({ error: "application source or data schema invalid" }, 400);
-          const task = await this.ctx.storage.get<WorkshopTask>(`task:${manifest.appId}`);
-          if (task?.originalAppId && (document.originalAppId !== task.originalAppId || document.originalReleaseId !== task.originalReleaseId || document.originalCommit !== task.originalCommit)) return json({ error: "original application version cannot change" }, 409);
+          if (document.source.applicationTree !== undefined && !/^[a-f0-9]{40}$/.test(document.source.applicationTree)) return json({ error: "application source snapshot invalid" }, 400);
           for (const blob of [document.bundle, ...(document.assets ?? [])]) {
             if (!blob || !/^[a-f0-9]{64}$/.test(blob.sha256) || !Number.isSafeInteger(blob.bytes) || blob.bytes < 0 || (blob === document.bundle && !blob.bytes)) return json({ error: "application blob invalid" }, 400);
             const stored = await this.env.BLOBS.head(`v1/app/${blob.sha256}`);
@@ -882,8 +966,8 @@ export class Workshop extends DurableObject<Env> {
         const manifest = key === "latest" ? await this.candidate(appId) : key ? await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/${key}`, "json") : null;
         if (!manifest) return json({ message: "没有对应版本" }, 404);
         const response = json(manifest, 200);
-        const proof = await this.ctx.storage.get<{ commit: string; tree: string }>(`source-proof:${appId}:${manifest.releaseId}`);
-        if (manifest.source.tree && proof?.tree === manifest.source.tree) response.headers.set("X-Application-Source-Commit", proof.commit);
+        const proof = await this.ctx.storage.get<SourceProof>(`source-proof:${appId}:${manifest.releaseId}`);
+        if (proof && (manifest.source.applicationTree ? proof.applicationTree === manifest.source.applicationTree : manifest.source.tree && proof.tree === manifest.source.tree)) response.headers.set("X-Application-Source-Commit", proof.commit);
         return response;
       }
       if (path === "/v1/works" && request.method === "GET") {
@@ -947,7 +1031,9 @@ export class Workshop extends DurableObject<Env> {
         if (input.originalAppId) {
           const shared = await this.ctx.storage.get<MarketEntry>(`shared:${input.originalAppId}`);
           if (!shared || shared.manifest.releaseId !== input.originalReleaseId) return json({ message: "原作公开版本已改变，请刷新市场后重新创作" }, 409);
-          original = shared.manifest; originalCommit = shared.sourceCommit ?? original.source.commit; originalBranch = shared.sourceBranch;
+          original = shared.manifest;
+          try { const source = await this.remixSource(shared); originalCommit = source.commit; originalBranch = source.branch; }
+          catch (error) { return json({ message: error instanceof Error ? error.message : "原作源码暂时无法读取，请重试" }, 409); }
         }
         const preparation = await sdkPreparation((await this.env.CATALOG.get<{ applications?: { sdk: string } }>("v1/release", "json"))?.applications?.sdk);
         if (!await this.quota(user.id, appId)) return json({ message: "每天最多发起 10 轮制作，同时最多制作 3 个作品" }, 429);
@@ -957,7 +1043,7 @@ export class Workshop extends DurableObject<Env> {
         payload.title = task.creationTitle;
         payload.sourceContext = { source: PLUGIN_SOURCE, githubRepoContext: { startingBranch: originalBranch ?? "main" }, environmentVariablesEnabled: false };
         await this.saveTask(task);
-        const origin = original ? `Remix：${original.appId}@${originalCommit}，分支 ${originalBranch ?? "main"}，版本 ${original.releaseId}；init 复制此提交。` : "";
+        const origin = original ? `改编 ${original.appId} 的公开版本 ${original.releaseId}；初始化命令自动复制对应源码，来源由平台维护。` : "";
         payload.prompt = `${preparation}\n新建 ${appId}。${await this.publisherInstruction(task, true)} ${origin} 需求：\n${prompt}`;
         const response = await proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ ...input, body: JSON.stringify(payload) }) }), this.env);
         if (!response.ok) {
@@ -991,7 +1077,7 @@ export class Workshop extends DurableObject<Env> {
         if (input.action !== "edit" && (!application || input.releaseId !== application.releaseId)) return json({ message: "候选版本已改变，请刷新作品状态后再上架" }, 409);
         const manifest = input.action === "edit" ? shared!.manifest : application;
         if (!manifest) return json({ message: "作品尚未发包，请先完成制作" }, 409);
-        const proof = await this.ctx.storage.get<{ commit: string }>(`source-proof:${appId}:${manifest.releaseId}`);
+        const proof = await this.ctx.storage.get<SourceProof>(`source-proof:${appId}:${manifest.releaseId}`);
         const title = input.title?.trim() ?? shared?.title ?? manifest.appName;
         const summary = input.summary?.trim() ?? shared?.summary ?? manifest.description;
         if (!title || title.length > 60 || summary.length > 300) return json({ message: "名称不能为空且最多 60 字，介绍最多 300 字" }, 400);
@@ -1002,7 +1088,7 @@ export class Workshop extends DurableObject<Env> {
           const prefix = `${new URL(request.url).origin}/v1/market-images/${appId}/${user.id}/`;
           if (!screenshot.startsWith(prefix) || !/^[a-f0-9]{64}$/.test(screenshot.slice(prefix.length)) || !await this.env.BLOBS.head(screenshot.slice(new URL(request.url).origin.length + 1))) return json({ message: "截图未上传或不属于这个作品" }, 400);
         }
-        const entry: MarketEntry = { iconUrl: await this.ctx.storage.get<string>(`application-icon:${appId}`), manifest, title, summary, category, screenshots, publishedAt: input.action === "edit" ? shared!.publishedAt || 0 : shared?.manifest.releaseId === manifest.releaseId ? shared.publishedAt || Date.now() : Date.now(), authorId: user.id, authorName: user.name, authorAvatarUrl: user.avatarUrl, authorOfficial: user.id === OFFICIAL_ACCOUNT_ID, originalAppId: (manifest as ApplicationRelease & { originalAppId?: string }).originalAppId ?? null, sourceCommit: input.action === "edit" ? shared!.sourceCommit : proof?.commit ?? manifest.source.commit, sourceBranch: input.action === "edit" ? shared!.sourceBranch : task.branch };
+        const entry: MarketEntry = { iconUrl: await this.ctx.storage.get<string>(`application-icon:${appId}`), manifest, title, summary, category, screenshots, publishedAt: input.action === "edit" ? shared!.publishedAt || 0 : shared?.manifest.releaseId === manifest.releaseId ? shared.publishedAt || Date.now() : Date.now(), authorId: user.id, authorName: user.name, authorAvatarUrl: user.avatarUrl, authorOfficial: user.id === OFFICIAL_ACCOUNT_ID, originalAppId: task.originalAppId ?? shared?.originalAppId ?? null, sourceCommit: input.action === "edit" ? shared!.sourceCommit : proof?.commit ?? (!manifest.source.dirty ? manifest.source.commit : undefined), sourceBranch: input.action === "edit" ? shared!.sourceBranch : proof?.branch };
         await this.ctx.storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${manifest.releaseId}`]: true });
         await this.ctx.storage.delete(`withdrawn:${appId}`);
         this.emitWork(user.id, appId);
