@@ -21,7 +21,7 @@ const allowedSource = (source?: string) => source === PLUGIN_SOURCE;
 const BLOB_KEY = /^v1\/apk\/[a-f0-9]{64}\.apk$|^v1\/(?:vendor|app|sdk)\/[a-f0-9]{64}$|^v1\/plugins\/[a-z0-9-]+\/[a-f0-9]{64}$/;
 
 const ACTIVITY_MASK =
-  "activities.name,activities.id,activities.createTime,activities.description,activities.progressUpdated,activities.planGenerated,activities.planApproved,activities.sessionCompleted,activities.sessionFailed,activities.agentMessaged,activities.userMessaged,activities.artifacts.bashOutput,activities.artifacts.changeSet,activities.artifacts.media.mimeType,nextPageToken";
+  "activities.name,activities.id,activities.createTime,activities.description,activities.progressUpdated,activities.planGenerated,activities.planApproved,activities.sessionCompleted,activities.sessionFailed,activities.agentMessaged,activities.userMessaged,nextPageToken";
 
 type CatalogObject = { key?: unknown; body?: unknown };
 
