@@ -40,8 +40,8 @@ async function inputOf(request: Request): Promise<Record<string, unknown>> {
 /** Uses the existing Posts storage; private messages never enter the public timeline. */
 export class SocialInbox {
   constructor(private ctx: DurableObjectState, private env: Env) {}
-  private notify(owner: string, type: "message" | "read") {
-    return sendAccountLive(this.ctx, owner, type);
+  private notify(owner: string, type: "message" | "read", peerId?: string) {
+    return sendAccountLive(this.ctx, owner, type, {peerId});
   }
   async relations(authorId: string, kind: "following" | "followers", url: URL, viewer: User | null) {
     if (!uuid.test(authorId)) throw new SocialError("作者标识无效");
@@ -111,9 +111,16 @@ export class SocialInbox {
     const prefix = `dm:${pairKey(user.id, peer.id)}:`;
     const cursor = url.searchParams.get("cursor") || undefined;
     if (cursor && (!cursor.startsWith(prefix) || !/^\d{13}:[a-f0-9]{64}$/.test(cursor.slice(prefix.length)))) throw new SocialError("私信分页标记无效");
-    const records = await this.ctx.storage.list<Message>({ prefix, end: cursor, reverse: true, limit: 51 });
+    const afterId = url.searchParams.get("after");
+    let after: string | undefined;
+    if (afterId) {
+      if (cursor || !/^[a-f0-9]{64}$/.test(afterId)) throw new SocialError("私信增量位置无效");
+      after = await this.ctx.storage.get<string>(`dm-id:${pairKey(user.id,peer.id)}:${afterId}`);
+      if (!after) throw new SocialError("私信增量位置不存在",404);
+    }
+    const records = await this.ctx.storage.list<Message>({ prefix, ...(after ? {startAfter: after, reverse: false} : {end: cursor, reverse: true}), limit: 51 });
     const entries = [...records.entries()].slice(0, 50);
-    return json({ peer, messages: entries.map(([, message]) => message).reverse(), nextCursor: records.size > 50 ? entries.at(-1)![0] : null });
+    return json({ peer, messages: after ? entries.map(([,message]) => message) : entries.map(([, message]) => message).reverse(), nextCursor: after ? null : records.size > 50 ? entries.at(-1)![0] : null, hasMoreNew: !!after && records.size > 50 });
   }
   private async storeConversation(storage: DurableObjectTransaction, owner: string, next: Conversation, previousKey?: string) {
     if (previousKey) await storage.delete(previousKey);
@@ -150,7 +157,7 @@ export class SocialInbox {
       await storage.put(`dm-unread:${peer.id}`, ((await storage.get<number>(`dm-unread:${peer.id}`)) ?? 0) + 1);
       return { message, created: true };
     });
-    if (result.created) { await this.notify(user.id, "message"); await this.notify(peer.id, "message"); }
+    if (result.created) { await this.notify(user.id, "message", peer.id); await this.notify(peer.id, "message", user.id); }
     return json({ message: result.message }, result.created ? 201 : 200);
   }
   private async markRead(request: Request, user: User, peerId: string) {
@@ -174,7 +181,7 @@ export class SocialInbox {
       await storage.put(`dm-unread:${user.id}`, Math.max(0, ((await storage.get<number>(`dm-unread:${user.id}`)) ?? 0) - removed));
       return removed > 0;
     });
-    if (changed) await this.notify(user.id, "read");
+    if (changed) await this.notify(user.id, "read", peerId);
     return json({ unreadCount: (await this.ctx.storage.get<number>(`dm-unread:${user.id}`)) ?? 0 });
   }
 }

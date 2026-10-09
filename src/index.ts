@@ -1,8 +1,11 @@
+import { getMany } from "./storageBatch";
 import { validateApplicationIcon, validIconJpeg } from "./applicationIcon";
 import { androidAssetLinks, downloadLatestApk, readSharedApplication } from "./sharedLinks";
 import { DurableObject } from "cloudflare:workers";
 import { authenticatedUser, OFFICIAL_ACCOUNT_ID, OFFICIAL_APPLICATIONS, publicProfiles, readAvatar } from "./accounts";
 import { KeyedQueue } from "./concurrency";
+import { MarketIndex } from "./readIndexes";
+import { pageBff } from "./pageBff";
 import { sdkPreparation } from "./sdk-distribution";
 import { issuePublisherGrant, readPublisherGrant, redactPublisherGrants, publisherGrantActive } from "./publisher";
 export { Accounts } from "./accounts";
@@ -29,6 +32,8 @@ export default {
   async fetch(request, env): Promise<Response> {
     const url = new URL(request.url);
     try {
+      const page = await pageBff(request, env);
+      if (page) return page;
       if (url.pathname.startsWith("/v1/app-data/")) return applicationData(request, env);
       if (["GET", "HEAD"].includes(request.method) && url.pathname === "/.well-known/assetlinks.json") return androidAssetLinks();
       if (["GET", "HEAD"].includes(request.method) && url.pathname === "/download") return downloadLatestApk(env);
@@ -238,7 +243,7 @@ function pathBeforeQuery(path: string): string {
   const index = path.indexOf("?");
   return index < 0 ? path : path.slice(0, index);
 }
-type ApplicationRelease = { icon?: { sha256: string; bytes: number; format: "svg" }; appId: string; releaseId: string; appName: string; description: string; version: string; releaseNotes: string; modules: { base: number }; source: { repository: string; commit: string; tree?: string; applicationTree?: string; dirty: boolean } };
+type ApplicationRelease = { icon?: { sha256: string; bytes: number; format: "svg" }; appId: string; releaseId: string; appName: string; description: string; accent: string; version: string; releaseNotes: string; modules: { base: number }; source: { repository: string; commit: string; tree?: string; applicationTree?: string; dirty: boolean } };
 type WorkshopTask = { awaitingRoundStart?: boolean; deliveryWaitStartedAt?: number; branch?: string; branchCommit?: string; roundRelease?: string; dispatchVersion?: string; originalBranch?: string; ownerId: string; appId: string; session: string; token: string; phase: "working" | "ready" | "paused"; previousCommit?: string; repair?: boolean; publishEpoch?: string; requestId?: string; creationTitle?: string; creationRejected?: boolean; title?: string; wish?: string; originalAppId?: string; originalReleaseId?: string; originalCommit?: string; startedAt?: number };
 type CloudSession = { name?: string; state?: string; url?: string; title?: string; createTime?: string; updateTime?: string; sourceContext?: { source?: string }; outputs?: { pullRequest?: { url?: string } }[] };
 type WorkSummary = { completed: boolean; state: string; delivery: string; message: string; application?: ApplicationRelease; stale?: boolean };
@@ -279,6 +284,7 @@ type SourceProof = { commit: string; branch: string; tree?: string; applicationT
 type MarketEntry = { downloadCount?: number; iconUrl?: string; manifest: ApplicationRelease; title: string; summary: string; category?: string; screenshots?: string[]; publishedAt?: number; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; authorOfficial?: boolean; originalAppId: string | null; sourceCommit?: string; sourceBranch?: string };
 
 export class Workshop extends DurableObject<Env> {
+  private marketIndex = new MarketIndex(this.ctx);
   async canUseCloud(appId: string, userId: string): Promise<boolean> {
     if (this.resetting || !/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return false;
     const [published, task] = await Promise.all([
@@ -389,6 +395,7 @@ export class Workshop extends DurableObject<Env> {
   private resetting = false;
   private writes = new Set<Promise<Response>>();
   async fetch(request: Request): Promise<Response> {
+    await this.marketIndex.ensure();
     if (new URL(request.url).pathname === "/v1/development-reset") return this.reset(request);
     if (this.resetting) return json({ message: "开发数据正在重置，请稍后重试" }, 503);
     const path = new URL(request.url).pathname;
@@ -427,6 +434,7 @@ export class Workshop extends DurableObject<Env> {
         cursor = page.list_complete ? undefined : page.cursor;
       } while (cursor);
       await this.ctx.storage.deleteAll();
+      this.marketIndex = new MarketIndex(this.ctx);
       await this.ctx.storage.deleteAlarm();
       for (const task of tasks) this.emitWork(task.ownerId, task.appId);
       return json({ reset: true, scope: input.scope ?? "all", accounts, deletedApplications: applications, deletedApplicationCatalogs: count, retainedApplications: [] }, 200);
@@ -533,6 +541,30 @@ export class Workshop extends DurableObject<Env> {
       return { ...page, stale: false };
     } catch { return { ...(cached?.page ?? { activities }), stale: true }; }
   }
+  private async progressActivities(task: WorkshopTask, session: CloudSession) {
+    type Activity = { createTime?: string; agentMessaged?: { agentMessage?: string } };
+    const key = `progress-output:${task.appId}`;
+    const round = `${task.session}:${task.requestId}:${task.startedAt}`;
+    const version = `${session.state}:${session.updateTime}`;
+    const cached = await this.ctx.storage.get<{round: string; version: string; at: number; reply?: Activity}>(key);
+    if (cached?.round === round && cached.version === version && (session.updateTime || Date.now() - cached.at < 30000)) return {activities: cached.reply ? [cached.reply] : [], stale: false};
+    let reply = cached?.round === round ? cached.reply : undefined;
+    try {
+      let cursor: string | undefined; const seen = new Set<string>();
+      do {
+        const page = await this.activities(task.session, cursor);
+        for (const value of page.activities || []) {
+          const activity = value as Activity;
+          if (activity.agentMessaged?.agentMessage?.trim() && Date.parse(activity.createTime || "") >= (task.startedAt || 0) && (!reply || (activity.createTime || "") >= (reply.createTime || ""))) reply = activity;
+        }
+        cursor = page.nextPageToken;
+        if (cursor && seen.has(cursor)) throw new Error("制作记录游标重复");
+        if (cursor) seen.add(cursor);
+      } while (cursor);
+      await this.ctx.storage.put(key, {round, version, at: Date.now(), reply});
+      return {activities: reply ? [reply] : [], stale: false};
+    } catch { return {activities: reply ? [reply] : [], stale: true}; }
+  }
   private async allocate(appId: string): Promise<number> {
     const existing = await this.ctx.storage.get<number>(`allocation:${appId}`); if (existing) return existing;
     const fixed: Record<string, number> = { jolly: 2000000 };
@@ -631,7 +663,7 @@ export class Workshop extends DurableObject<Env> {
         const entries = await this.ctx.storage.get<MarketEntry | string>(ids.flatMap(id => [`shared:${id}`, `application-icon:${id}`]));
         return json({ icons: ids.flatMap(appId => {
           const item = entries.get(`shared:${appId}`) as MarketEntry | undefined;
-          return item ? [{ appId, icon: item.manifest.icon, iconUrl: entries.get(`application-icon:${appId}`) || item.iconUrl }] : [];
+          return item ? [{ appId, available: true, releaseId: item.manifest.releaseId, title: item.title || item.manifest.appName, summary: item.summary || item.manifest.description, accent: item.manifest.accent, icon: item.manifest.icon, iconUrl: entries.get(`application-icon:${appId}`) || item.iconUrl }] : [{appId, available: false}];
         }) }, 200);
       }
 
@@ -793,16 +825,6 @@ export class Workshop extends DurableObject<Env> {
             sharing: owned ? { shared: published?.authorId === viewer!.id ? published : null, application: candidate, iconUrl } : undefined };
           const response = json({ item }, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
         }
-        const selected = appId ? await this.ctx.storage.get<MarketEntry>(`shared:${appId}`) : undefined;
-        const entries = appId ? selected ? [selected] : [] : [...(await this.ctx.storage.list<MarketEntry>({ prefix: "shared:" })).values()];
-        for (const entry of entries) {
-          if ((OFFICIAL_APPLICATIONS as readonly string[]).includes(entry.manifest.appId)) { entry.authorId = OFFICIAL_ACCOUNT_ID; entry.authorName = "生花官方"; entry.authorAvatarUrl = null; }
-          entry.authorOfficial = entry.authorId === OFFICIAL_ACCOUNT_ID;
-        }
-        // Jolly is built into the host; archived releases are retained but no longer offered as an application.
-        const filtered = entries.filter(entry => entry.manifest.appId !== "jolly" && (!authorId || entry.authorId === authorId) && (!category || (category === "official" ? entry.authorOfficial : (entry.category || "other") === category)) && (!query || `${entry.title} ${entry.summary}`.toLowerCase().includes(query)));
-        filtered.sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0) || a.manifest.appId.localeCompare(b.manifest.appId));
-        // Explicit pagination keeps author-profile/internal callers on their existing full-list contract.
         const paged = params.has("limit") || params.has("cursor");
         const limit = Number(params.get("limit") || "24");
         if (paged && (!Number.isInteger(limit) || limit < 1 || limit > 50)) return json({ message: "分页大小无效" }, 400);
@@ -811,21 +833,26 @@ export class Workshop extends DurableObject<Env> {
           try { const parsed = JSON.parse(atob(params.get("cursor")!)); if (parsed.filter !== JSON.stringify([category, encodeURIComponent(query), authorId, appId]) || !Number.isSafeInteger(parsed.at) || parsed.at < 0 || !/^[a-z][a-z0-9-]{0,63}$/.test(parsed.id)) throw new Error(); after = parsed; }
           catch { return json({ message: "分页游标无效，请刷新列表" }, 400); }
         }
-        const remaining = after ? filtered.filter(entry => (entry.publishedAt || 0) < after!.at || (entry.publishedAt || 0) === after!.at && entry.manifest.appId.localeCompare(after!.id) > 0) : filtered;
-        const visible = paged ? remaining.slice(0, limit) : remaining;
-        const last = visible.at(-1);
-        const nextCursor = paged && last && remaining.length > limit ? btoa(JSON.stringify({ at: last.publishedAt || 0, id: last.manifest.appId, filter: JSON.stringify([category, encodeURIComponent(query), authorId, appId]) })) : undefined;
+        const selection = this.marketIndex.page({ appId, authorId, category, query, after, limit: paged ? limit + 1 : undefined });
+        if (params.get("view") === "count") return json({ applications: [], totalCount: selection.total }, 200);
+        const rows = paged ? selection.rows.slice(0, limit) : selection.rows;
+        const records = rows.length ? await getMany<MarketEntry>(this.ctx.storage, rows.map(row => `shared:${row.app_id}`)) : new Map<string, MarketEntry>();
+        const visible = rows.flatMap(row => { const entry = records.get(`shared:${row.app_id}`); return entry ? [{ ...entry, authorOfficial: entry.authorId === OFFICIAL_ACCOUNT_ID }] : []; });
+        const last = rows.at(-1);
+        const nextCursor = paged && last && selection.rows.length > limit ? btoa(JSON.stringify({ at: last.at, id: last.app_id, filter: JSON.stringify([category, encodeURIComponent(query), authorId, appId]) })) : undefined;
         // Independent public enrichments share one wait; profile failures keep snapshots usable.
         const [profiles, counts] = await Promise.all([
           publicProfiles([...new Set(visible.map(entry => entry.authorId).filter((id): id is string => Boolean(id)))], this.env).catch(() => new Map()),
-          path === "/v1/market" && visible.length ? this.ctx.storage.get<number>(visible.map(entry => `downloads:${entry.manifest.appId}`)) : Promise.resolve(new Map<string, number>())
+          path === "/v1/market" && visible.length ? getMany<number>(this.ctx.storage, visible.map(entry => `downloads:${entry.manifest.appId}`)) : Promise.resolve(new Map<string, number>())
         ]);
         for (const entry of visible) {
           const profile = entry.authorId ? profiles.get(entry.authorId) : undefined;
           if (profile) { entry.authorName = profile.name; entry.authorAvatarUrl = profile.avatarUrl; }
           if (path === "/v1/market") entry.downloadCount = counts.get(`downloads:${entry.manifest.appId}`) ?? 0;
         }
-        const response = json({ applications: path === "/v1/applications" ? visible.map(entry => entry.manifest) : visible, nextCursor }, 200);
+        const compact = ["picker", "summary"].includes(params.get("view") || "");
+        const applications = path === "/v1/applications" ? visible.map(entry => entry.manifest) : compact ? visible.map(entry => ({ ...entry, summaryOnly: true, screenshots: undefined, manifest: { version: entry.manifest.version, releaseNotes: entry.manifest.releaseNotes, appId: entry.manifest.appId, releaseId: entry.manifest.releaseId, appName: entry.manifest.appName, description: entry.manifest.description, accent: entry.manifest.accent, icon: entry.manifest.icon } })) : visible;
+        const response = json({ applications, nextCursor, totalCount: selection.total }, 200);
         response.headers.set("Cache-Control", "no-store"); return response;
       }
       if (new URL(request.url).pathname === "/v1/catalog") {
@@ -925,7 +952,10 @@ export class Workshop extends DurableObject<Env> {
         if (!manifest || manifest.appId !== appId || manifest.releaseId !== releaseId || manifest.source.dirty) return json({ message: "指定版本尚未上传或无效" }, 409);
         const prior = await this.ctx.storage.get<MarketEntry>(`shared:${appId}`);
         const entry: MarketEntry = { manifest, title: manifest.appName, summary: manifest.description, category: prior?.category || (appId === "jolly" ? "creative" : "other"), screenshots: prior?.screenshots || [], publishedAt: prior?.manifest.releaseId === releaseId ? prior.publishedAt || Date.now() : Date.now(), authorId: OFFICIAL_ACCOUNT_ID, authorName: "生花官方", authorOfficial: true, originalAppId: null };
-        await this.ctx.storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${releaseId}`]: true });
+        await this.ctx.storage.transaction(async storage => {
+          await storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${releaseId}`]: true });
+          this.marketIndex.put(entry);
+        });
         await this.ctx.storage.delete(`withdrawn:${appId}`);
         return json({ appId, public: releaseId }, 200);
       }
@@ -972,16 +1002,27 @@ export class Workshop extends DurableObject<Env> {
       }
       if (path === "/v1/works" && request.method === "GET") {
         const user = await authenticatedUser(request, this.env); if (!user) return json({ message: "请先登录" }, 401);
-        const tasks = [...(await this.ctx.storage.list<WorkshopTask>({ prefix: `owner:${user.id}:` })).values()];
+        const params = new URL(request.url).searchParams;
+        const gallery = params.get("view") === "gallery";
+        const term = (params.get("q") || "").trim().toLowerCase();
+        const allTasks = [...(await this.ctx.storage.list<WorkshopTask>({ prefix: `owner:${user.id}:` })).values()].filter(task => task.ownerId === user.id && (!term || `${task.title || ""} ${task.wish || ""}`.toLowerCase().includes(term))).sort((a,b) => (b.startedAt || 0) - (a.startedAt || 0) || b.appId.localeCompare(a.appId));
+        const cursor = params.get("cursor");
+        let after: {at: number; id: string} | undefined;
+        if (gallery && cursor) { try { after = JSON.parse(atob(cursor)); if (!after || !Number.isSafeInteger(after.at) || after.at < 0 || typeof after.id !== "string" || !/^[a-z][a-z0-9-]{0,63}$/.test(after.id) || (after as {filter?: string}).filter !== JSON.stringify([user.id,term])) throw new Error(); } catch { return json({message: "作品分页标记无效"},400); } }
+        const matching = after ? allTasks.filter(task => (task.startedAt || 0) < after!.at || (task.startedAt || 0) === after!.at && task.appId.localeCompare(after!.id) < 0) : allTasks;
+        const tasks = gallery ? matching.slice(0,24) : matching;
+        const last = tasks.at(-1);
+        const nextCursor = gallery && matching.length > 24 && last ? btoa(JSON.stringify({at: last.startedAt || 0, id: last.appId, filter: JSON.stringify([user.id,term])})) : null;
         const force = new URL(request.url).searchParams.get("refresh") === "1";
-        const entries = await Promise.all(tasks.filter(task => task.ownerId === user.id).map(async task => {
-          const [application, shared, cached] = await Promise.all([this.candidate(task.appId), this.ctx.storage.get<MarketEntry>(`shared:${task.appId}`), this.ctx.storage.get<{ key: string; at: number; status: WorkSummary }>(`work-summary:${task.appId}`)]);
-          const valid = cached?.key === this.summaryKey(task, application);
-          const settled = task.phase === "ready" && isRoundCandidate(task, application);
-          // A completed round with its actual candidate is authoritative locally;
-          // old/expired Jules sessions cannot make a delivered work stale again.
-          return { task, application, shared: shared?.authorId === user.id ? shared : null, cached: valid ? cached : undefined, pending: !settled && force ? this.refreshSummary(task, application) : undefined };
-        }));
+        const metadata = await getMany<ApplicationRelease | MarketEntry | {key: string; at: number; status: WorkSummary} | string>(this.ctx.storage, tasks.flatMap(task => [`candidate:${task.appId}`, `shared:${task.appId}`, `work-summary:${task.appId}`, `application-icon:${task.appId}`]));
+        const entries = tasks.map(task => {
+          const application = metadata.get(`candidate:${task.appId}`) as ApplicationRelease | undefined;
+          const shared = metadata.get(`shared:${task.appId}`) as MarketEntry | undefined;
+          const cached = metadata.get(`work-summary:${task.appId}`) as {key: string; at: number; status: WorkSummary} | undefined;
+          const valid = cached?.key === this.summaryKey(task, application ?? null);
+          const settled = task.phase === "ready" && isRoundCandidate(task, application ?? null);
+          return {task, application: application ?? null, shared: shared?.authorId === user.id ? shared : null, cached: valid ? cached : undefined, pending: !settled && force ? this.refreshSummary(task, application ?? null) : undefined};
+        });
         const pending = Promise.all(entries.map(entry => entry.pending)); this.ctx.waitUntil(pending);
         // Bound the whole list wait, rather than spending a timeout on every work.
         if (force || entries.some(entry => !entry.cached)) {
@@ -989,18 +1030,19 @@ export class Workshop extends DurableObject<Env> {
           await Promise.race([pending, new Promise<void>(resolve => { timer = setTimeout(resolve, 6500); })]);
           if (timer) clearTimeout(timer);
         }
-        const works = await Promise.all(entries.map(async ({ task: initial, cached: previous }) => {
-          const task = await this.ctx.storage.get<WorkshopTask>(`task:${initial.appId}`);
+        const works = await Promise.all(entries.map(async ({ task: initial, cached: previous, application: initialApplication, shared: initialShared }) => {
+          const task = force ? await this.ctx.storage.get<WorkshopTask>(`task:${initial.appId}`) : initial;
           if (!task || task.ownerId !== user.id) return undefined;
-          const [application, shared] = await Promise.all([this.candidate(task.appId), this.ctx.storage.get<MarketEntry>(`shared:${task.appId}`)]);
-          const cached = await this.ctx.storage.get<{ key: string; at: number; status: WorkSummary }>(`work-summary:${task.appId}`);
+          const [application, shared] = force ? await Promise.all([this.candidate(task.appId), this.ctx.storage.get<MarketEntry>(`shared:${task.appId}`)]) : [initialApplication, initialShared];
+          const cached = force ? await this.ctx.storage.get<{ key: string; at: number; status: WorkSummary }>(`work-summary:${task.appId}`) : previous;
           const valid = cached?.key === this.summaryKey(task, application);
           const settled = task.phase === "ready" && isRoundCandidate(task, application);
           const status = settled ? summarizeWork(task, { state: "COMPLETED" }, application) : valid ? cached.status : summarizeWork(task, { state: task.phase === "ready" ? "COMPLETED" : "QUEUED" }, application);
           const ttl = status.completed && status.application ? 300000 : 20000;
-          return { submissionId: task.requestId, appId: task.appId, ownerId: task.ownerId, session: task.session, approvalToken: task.token, title: task.title ?? task.appId, wish: task.wish ?? "", startedAt: task.startedAt, originalAppId: task.originalAppId, originalReleaseId: task.originalReleaseId, originalCommit: task.originalCommit, branch: task.branch, phase: task.phase, status: { ...status, stale: !settled && (!valid || Date.now() - cached.at >= ttl || force && cached.at === previous?.at) }, sharing: { shared: shared?.authorId === user.id ? shared : null, application, iconUrl: await this.ctx.storage.get<string>(`application-icon:${task.appId}`) }, updatedAt: valid ? cached.at : null };
+          return { submissionId: task.requestId, appId: task.appId, ownerId: task.ownerId, session: task.session, approvalToken: task.token, title: task.title ?? task.appId, wish: task.wish ?? "", startedAt: task.startedAt, originalAppId: task.originalAppId, originalReleaseId: task.originalReleaseId, originalCommit: task.originalCommit, branch: task.branch, phase: task.phase, status: { ...status, stale: !settled && (!valid || Date.now() - cached.at >= ttl || force && cached.at === previous?.at) }, sharing: { shared: shared?.authorId === user.id ? shared : null, application, iconUrl: metadata.get(`application-icon:${task.appId}`) as string | undefined }, updatedAt: valid ? cached.at : null };
         }));
-        const response = json({ works: works.filter(Boolean) }, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
+        const selected = works.filter((work): work is NonNullable<typeof work> => !!work);
+        const response = json(gallery ? {works: selected.map(work => ({appId: work.appId, title: work.status.application?.appName || work.title, wish: work.wish, createdAt: work.startedAt || 0, manifest: work.status.application || work.sharing.application, sharing: work.sharing, stale: work.status.stale, message: work.status.message, stage: work.status.state === "FAILED" ? "failed" : work.status.state === "PAUSED" ? "paused" : work.status.state === "AWAITING_USER_FEEDBACK" ? "reply" : work.status.completed ? work.status.application ? "load" : work.status.delivery === "blocked" ? "blocked" : "making" : "making"})), nextCursor, totalCount: allTasks.length} : {works: selected}, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
       }
       const input = await request.json() as { appId?: string; originalAppId?: string; originalReleaseId?: string; requestId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; category?: string; screenshots?: string[]; applicationReleases?: Record<string, string>; pageToken?: string; compact?: boolean };
       const appId = input.appId;
@@ -1067,8 +1109,11 @@ export class Workshop extends DurableObject<Env> {
         if (shared && shared.authorId !== user.id) return json({ message: "只有作者可以管理这份分享" }, 403);
         if (input.action === "status") return json({ shared, application, iconUrl: await this.ctx.storage.get<string>(`application-icon:${appId}`) }, 200);
         if (input.action === "withdraw") {
-          await this.ctx.storage.delete(`shared:${appId}`);
-          await this.ctx.storage.put(`withdrawn:${appId}`, true);
+          await this.ctx.storage.transaction(async storage => {
+            await storage.delete(`shared:${appId}`);
+            await storage.put(`withdrawn:${appId}`, true);
+            this.marketIndex.remove(appId);
+          });
           this.emitWork(user.id, appId);
           return json({ shared: null, application }, 200);
         }
@@ -1089,7 +1134,10 @@ export class Workshop extends DurableObject<Env> {
           if (!screenshot.startsWith(prefix) || !/^[a-f0-9]{64}$/.test(screenshot.slice(prefix.length)) || !await this.env.BLOBS.head(screenshot.slice(new URL(request.url).origin.length + 1))) return json({ message: "截图未上传或不属于这个作品" }, 400);
         }
         const entry: MarketEntry = { iconUrl: await this.ctx.storage.get<string>(`application-icon:${appId}`), manifest, title, summary, category, screenshots, publishedAt: input.action === "edit" ? shared!.publishedAt || 0 : shared?.manifest.releaseId === manifest.releaseId ? shared.publishedAt || Date.now() : Date.now(), authorId: user.id, authorName: user.name, authorAvatarUrl: user.avatarUrl, authorOfficial: user.id === OFFICIAL_ACCOUNT_ID, originalAppId: task.originalAppId ?? shared?.originalAppId ?? null, sourceCommit: input.action === "edit" ? shared!.sourceCommit : proof?.commit ?? (!manifest.source.dirty ? manifest.source.commit : undefined), sourceBranch: input.action === "edit" ? shared!.sourceBranch : proof?.branch };
-        await this.ctx.storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${manifest.releaseId}`]: true });
+        await this.ctx.storage.transaction(async storage => {
+          await storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${manifest.releaseId}`]: true });
+          this.marketIndex.put(entry);
+        });
         await this.ctx.storage.delete(`withdrawn:${appId}`);
         this.emitWork(user.id, appId);
         return json({ shared: entry, application }, 200);
@@ -1139,17 +1187,17 @@ export class Workshop extends DurableObject<Env> {
         const response = json(await this.activities(task.session, input.pageToken), 200);
         response.headers.set("Cache-Control", "private,no-store"); return response;
       }
-      if (input.action === "detail") {
+      if (input.action === "detail" || input.action === "progress") {
         const started = Date.now();
         const [session, application, shared, initialActivities] = await Promise.all([
           this.session(task.session), this.candidate(appId), this.ctx.storage.get<MarketEntry>(`shared:${appId}`),
-          input.compact ? Promise.resolve({ ...(this.activityPages.get(task.session)?.page ?? { activities: [] }), stale: true }) : this.recentActivities({ name: task.session }),
+          (input.compact || input.action === "progress") ? Promise.resolve({ ...(this.activityPages.get(task.session)?.page ?? { activities: [] }), stale: true }) : this.recentActivities({ name: task.session }),
         ]);
         // Status is independent of the bulk history. Only round confirmation
         // needs activities before replying; history warming never polls the client.
         const confirmRound = task.awaitingRoundStart && ["COMPLETED", "FAILED", "PAUSED", "AWAITING_USER_FEEDBACK"].includes(session.state || "");
-        const activityResult = input.compact && confirmRound ? await this.recentActivities({ ...session, name: task.session }) : initialActivities;
-        if (input.compact && !confirmRound) this.ctx.waitUntil(this.recentActivities({ ...session, name: task.session }).catch(() => {}));
+        const activityResult = input.action === "progress" ? await this.progressActivities(task, session) : input.compact && confirmRound ? await this.recentActivities({ ...session, name: task.session }) : initialActivities;
+        if (input.compact && !confirmRound && input.action !== "progress") this.ctx.waitUntil(this.recentActivities({ ...session, name: task.session }).catch(() => {}));
         observeRound(task, session, activityResult.activities);
         Object.assign(session, currentRoundSession(task, session, application));
         if (task.startedAt) activityResult.activities = activityResult.activities.filter(value => Date.parse((value as { createTime?: string }).createTime || "") >= task.startedAt!);

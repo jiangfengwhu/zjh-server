@@ -74,3 +74,18 @@ GET /v1/messages/live 以 Authorization 头建立 WebSocket，复用 Posts 的�
 GET /v1/application-discussions/<appId> 返回已公开作品的独立讨论及当前账号的点赞、收藏状态；讨论按应用 ID 跨版本保留，不进入社区时间线。点赞、评论复用 /v1/posts/<id>/like、comments；POST/DELETE /v1/posts/<id>/bookmark 幂等收藏/取消收藏。讨论不能作为动态删除，读作品讨论时重新校验公开状态。复用既有 Posts 存储与账号鉴权，不新增绑定。
 
 维护者可用 `POST /v1/application-source` 修复当前公开版本的源码定位，携带 appId、releaseId、commit、branch；接口核对应用目录快照和分支包含关系，不修改公开包或合入 PR。旧版本缺少应用目录快照时，须先在独立目录重建并确认 bundle 与全部 assets 一致，再携带 rebuiltBundleSha256、rebuiltAssets；可用 remixAppIds 指定需要同步来源记录的已有改编任务。接口仅接受维护者授权。
+
+## 宿主页面读模型
+
+- GET /v1/discovery：沿用 market 的 limit/cursor/category/q 条件，批量带回 discussion、authorFollowing，按登录身份组装且不公共缓存；互动失败降级为公开作品页，不预取评论。
+- GET /v1/application-discussions/<appId>?comments=1：讨论与评论第一页、nextCursor、following 一起返回。后续评论继续使用既有 post 接口。
+- GET /v1/me/works：认证账号的作品展示分页（24 条）、totalCount、summary；支持 q、cursor、refresh=1，游标绑定账号和搜索条件，不携带恢复凭据。原 GET /v1/works 全量恢复契约保留。
+- GET /v1/profiles/<id>?view=relationship|summary|posts|apps：只读关系/摘要或当前 tab；applicationCount 为公开作品总数，动态 nextCursor 与作品 applicationsNextCursor 独立。旧无 view 契约保留。
+- GET /v1/market?view=summary|picker&limit=24：显示投影，不含 bundle/assets 等执行清单，summaryOnly=true；宿主读取 detail 后才能进行需要完整清单的操作。发现流保留完整 manifest。
+- POST /v1/workshop 的 action=progress：沿用账号、应用、会话和本轮凭据校验，仅返回本轮最后模型消息。按 session/轮次/上游 state+updateTime 持久缓存；首次回填或上游版本变化可能遍历历史，失败标 stale，旧 detail/activities 契约保留，无定时查询。
+- GET /v1/account-counts：合并通知 unreadCount/unreadByCategory 和 messageUnreadCount，仅供实时连接失败时回退。
+- GET /v1/messages/<peerId>?after=<messageId>：认证会话的增量页，最多 50 条，hasMoreNew 指示后续增量；不能与历史 cursor 混用。message/read 实时事件携带 peerId。GET 不标记已读。
+
+Workshop 和 Posts 的派生 SQLite 索引复用现有存储：公开作品顺序/作者/分类与单字、双字搜索 posting；社区动态作者和关注 join；通知 owner/category。首次读取回填旧 KV，发布/撤回/删除/关注变更在同一 KV/SQL 事务更新，索引不存制作凭据，不新增绑定或清理原数据。中文搜索保留子串匹配，posting 筛选后再做精确包含检查。
+
+针对性回归：`node --test tests/pageReads.test.mjs`，使用本地真实 SQLite 与模拟账号/DO，不访问生产数据。

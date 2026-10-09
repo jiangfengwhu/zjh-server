@@ -1,3 +1,4 @@
+import { getMany } from "./storageBatch";
 import { sendLive, sendAccountLive } from "./live";
 import { sharedLinkActions, sharedLinkStyles } from "./sharedLinks";
 import { normalizePostContent, type PostContent } from "./postHtml";
@@ -10,6 +11,7 @@ import {
 } from "./accounts";
 import { SocialInbox, SocialError } from "./social";
 import { KeyedQueue } from "./concurrency";
+import { TimelineIndex } from "./readIndexes";
 
 type Author = Pick<User, "id" | "name" | "avatarUrl">;
 type Media = {
@@ -39,6 +41,7 @@ type Post = {
   application?: ApplicationLink;
   content?: PostContent;
 };
+type ApplicationItem = { manifest: { appId: string; releaseId: string; appName: string; description: string; accent: string; icon?: ApplicationLink["icon"] }; title?: string; summary?: string; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; iconUrl?: string };
 type Comment = {
   id: string;
   postId: string;
@@ -110,11 +113,13 @@ const postKey = (post: Post) =>
 
 /** Public user timeline; account credentials and app-generated posts remain separate. */
 export class Posts extends DurableObject<Env> {
+  private readIndex = new TimelineIndex(this.ctx);
   private queue = new KeyedQueue();
   private noticeChanges = new Set<string>();
   private resetting = false;
   private pending = new Set<Promise<unknown>>();
   async fetch(request: Request): Promise<Response> {
+    await this.readIndex.ensure();
     if (
       new URL(request.url).pathname === "/internal/development-reset" &&
       request.method === "POST"
@@ -146,11 +151,24 @@ export class Posts extends DurableObject<Env> {
   private async handle(request: Request): Promise<Response> {
     try {
       const url = new URL(request.url);
+      if (url.pathname === "/internal/account-counts" && request.method === "GET") {
+        const viewer = await authenticatedUser(request, this.env);
+        if (!viewer) return json({ message: "请先登录" }, 401);
+        const [notices, messages] = await Promise.all([this.noticeSummary(viewer.id), this.ctx.storage.get<number>(`dm-unread:${viewer.id}`)]);
+        return json({ ...notices, messageUnreadCount: messages ?? 0 });
+      }
+      if (url.pathname === "/internal/application-interactions" && request.method === "POST") {
+        const viewer = request.headers.has("Authorization") ? await authenticatedUser(request, this.env) : null;
+        const { applications } = await request.json() as { applications: ApplicationItem[] };
+        if (!Array.isArray(applications) || applications.length > 50) throw new InputError("作品分页无效");
+        return json({ items: await this.discussions(applications, viewer) });
+      }
       if (
         url.pathname === "/internal/development-reset" &&
         request.method === "POST"
       ) {
         await this.ctx.storage.deleteAll();
+        this.readIndex = new TimelineIndex(this.ctx);
         await this.ctx.storage.deleteAlarm();
         let cursor: string | undefined;
         do {
@@ -213,6 +231,7 @@ export class Posts extends DurableObject<Env> {
             9999999999999 - notice.createdAt
           ).padStart(13, "0")}:${id}`;
           await storage.put(key, notice);
+          this.readIndex.notice(key, input.ownerId, notice.kind);
           await storage.put(index, key);
           await this.changeUnread(storage, input.ownerId, notice.kind, 1);
         });
@@ -225,53 +244,13 @@ export class Posts extends DurableObject<Env> {
           ? await authenticatedUser(request, this.env)
           : null;
         if (following && !viewer) return json({ posts: [], nextCursor: null });
-        const followed = following ? new Set<string>() : null;
-        if (followed) {
-          let after: string | undefined;
-          while (true) {
-            const records = await this.ctx.storage.list<boolean>({
-              prefix: `follow:${viewer!.id}:`,
-              startAfter: after,
-              limit: 500,
-            });
-            for (const key of records.keys()) followed.add(key.split(":")[2]);
-            if (records.size < 500) break;
-            after = [...records.keys()].at(-1);
-          }
-          if (!followed.size) return json({
-            posts: [], nextCursor: null,
-            unreadCount: (await this.ctx.storage.get<number>(`notice-unread:${viewer!.id}`)) ?? 0,
-          });
-        }
         const cursor = url.searchParams.get("cursor") || undefined;
         const authorId = url.searchParams.get("authorId") || undefined;
-        if (authorId && !uuid.test(authorId))
-          throw new InputError("作者标识无效");
-        if (cursor && !/^post:\d{13}:[a-f0-9]{64}$/.test(cursor))
-          throw new InputError("分页标记无效");
-        const limit = authorId || following ? 500 : 51;
-        const matching: Array<[string, Post]> = [];
-        let after = cursor;
-        let hasMore = false;
-        let scannedCount = 0;
-        do {
-          const entries = await this.ctx.storage.list<Post>({
-            prefix: "post:",
-            startAfter: after,
-            limit,
-          });
-          for (const entry of entries) {
-            after = entry[0];
-            scannedCount++;
-            if (
-              (!authorId || entry[1].author.id === authorId) &&
-              (!followed || followed.has(entry[1].author.id))
-            )
-              matching.push(entry);
-            if (matching.length > 50) break;
-          }
-          hasMore = entries.size === limit;
-        } while (matching.length <= 50 && hasMore && scannedCount < 5000);
+        if (authorId && !uuid.test(authorId)) throw new InputError("作者标识无效");
+        if (cursor && !/^post:\d{13}:[a-f0-9]{64}$/.test(cursor)) throw new InputError("分页标记无效");
+        const locations = this.readIndex.posts({ author: authorId, viewer: following ? viewer!.id : undefined, after: cursor, limit: 51 });
+        const records = locations.length ? await this.ctx.storage.get<Post>(locations) : new Map<string, Post>();
+        const matching = locations.flatMap(key => { const post = records.get(key); return post ? [[key, post] as [string, Post]] : []; });
         const page = matching.slice(0, 50);
         // Hydrate the list as one BFF operation: batch stats/reactions instead of
         // issuing up to two storage reads for every post in a 50-item page.
@@ -298,7 +277,7 @@ export class Posts extends DurableObject<Env> {
             };
           }),
           nextCursor:
-            matching.length > 50 ? page.at(-1)![0] : hasMore ? after : null,
+            matching.length > 50 ? page.at(-1)![0] : null,
           unreadCount: viewer ? metadata.get(`notice-unread:${viewer.id}`) ?? 0 : 0,
         });
       }
@@ -307,6 +286,25 @@ export class Posts extends DurableObject<Env> {
       )?.[1];
       if (profileId && request.method === "GET") {
         if (!uuid.test(profileId)) throw new InputError("作者标识无效");
+        const view = url.searchParams.get("view");
+        if (["relationship", "summary", "posts", "apps"].includes(view || "")) {
+          const viewer = request.headers.has("Authorization") ? await authenticatedUser(request, this.env) : null;
+          const follow = await this.followStatus(profileId, viewer?.id);
+          if (view === "relationship") return json(follow);
+          const marketParams = new URLSearchParams({ authorId: profileId, limit: view === "apps" ? "24" : "1", view: view === "apps" ? "full" : "count" });
+          if (view === "apps" && url.searchParams.get("cursor")) marketParams.set("cursor", url.searchParams.get("cursor")!);
+          const [profiles, market, timeline] = await Promise.all([
+            publicProfiles([profileId], this.env),
+            this.env.WORKSHOP.getByName("dynamic").fetch(new Request(`https://workshop.internal/v1/market?${marketParams}`)),
+            view === "posts" ? this.handle(new Request(`https://posts.internal/v1/posts?authorId=${profileId}${url.searchParams.get("cursor") ? `&cursor=${encodeURIComponent(url.searchParams.get("cursor")!)}` : ""}`, { headers: request.headers })) : Promise.resolve(undefined),
+          ]);
+          const author = profiles.get(profileId);
+          if (!author) throw new InputError("这位作者不存在", 404);
+          if (!market.ok || timeline && !timeline.ok) throw new InputError("主页暂时不可用，请重试", 503);
+          const applications = await market.json() as { applications: unknown[]; nextCursor?: string; totalCount: number };
+          const posts = timeline ? await timeline.json() as { posts: unknown[]; nextCursor: string | null } : { posts: [], nextCursor: null };
+          return json({ ...follow, author: { ...author, official: profileId === OFFICIAL_ACCOUNT_ID }, applicationCount: applications.totalCount, applications: applications.applications, applicationsNextCursor: applications.nextCursor ?? null, ...posts });
+        }
         const [profiles, market, timeline, follow] = await Promise.all([
           publicProfiles([profileId], this.env),
           this.env.WORKSHOP.getByName("dynamic").fetch(
@@ -370,7 +368,7 @@ export class Posts extends DurableObject<Env> {
       const applicationId = url.pathname.match(/^\/v1\/application-discussions\/([a-z][a-z0-9-]{0,63})$/)?.[1];
       if (applicationId && request.method === "GET") {
         const viewer = request.headers.has("Authorization") ? await authenticatedUser(request, this.env) : null;
-        return await this.applicationDiscussion(applicationId, viewer);
+        return await this.applicationDiscussion(applicationId, viewer, url.searchParams.get("comments") === "1");
       }
       const target = url.pathname.match(
         /^\/v1\/posts\/([a-f0-9]{64})(?:\/(like|bookmark|comments)(?:\/([a-f0-9]{64}))?)?$/
@@ -382,41 +380,25 @@ export class Posts extends DurableObject<Env> {
         target[2] !== "bookmark" &&
         !target[3]
       ) {
-        const post = await this.findPost(target[1]);
         const commentId = url.searchParams.get("commentId");
-        let start: string | undefined;
-        if (commentId) {
-          if (!/^[a-f0-9]{64}$/.test(commentId))
-            throw new InputError("评论标识无效");
-          start = await this.ctx.storage.get<string>(
-            `comment-id:${target[1]}:${commentId}`
-          );
-          if (!start) throw new InputError("这条评论已删除", 404);
-        }
-        const page = await this.comments(
-          target[1],
-          url.searchParams.get("cursor") || undefined,
-          start
-        );
-        const viewer = request.headers.has("Authorization")
-          ? await authenticatedUser(request, this.env)
-          : null;
-        const profiles = await publicProfiles(
-          [post.author.id, ...page.comments.map((item) => item.author.id)],
-          this.env
-        );
-        if (!target[2] && !url.searchParams.has("cursor")) await this.recordViews([post.id], request, viewer).catch(() => {});
-        return json({
-          post: await this.decorate(
-            { ...post, author: profiles.get(post.author.id) ?? post.author },
-            viewer
-          ),
-          comments: page.comments.map((item) => ({
-            ...item,
-            author: profiles.get(item.author.id) ?? item.author,
-          })),
-          nextCursor: page.nextCursor,
-        });
+        if (commentId && !/^[a-f0-9]{64}$/.test(commentId)) throw new InputError("评论标识无效");
+        const [post, page, viewer] = await Promise.all([
+          this.findPost(target[1]),
+          (async () => {
+            const start = commentId ? await this.ctx.storage.get<string>(`comment-id:${target[1]}:${commentId}`) : undefined;
+            if (commentId && !start) throw new InputError("这条评论已删除", 404);
+            return this.comments(target[1], url.searchParams.get("cursor") || undefined, start);
+          })(),
+          request.headers.has("Authorization") ? authenticatedUser(request, this.env) : Promise.resolve(null),
+        ]);
+        const [profiles, decorated] = await Promise.all([
+          publicProfiles([...new Set([post.author.id, ...page.comments.map(item => item.author.id)])], this.env),
+          (async () => {
+            if (!target[2] && !url.searchParams.has("cursor")) await this.recordViews([post.id], request, viewer).catch(() => {});
+            return this.decorate(post, viewer);
+          })(),
+        ]);
+        return json({post: {...decorated, author: profiles.get(post.author.id) ?? post.author}, comments: page.comments.map(item => ({...item, author: profiles.get(item.author.id) ?? item.author})), nextCursor: page.nextCursor});
       }
       const relationship = url.pathname.match(/^\/v1\/profiles\/([a-f0-9-]{36})\/(followers|following)$/);
       if (relationship && request.method === "GET") {
@@ -452,6 +434,7 @@ export class Posts extends DurableObject<Env> {
           await this.ctx.storage.transaction(async (storage) => {
             const key = `follow:${user.id}:${followId}`;
             const previous = !!(await storage.get(key));
+            this.readIndex.follow(user.id, followId, desired);
             const reverse = `follower:${followId}:${user.id}`;
             if (desired) await storage.put(reverse, true);
             else await storage.delete(reverse);
@@ -583,23 +566,13 @@ export class Posts extends DurableObject<Env> {
     if (supplied && category && !supplied.startsWith(`${category}|`)) throw new InputError("通知分页分类不一致");
     const cursor = supplied && category ? supplied.slice(category.length + 1) : supplied;
     if (cursor && (!cursor.startsWith(prefix) || !/^notice:[a-f0-9-]{36}:\d{13}:[a-f0-9]{64}$/.test(cursor))) throw new InputError("通知分页标记无效");
-    const entries: Array<[string, Notice]> = [];
-    let after = cursor;
-    let exhausted = false;
-    for (let scan = 0; scan < 10 && entries.length < 51; scan++) {
-      const records = await this.ctx.storage.list<Notice>({ prefix, startAfter: after, limit: 100 });
-      for (const [key, notice] of records) {
-        after = key;
-        const creation = notice.kind === "work-success" || notice.kind === "work-failure" || notice.kind === "work-submitted";
-        if (!category || (category === "creation") === creation) entries.push([key, notice]);
-        if (entries.length === 51) break;
-      }
-      exhausted = entries.length < 51 && records.size < 100;
-      if (exhausted) break;
-    }
-    const more = entries.length > 50 || !exhausted;
+    const records = category
+      ? await (async () => { const keys = this.readIndex.notices(user.id, category, cursor, 51); const values = keys.length ? await this.ctx.storage.get<Notice>(keys) : new Map<string, Notice>(); return new Map(keys.flatMap(key => { const value = values.get(key); return value ? [[key, value] as [string, Notice]] : []; })); })()
+      : await this.ctx.storage.list<Notice>({ prefix, startAfter: cursor, limit: 51 });
+    const entries = [...records.entries()];
+    const more = entries.length > 50;
     const page = entries.slice(0, 50);
-    const next = entries.length > 50 ? page.at(-1)![0] : after;
+    const next = page.at(-1)?.[0];
     const profiles = await publicProfiles(
       [...new Set(page.map(([, item]) => item.actor.id))],
       this.env
@@ -680,7 +653,7 @@ export class Posts extends DurableObject<Env> {
         const notice = key ? await storage.get<Notice>(key) : undefined;
         if (notice && !notice.read)
           await this.changeUnread(storage, recipient, notice.kind, -1);
-        if (key) await storage.delete(key);
+        if (key) { await storage.delete(key); this.readIndex.removeNotice(key); }
         await storage.delete(index);
       }
       await storage.delete(targetsKey);
@@ -735,44 +708,47 @@ export class Posts extends DurableObject<Env> {
     return counts;
   }
   /** One discussion per application, across releases; kept out of the community timeline. */
-  private async applicationDiscussion(appId: string, viewer: User | null) {
+  private async discussions(applications: ApplicationItem[], viewer: User | null) {
+    const identities = await Promise.all(applications.map(async item => ({ item, id: await digest(`application-discussion:${item.manifest.appId}`) })));
+    const posts = await this.ctx.storage.transaction(async storage => {
+      const keys = identities.map(({ item }) => `application-discussion:${item.manifest.appId}`);
+      const prior = keys.length ? await storage.get<Post>(keys) : new Map<string, Post>();
+      const writes: Record<string, Post | string> = {};
+      const posts = identities.map(({ item, id }) => {
+        if (!item.authorId) throw new InputError("作品作者暂时不可用", 503);
+        const key = `application-discussion:${item.manifest.appId}`;
+        const post: Post = { id, applicationDiscussion: true,
+          author: { id: item.authorId, name: item.authorName, avatarUrl: item.authorAvatarUrl ?? null },
+          body: item.summary || item.manifest.description, images: [], createdAt: prior.get(key)?.createdAt ?? Date.now(),
+          application: { appId: item.manifest.appId, releaseId: item.manifest.releaseId, title: item.title || item.manifest.appName, summary: item.summary || item.manifest.description, accent: item.manifest.accent, icon: item.manifest.icon, iconUrl: item.iconUrl } };
+        if (JSON.stringify(prior.get(key)) !== JSON.stringify(post)) { writes[key] = post; writes[`id:${id}`] = key; }
+        return post;
+      });
+      if (Object.keys(writes).length) await storage.put(writes);
+      return posts;
+    });
+    const keys = [...new Set(posts.flatMap(post => [`stats:${post.id}`, ...(viewer ? [`like:${post.id}:${viewer.id}`, `bookmark:${viewer.id}:${post.id}`, `follow:${viewer.id}:${post.author.id}`] : [])]))];
+    const metadata = keys.length ? await getMany<Stats | boolean>(this.ctx.storage, keys) : new Map<string, Stats | boolean>();
+    return posts.map(post => { const stats = metadata.get(`stats:${post.id}`) as Stats | undefined; return { appId: post.application!.appId, following: viewer ? !!metadata.get(`follow:${viewer.id}:${post.author.id}`) : false,
+      post: { ...post, viewCount: stats?.views ?? 0, likeCount: stats?.likes ?? 0, commentCount: stats?.comments ?? 0, liked: viewer ? !!metadata.get(`like:${post.id}:${viewer.id}`) : false, saved: viewer ? !!metadata.get(`bookmark:${viewer.id}:${post.id}`) : false } }; });
+  }
+  private async applicationDiscussion(appId: string, viewer: User | null, withComments = false) {
     const response = await this.env.WORKSHOP.getByName("dynamic").fetch(new Request(`https://workshop.internal/v1/market?appId=${appId}&detail=1`));
     if (!response.ok) throw new InputError("这个作品已撤回或暂未公开", response.status === 404 ? 404 : 503);
-    const { item } = await response.json() as { item: { manifest: { appId: string; releaseId: string; appName: string; description: string; accent: string; icon?: ApplicationLink["icon"] }; title: string; summary: string; authorId: string | null; authorName: string; authorAvatarUrl?: string | null; iconUrl?: string } };
+    const { item } = await response.json() as { item: ApplicationItem };
     if (!item?.authorId || item.manifest.appId !== appId) throw new InputError("作品信息暂时不可用", 503);
-    const id = await digest(`application-discussion:${appId}`);
-    return this.queue.run(`post:${id}`, async () => {
-      const key = `application-discussion:${appId}`;
-      const prior = await this.ctx.storage.get<Post>(key);
-      const post: Post = {
-        id, applicationDiscussion: true,
-        author: { id: item.authorId!, name: item.authorName, avatarUrl: item.authorAvatarUrl ?? null },
-        body: item.summary || item.manifest.description, images: [], createdAt: prior?.createdAt ?? Date.now(),
-        application: { appId, releaseId: item.manifest.releaseId, title: item.title || item.manifest.appName, summary: item.summary || item.manifest.description, accent: item.manifest.accent, icon: item.manifest.icon, iconUrl: item.iconUrl },
-      };
-      if (JSON.stringify(prior) !== JSON.stringify(post)) await this.ctx.storage.transaction(async storage => {
-        await storage.put(key, post);
-        await storage.put(`id:${id}`, key);
-      });
-      return json({ post: await this.decorate(post, viewer) });
-    });
+    const [{ post, following }] = await this.discussions([item], viewer);
+    if (!withComments) return json({ post, following });
+    const page = await this.comments(post.id);
+    const profiles = await publicProfiles([...new Set(page.comments.map(comment => comment.author.id))], this.env);
+    return json({ post, following, ...page, comments: page.comments.map(comment => ({ ...comment, author: profiles.get(comment.author.id) ?? comment.author })) });
   }
   private async decorate(post: Post, viewer: User | null) {
-    const stats = (await this.ctx.storage.get<Stats>(`stats:${post.id}`)) ?? {
-      likes: 0,
-      comments: 0,
-    };
-    const liked = viewer
-      ? !!(await this.ctx.storage.get(`like:${post.id}:${viewer.id}`))
-      : false;
-    return {
-      ...post,
-      viewCount: stats.views ?? 0,
-      likeCount: stats.likes,
-      commentCount: stats.comments,
-      liked,
-      saved: viewer ? !!await this.ctx.storage.get(`bookmark:${viewer.id}:${post.id}`) : false,
-    };
+    const keys = [`stats:${post.id}`, ...(viewer ? [`like:${post.id}:${viewer.id}`, `bookmark:${viewer.id}:${post.id}`] : [])];
+    const metadata = await this.ctx.storage.get<Stats | boolean>(keys);
+    const stats = metadata.get(keys[0]) as Stats | undefined;
+    return { ...post, viewCount: stats?.views ?? 0, likeCount: stats?.likes ?? 0, commentCount: stats?.comments ?? 0,
+      liked: viewer ? !!metadata.get(keys[1]) : false, saved: viewer ? !!metadata.get(keys[2]) : false };
   }
   private async like(id: string, user: User, wanted: boolean) {
     const post = await this.findPost(id);
@@ -808,6 +784,7 @@ export class Posts extends DurableObject<Env> {
         };
         const noticeKey = `notice:${recipient}:${String(9999999999999 - notice.createdAt).padStart(13, "0")}:${noticeId}`;
         await storage.put(noticeKey, notice);
+        this.readIndex.notice(noticeKey, recipient, notice.kind);
         await storage.put(index, noticeKey);
         await storage.put(targets, [recipient]);
         await this.changeUnread(storage, recipient, notice.kind, 1);
@@ -815,6 +792,7 @@ export class Posts extends DurableObject<Env> {
         const notice = await storage.get<Notice>(previousKey);
         if (notice && !notice.read) await this.changeUnread(storage, recipient, notice.kind, -1);
         await storage.delete([previousKey, index, targets]);
+        this.readIndex.removeNotice(previousKey);
       }
 
     });
@@ -953,6 +931,7 @@ export class Posts extends DurableObject<Env> {
           9999999999999 - notice.createdAt
         ).padStart(13, "0")}:${notice.id}`;
         await storage.put(noticeKey, notice);
+        this.readIndex.notice(noticeKey, recipient, notice.kind);
         await storage.put(`notice-id:${recipient}:${notice.id}`, noticeKey);
         await this.changeUnread(storage, recipient, notice.kind, 1);
       }
@@ -1176,6 +1155,7 @@ export class Posts extends DurableObject<Env> {
     };
     await this.ctx.storage.transaction(async (storage) => {
       await storage.put(postKey(post), post);
+      this.readIndex.post(postKey(post), user.id);
       await storage.put(`id:${post.id}`, postKey(post));
       await storage.put(requestKey, { key: postKey(post), fingerprint });
       for (const item of media)
@@ -1195,6 +1175,7 @@ export class Posts extends DurableObject<Env> {
       throw new InputError("只能删除自己的动态", 403);
     await this.ctx.storage.transaction(async (storage) => {
       await storage.delete(key!);
+      this.readIndex.removePost(key!);
       await storage.delete(`id:${id}`);
       for (const image of post.images) {
         const media = await storage.get<Media>(`media:${image.id}`);
