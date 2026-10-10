@@ -2,7 +2,7 @@ import { getMany } from "./storageBatch";
 import { validateApplicationIcon, validIconJpeg } from "./applicationIcon";
 import { androidAssetLinks, downloadLatestApk, readSharedApplication } from "./sharedLinks";
 import { DurableObject } from "cloudflare:workers";
-import { authenticatedUser, OFFICIAL_ACCOUNT_ID, OFFICIAL_APPLICATIONS, publicProfiles, readAvatar } from "./accounts";
+import { authenticatedUser, OFFICIAL_ACCOUNT_ID, OFFICIAL_PROFILE, OFFICIAL_APPLICATIONS, publicProfiles, readAvatar } from "./accounts";
 import { KeyedQueue } from "./concurrency";
 import { MarketIndex } from "./readIndexes";
 import { pageBff } from "./pageBff";
@@ -956,7 +956,7 @@ export class Workshop extends DurableObject<Env> {
         const manifest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/releases/${releaseId}`, "json");
         if (!manifest || manifest.appId !== appId || manifest.releaseId !== releaseId || manifest.source.dirty) return json({ message: "指定版本尚未上传或无效" }, 409);
         const prior = await this.ctx.storage.get<MarketEntry>(`shared:${appId}`);
-        const entry: MarketEntry = { manifest, title: manifest.appName, summary: manifest.description, category: prior?.category || (appId === "jolly" ? "creative" : "other"), screenshots: prior?.screenshots || [], publishedAt: prior?.manifest.releaseId === releaseId ? prior.publishedAt || Date.now() : Date.now(), authorId: OFFICIAL_ACCOUNT_ID, authorName: "生花官方", authorOfficial: true, originalAppId: null };
+        const entry: MarketEntry = { manifest, title: manifest.appName, summary: manifest.description, category: prior?.category || (appId === "jolly" ? "creative" : "other"), screenshots: prior?.screenshots || [], publishedAt: prior?.manifest.releaseId === releaseId ? prior.publishedAt || Date.now() : Date.now(), authorId: OFFICIAL_ACCOUNT_ID, authorName: OFFICIAL_PROFILE.name, authorAvatarUrl: OFFICIAL_PROFILE.avatarUrl, authorOfficial: true, originalAppId: null };
         await this.ctx.storage.transaction(async storage => {
           await storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${releaseId}`]: true });
           this.marketIndex.put(entry);
