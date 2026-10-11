@@ -1,4 +1,4 @@
-# 紫金花服务端
+# 生花服务端
 
 Cloudflare Worker 提供账号、动态互动、作品与产物接口及 Jules 制作代理。SDK/宿主在 zjh-dynamic，APK 在 zjh-android，应用源码与云端 Agent 规则在 zjh-plugin。维护边界见 [AGENTS.md](AGENTS.md)。
 
@@ -59,13 +59,13 @@ APP_DATA 使用 SQLite Durable Objects。私有实例按 userId 分配，内部�
 
 通知 category=creation/interaction 使用独立分页游标；不传 category 返回全部通知。通知列表、未读查询与标记已读均返回 unreadByCategory（creation/interaction 未读数）；点赞、评论、回复归入互动，重复点赞不生成通知，取消点赞清理对应通知。制作状态携带 submissionId/startedAt，旧轮终态不能覆盖新提交；继续修改的 requestId 绑定账号、应用、会话与正文，成功重试不再次提交。
 
-候选发布必须提供 expectedReleases 原子基线，冲突返回 409；candidate 为权威候选，latest 为私有镜像，不检查应用提交祖先。市场与安装只消费公开版本，APK 只内置宿主 vendor/app 包；官方身份由服务端生成。
+候选发布必须提供 expectedReleases 原子基线，冲突返回 409；candidate 为权威候选，latest 为私有镜像，不检查应用提交祖先。发现与安装只消费公开版本，APK 只内置宿主 vendor/app 包；官方身份由服务端生成。
 
 任务命令保存应用本轮身份，发布脚本通过 POST /v1/application-publisher/<appId> 自动获取最长 30 分钟的发布授权，期限不超过任务凭据；账号、应用与 publishEpoch 必须一致。同一轮 working/ready 状态允许重复发布，停止或开始新一轮立即使旧授权失效。任务提示明确要求完成开发和清单后再发布，不发布初始化模板。
 
-宿主负责制作表单，Jolly 仅查进度。服务端注入授权与任务上下文，通用规则引用插件及 SDK 文档。Remix 来源由制作记录维护，客户端清单不填写原作字段，也不因这些字段缺失而拒绝发布。Remix 按原作 releaseId 锁定应用目录源码快照与确切提交，从已确认的原作分支启动新任务；缺失源码记录时明确报错，不退回 main。分支确认后回填对应公开版本的来源，原作后续提交不改变已锁定版本。分配独立身份与模块范围。共享 JS 环境不是恶意代码沙箱。
+制作表单与进度页面均由宿主提供。服务端注入授权与任务上下文，通用规则引用插件及 SDK 文档。Remix 来源由制作记录维护，客户端清单不填写原作字段，也不因这些字段缺失而拒绝发布。Remix 按原作 releaseId 锁定应用目录源码快照与确切提交，从已确认的原作分支启动新任务；缺失源码记录时明确报错，不退回 main。分支确认后回填对应公开版本的来源，原作后续提交不改变已锁定版本。分配独立身份与模块范围。共享 JS 环境不是恶意代码沙箱。
 
-Jolly 紧凑查询先返回本轮状态，历史在后台预热；尚未确认的新轮终态等待记录校验。本轮候选发布成功即标记可体验，并异步发送完成通知，不依赖用户刷新进度。Jules 未发布即失败的状态仍需查询上游才能获知；不定时查询，定时任务仅重试已生成但尚未送达的通知。/v1/works 默认只读本地快照，refresh=1 才查询上游。
+制作进度返回本轮状态与最后模型输出；尚未确认的新轮终态等待记录校验。本轮候选发布成功即标记可体验，并异步发送完成通知，不依赖用户刷新进度。Jules 未发布即失败的状态仍需查询上游才能获知；不定时查询，定时任务仅重试已生成但尚未送达的通知。/v1/works 默认只读本地快照，refresh=1 才查询上游。
 
 `/v1/updates?apkVersionCode=<本机版本>` 返回 release、apk 与 apkUpdate；APK 文件位于既有 R2 的 v1/apk/<sha256>.apk。运行时与 APK 清单仅允许维护者发布，应用发布授权不可修改。
 
@@ -86,9 +86,9 @@ GET /v1/application-discussions/<appId> 返回已公开作品的独立讨论及�
 - GET /v1/discovery：沿用 market 的 limit/cursor/category/q 条件，批量带回 discussion、authorFollowing，按登录身份组装且不公共缓存；互动失败降级为公开作品页，不预取评论。
 - GET /v1/application-discussions/<appId>?comments=1：讨论与评论第一页、nextCursor、following 一起返回。后续评论继续使用既有 post 接口。
 - GET /v1/me/works：认证账号的作品展示分页（24 条）、totalCount、summary；支持 q、cursor、refresh=1，游标绑定账号和搜索条件，不携带恢复凭据。原 GET /v1/works 全量恢复契约保留。
-- GET /v1/profiles/<id>?view=relationship|summary|posts|apps：只读关系/摘要或当前 tab；applicationCount 为公开作品总数，动态 nextCursor 与作品 applicationsNextCursor 独立。旧无 view 契约保留。
+- GET /v1/profiles/<id>?view=relationship|summary|posts|apps：只读关系/摘要或当前 tab；applicationCount 为公开作品总数，动态 nextCursor 与作品 applicationsNextCursor 独立。不传 view 时返回摘要，不同时拉取动态与作品列表。
 - GET /v1/market?view=summary|picker&limit=24：显示投影，不含 bundle/assets 等执行清单，summaryOnly=true；宿主读取 detail 后才能进行需要完整清单的操作。发现流保留完整 manifest。
-- POST /v1/workshop 的 action=progress：沿用账号、应用、会话和本轮凭据校验，仅返回本轮最后模型消息。按 session/轮次/上游 state+updateTime 持久缓存；首次回填或上游版本变化可能遍历历史，失败标 stale，旧 detail/activities 契约保留，无定时查询。
+- POST /v1/workshop 的 action=progress：沿用账号、应用、会话和本轮凭据校验，仅返回本轮最后模型消息。按 session/轮次/上游 state+updateTime 持久缓存；首次回填或上游版本变化可能遍历历史，失败标 stale，无定时查询。
 - GET /v1/account-counts：合并通知 unreadCount/unreadByCategory 和 messageUnreadCount，仅供实时连接失败时回退。
 - GET /v1/messages/<peerId>?after=<messageId>：认证会话的增量页，最多 50 条，hasMoreNew 指示后续增量；不能与历史 cursor 混用。message/read 实时事件携带 peerId。GET 不标记已读。
 

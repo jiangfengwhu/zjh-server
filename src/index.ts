@@ -16,7 +16,7 @@ import { applicationFiles } from "./applicationFiles";
 import { applicationRooms } from "./applicationRooms";
 export { ApplicationDatabase } from "./applicationData";
 
-/** 清单类的键：整套清单和 vendor 的模块编号表。格式变了就换前缀（v3/…），旧版本的手机继续读旧前缀。 */
+/** 清单类的键：宿主清单和 vendor 模块编号表。 */
 const JSON_KEY = /^v1\/(?:release|runtime|apk|maps\/vendor\.json|applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|releases\/[a-f0-9]{64}))$/;
 const DYNAMIC_JSON_KEY = /^v1\/(?:release|apk|maps\/vendor\.json|applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|releases\/[a-f0-9]{64}))$/;
 const PLUGIN_SOURCE = "sources/github/jiangfengwhu/zjh-plugin";
@@ -281,7 +281,7 @@ function summarizeWork(task: WorkshopTask, session: CloudSession, application: A
   if (task.phase === "paused") return { completed: false, state: session.state === "FAILED" ? "FAILED" : "PAUSED", delivery: "unpublished", message: session.state === "FAILED" ? "制作失败，可以在当前作品继续处理" : "制作已暂停，可以继续这个应用" };
   if (session.state !== "COMPLETED") return { completed: false, state: session.state ?? "QUEUED", delivery: "unpublished", message: ["FAILED", "PAUSED"].includes(session.state ?? "") ? "制作已暂停，可以继续处理" : "这轮作品仍在制作" };
   const ready = isRoundCandidate(task, application);
-  if (!ready && task.deliveryWaitStartedAt && Date.now() - task.deliveryWaitStartedAt >= 120000) return { completed: true, state: "COMPLETED", delivery: "blocked", message: "Jolly 已结束制作，但本轮应用没有完成交付。可以在当前作品继续修复并重新发布。" };
+  if (!ready && task.deliveryWaitStartedAt && Date.now() - task.deliveryWaitStartedAt >= 120000) return { completed: true, state: "COMPLETED", delivery: "blocked", message: "制作任务已结束，但本轮应用没有完成交付。可以在当前作品继续修复并重新发布。" };
   return { completed: true, state: "COMPLETED", delivery: ready ? "update" : "unpublished", message: ready ? "作品已发布，可直接体验、继续修改或上架" : "等待本轮候选包发布", ...(ready ? { application } : {}) };
 }
 const MARKET_CATEGORIES = ["tools", "productivity", "life", "creative", "other"];
@@ -419,7 +419,7 @@ export class Workshop extends DurableObject<Env> {
     try {
       await Promise.allSettled([...this.writes, ...this.summaries.values(), ...(this.monitoring ? [this.monitoring] : [])]);
       await Promise.allSettled([...this.notices]);
-      // Jolly lives in the host. No plugin application needs to be retained.
+      // Creation belongs to the host; there is no built-in plugin application.
       const tasks = [...(await this.ctx.storage.list<WorkshopTask>({ prefix: "task:" })).values()];
       const candidates = [...(await this.ctx.storage.list<ApplicationRelease>({ prefix: "candidate:" })).values()];
       const applications = [...new Set([...tasks, ...candidates].map(item => item.appId))];
@@ -828,7 +828,7 @@ export class Workshop extends DurableObject<Env> {
           }
         }
         const origin = manager ? { title: task?.title, originalAppId: task?.originalAppId, originalReleaseId: task?.originalReleaseId, originalCommit: task?.originalCommit, originalBranch: task?.originalBranch, branch: task?.branch } : {};
-        return base ? json({ appId, moduleBase: base, ...origin }, 200) : json({ error: "请先在 Jolly 创建这个应用的心愿" }, 404);
+        return base ? json({ appId, moduleBase: base, ...origin }, 200) : json({ error: "请先在生花发起这个应用的创作" }, 404);
       }
       if ((path === "/v1/market" || path === "/v1/applications") && request.method === "GET") {
         const params = new URL(request.url).searchParams;
@@ -1089,7 +1089,7 @@ export class Workshop extends DurableObject<Env> {
         const selected = works.filter((work): work is NonNullable<typeof work> => !!work && !deletedIds.has(work.appId));
         const response = json(gallery ? {works: selected.map(work => ({appId: work.appId, title: work.status.application?.appName || work.title, wish: work.wish, createdAt: work.startedAt || 0, manifest: work.status.application || work.sharing.application, sharing: work.sharing, stale: work.status.stale, message: work.status.message, stage: work.status.state === "FAILED" ? "failed" : work.status.state === "PAUSED" ? "paused" : work.status.state === "AWAITING_USER_FEEDBACK" ? "reply" : work.status.completed ? work.status.application ? "load" : work.status.delivery === "blocked" ? "blocked" : "making" : "making"})), nextCursor, totalCount: allTasks.filter(task => !deletedIds.has(task.appId)).length, deletedAppIds} : {works: selected, deletedAppIds}, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
       }
-      const input = await request.json() as { appId?: string; originalAppId?: string; originalReleaseId?: string; requestId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; category?: string; screenshots?: string[]; applicationReleases?: Record<string, string>; pageToken?: string; compact?: boolean };
+      const input = await request.json() as { appId?: string; originalAppId?: string; originalReleaseId?: string; requestId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; category?: string; screenshots?: string[]; applicationReleases?: Record<string, string> };
       const appId = input.appId;
       if (!appId || !/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return json({ message: "请指定目标应用" }, 400);
       const user = await authenticatedUser(request, this.env);
@@ -1137,7 +1137,7 @@ export class Workshop extends DurableObject<Env> {
           task.creationRejected = response.status >= 400 && response.status < 500;
           task.phase = task.creationRejected ? "paused" : "working";
           await this.saveTask(task);
-          if (task.creationRejected) await this.notifyResult(task, false, "Jolly 未能开始这轮制作。点击查看作品，调整后可以重试。");
+          if (task.creationRejected) await this.notifyResult(task, false, "未能开始这轮制作。点击查看作品，调整后可以重试。");
           return response;
         }
         const session = await response.json() as CloudSession;
@@ -1226,23 +1226,14 @@ export class Workshop extends DurableObject<Env> {
         }
         return proxyJules(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify(input) }), this.env);
       }
+      if (!["progress", "status", "stop"].includes(input.action || "")) return json({ message: "制作操作无效" }, 400);
       if (input.session !== task.session) return json({ message: "Session 不属于这个应用" }, 403);
-      if (input.action === "activities") {
-        if (typeof input.pageToken !== "string" || !input.pageToken || input.pageToken.length > 4096) return json({ message: "制作记录游标无效" }, 400);
-        const response = json(await this.activities(task.session, input.pageToken), 200);
-        response.headers.set("Cache-Control", "private,no-store"); return response;
-      }
-      if (input.action === "detail" || input.action === "progress") {
+      if (input.action === "progress") {
         const started = Date.now();
-        const [session, application, shared, initialActivities] = await Promise.all([
+        const [session, application, shared] = await Promise.all([
           this.session(task.session), this.candidate(appId), this.ctx.storage.get<MarketEntry>(`shared:${appId}`),
-          (input.compact || input.action === "progress") ? Promise.resolve({ ...(this.activityPages.get(task.session)?.page ?? { activities: [] }), stale: true }) : this.recentActivities({ name: task.session }),
         ]);
-        // Status is independent of the bulk history. Only round confirmation
-        // needs activities before replying; history warming never polls the client.
-        const confirmRound = task.awaitingRoundStart && ["COMPLETED", "FAILED", "PAUSED", "AWAITING_USER_FEEDBACK"].includes(session.state || "");
-        const activityResult = input.action === "progress" ? await this.progressActivities(task, session) : input.compact && confirmRound ? await this.recentActivities({ ...session, name: task.session }) : initialActivities;
-        if (input.compact && !confirmRound && input.action !== "progress") this.ctx.waitUntil(this.recentActivities({ ...session, name: task.session }).catch(() => {}));
+        const activityResult = await this.progressActivities(task, session);
         observeRound(task, session, activityResult.activities);
         Object.assign(session, currentRoundSession(task, session, application));
         if (task.startedAt) activityResult.activities = activityResult.activities.filter(value => Date.parse((value as { createTime?: string }).createTime || "") >= task.startedAt!);

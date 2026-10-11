@@ -8,6 +8,7 @@ import {
   authenticatedUser,
   publicProfiles,
   OFFICIAL_ACCOUNT_ID,
+  OFFICIAL_PROFILE,
   type User,
 } from "./accounts";
 import { SocialInbox, SocialError } from "./social";
@@ -206,7 +207,7 @@ export class Posts extends DurableObject<Env> {
         );
         const notice: Notice = {
           id,
-          actor: { id: OFFICIAL_ACCOUNT_ID, name: "Jolly", avatarUrl: null },
+          actor: { id: OFFICIAL_ACCOUNT_ID, ...OFFICIAL_PROFILE },
           postId: "",
           commentId: "",
           appId: input.appId,
@@ -278,59 +279,24 @@ export class Posts extends DurableObject<Env> {
       )?.[1];
       if (profileId && request.method === "GET") {
         if (!uuid.test(profileId)) throw new InputError("作者标识无效");
-        const view = url.searchParams.get("view");
-        if (["relationship", "summary", "posts", "apps"].includes(view || "")) {
-          const viewer = request.headers.has("Authorization") ? await authenticatedUser(request, this.env) : null;
-          const follow = await this.followStatus(profileId, viewer?.id);
-          if (view === "relationship") return json(follow);
-          const marketParams = new URLSearchParams({ authorId: profileId, limit: view === "apps" ? "24" : "1", view: view === "apps" ? "full" : "count" });
-          if (view === "apps" && url.searchParams.get("cursor")) marketParams.set("cursor", url.searchParams.get("cursor")!);
-          const [profiles, market, timeline] = await Promise.all([
-            publicProfiles([profileId], this.env),
-            this.env.WORKSHOP.getByName("dynamic").fetch(new Request(`https://workshop.internal/v1/market?${marketParams}`)),
-            view === "posts" ? this.handle(new Request(`https://posts.internal/v1/posts?authorId=${profileId}${url.searchParams.get("cursor") ? `&cursor=${encodeURIComponent(url.searchParams.get("cursor")!)}` : ""}`, { headers: request.headers })) : Promise.resolve(undefined),
-          ]);
-          const author = profiles.get(profileId);
-          if (!author) throw new InputError("这位作者不存在", 404);
-          if (!market.ok || timeline && !timeline.ok) throw new InputError("主页暂时不可用，请重试", 503);
-          const applications = await market.json() as { applications: unknown[]; nextCursor?: string; totalCount: number };
-          const posts = timeline ? await timeline.json() as { posts: unknown[]; nextCursor: string | null } : { posts: [], nextCursor: null };
-          return json({ ...follow, author: { ...author, official: profileId === OFFICIAL_ACCOUNT_ID }, applicationCount: applications.totalCount, applications: applications.applications, applicationsNextCursor: applications.nextCursor ?? null, ...posts });
-        }
-        const [profiles, market, timeline, follow] = await Promise.all([
+        const view = url.searchParams.get("view") || "summary";
+        if (!["relationship", "summary", "posts", "apps"].includes(view)) throw new InputError("主页视图无效");
+        const viewer = request.headers.has("Authorization") ? await authenticatedUser(request, this.env) : null;
+        const follow = await this.followStatus(profileId, viewer?.id);
+        if (view === "relationship") return json(follow);
+        const marketParams = new URLSearchParams({ authorId: profileId, limit: view === "apps" ? "24" : "1", view: view === "apps" ? "full" : "count" });
+        if (view === "apps" && url.searchParams.get("cursor")) marketParams.set("cursor", url.searchParams.get("cursor")!);
+        const [profiles, market, timeline] = await Promise.all([
           publicProfiles([profileId], this.env),
-          this.env.WORKSHOP.getByName("dynamic").fetch(
-            new Request(
-              `https://workshop.internal/v1/market?authorId=${profileId}`
-            )
-          ),
-          this.handle(
-            new Request(
-              `https://posts.internal/v1/posts?authorId=${profileId}`,
-              { headers: request.headers }
-            )
-          ),
-          (async () => {
-            const viewer = request.headers.has("Authorization")
-              ? await authenticatedUser(request, this.env)
-              : null;
-            return this.followStatus(profileId, viewer?.id);
-          })(),
+          this.env.WORKSHOP.getByName("dynamic").fetch(new Request(`https://workshop.internal/v1/market?${marketParams}`)),
+          view === "posts" ? this.handle(new Request(`https://posts.internal/v1/posts?authorId=${profileId}${url.searchParams.get("cursor") ? `&cursor=${encodeURIComponent(url.searchParams.get("cursor")!)}` : ""}`, { headers: request.headers })) : Promise.resolve(undefined),
         ]);
         const author = profiles.get(profileId);
         if (!author) throw new InputError("这位作者不存在", 404);
-        if (!market.ok || !timeline.ok)
-          throw new InputError("作者主页暂时不可用，请重试", 503);
-        const [applications, posts] = await Promise.all([
-          market.json() as Promise<{ applications: unknown[] }>,
-          timeline.json() as Promise<{ posts: unknown[]; nextCursor: string | null }>,
-        ]);
-        return json({
-          ...follow,
-          author: { ...author, official: profileId === OFFICIAL_ACCOUNT_ID },
-          applications: applications.applications,
-          ...posts,
-        });
+        if (!market.ok || timeline && !timeline.ok) throw new InputError("主页暂时不可用，请重试", 503);
+        const applications = await market.json() as { applications: unknown[]; nextCursor?: string; totalCount: number };
+        const posts = timeline ? await timeline.json() as { posts: unknown[]; nextCursor: string | null } : { posts: [], nextCursor: null };
+        return json({ ...follow, author: { ...author, official: profileId === OFFICIAL_ACCOUNT_ID }, applicationCount: applications.totalCount, applications: applications.applications, applicationsNextCursor: applications.nextCursor ?? null, ...posts });
       }
       if (url.pathname === "/v1/application-bookmarks" && request.method === "GET") {
         if (!/^Bearer [a-f0-9]{64}$/.test(request.headers.get("Authorization") || "")) return json({ message: "请先登录" }, 401);
