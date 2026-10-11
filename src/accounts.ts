@@ -4,7 +4,6 @@ import { KeyedQueue } from "./concurrency";
 type AccountEnv = Env & { RESEND_API_KEY?: string; MAIL_FROM?: string };
 export const OFFICIAL_ACCOUNT_ID = "00000000-0000-4000-8000-000000000001";
 export const OFFICIAL_PROFILE = { name: "生花官方", avatarUrl: "https://zijinhua.297782.xyz/v1/avatars/00000000-0000-4000-8000-000000000001/db19c53b9c42cd5205709edd1e646b0ada6ab6ed5d08299d7ddcc8220a943322" } as const;
-export const OFFICIAL_APPLICATIONS = ["jolly"] as const;
 export type User = { id: string; email: string | null; name: string; avatarUrl: string | null; createdAt: number };
 type Session = { userId: string; expiresAt: number };
 type Challenge = { salt: string; digest: string; expiresAt: number; attempts: number; sentAt: number };

@@ -35,7 +35,6 @@ export class MarketIndex {
   }).catch(error => { this.flight = undefined; throw error; }); }
   put(entry: MarketRecord) {
     const id = entry.manifest.appId;
-    if (id === "jolly") return;
     const text = `${entry.title ?? ""} ${entry.summary ?? ""}`.toLowerCase();
     this.ctx.storage.sql.exec("INSERT OR REPLACE INTO market_read VALUES (?, ?, ?, ?, ?, ?)", id, entry.authorId ?? "", entry.category || "other", entry.authorOfficial ? 1 : 0, entry.publishedAt || 0, text);
     this.ctx.storage.sql.exec("DELETE FROM market_gram WHERE app_id = ?", id);

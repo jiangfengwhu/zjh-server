@@ -11,7 +11,7 @@ npm run deploy
 
 维护者登录 Wrangler 后部署，保留 wrangler.jsonc 现有绑定。纯文档修改不部署。
 
-开发清理使用维护者鉴权的 `POST /v1/development-reset`，请求携带 `confirm: "RESET_WORKSHOP_DEVELOPMENT_DATA"`。设置 `scope: "applications"` 清理全部应用目录、制作记录和授权，保留账号、动态与私信；省略 scope 清理全部开发数据。Jolly 制作进度页属于宿主，不是 plugin 应用，不需要保留应用目录。`dryRun: true` 只返回待清理应用与制作分支，不删除数据。
+开发清理使用维护者鉴权的 `POST /v1/development-reset`，请求携带 `confirm: "RESET_WORKSHOP_DEVELOPMENT_DATA"`。设置 `scope: "applications"` 清理全部应用目录、制作记录和授权，保留账号、动态与私信；省略 scope 清理全部开发数据。制作进度页属于宿主，不是 plugin 应用，不需要保留应用目录。`dryRun: true` 只返回待清理应用与制作分支，不删除数据。
 
 Secrets 用 `npx wrangler secret put <NAME>` 交互配置，值不写入代码或命令文本，.dev.vars 不提交。
 
@@ -54,7 +54,7 @@ APP_DATA 使用 SQLite Durable Objects。私有实例按 userId 分配，内部�
 | POST /v1/application-download/<id> | 宿主成功安装后异步记录，按登录账号及应用去重；仅接受已上架 releaseId，市场列表返回 downloadCount |
 | /posts/<id>、/applications/<id>、/download | 公开分享落地页、打开 App 的兜底入口；下载地址重定向到当前 R2 APK |
 | /.well-known/assetlinks.json | Android App Links 域名关联，证书指纹必须与分发 APK 签名一致 |
-| /v1/official-release、/v1/runtime | 维护者公开官方版本、发布配套 APK 契约 |
+| /v1/official-release、/v1/runtime | 维护者公开官方版本、发布配套 APK 契约；official-release 的 action=withdraw 仅下架官方作品，保留不可变历史包 |
 | /v1/updates、/v1/apk | 动态与 APK 更新检查、APK 清单 |
 
 通知 category=creation/interaction 使用独立分页游标；不传 category 返回全部通知。通知列表、未读查询与标记已读均返回 unreadByCategory（creation/interaction 未读数）；点赞、评论、回复归入互动，重复点赞不生成通知，取消点赞清理对应通知。制作状态携带 submissionId/startedAt，旧轮终态不能覆盖新提交；继续修改的 requestId 绑定账号、应用、会话与正文，成功重试不再次提交。

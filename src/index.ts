@@ -2,7 +2,7 @@ import { getMany } from "./storageBatch";
 import { validateApplicationIcon, validIconJpeg } from "./applicationIcon";
 import { androidAssetLinks, downloadLatestApk, readSharedApplication } from "./sharedLinks";
 import { DurableObject } from "cloudflare:workers";
-import { authenticatedUser, OFFICIAL_ACCOUNT_ID, OFFICIAL_PROFILE, OFFICIAL_APPLICATIONS, publicProfiles, readAvatar } from "./accounts";
+import { authenticatedUser, OFFICIAL_ACCOUNT_ID, OFFICIAL_PROFILE, publicProfiles, readAvatar } from "./accounts";
 import { KeyedQueue } from "./concurrency";
 import { MarketIndex } from "./readIndexes";
 import { pageBff } from "./pageBff";
@@ -500,7 +500,6 @@ export class Workshop extends DurableObject<Env> {
   private async deleteWork(request: Request, appId: string): Promise<Response> {
     const user = await authenticatedUser(request, this.env);
     if (!user) return json({ message: "请先登录" }, 401);
-    if (appId === "jolly") return json({ message: "不能删除宿主应用" }, 403);
     const [task, shared, deleted] = await Promise.all([
       this.ctx.storage.get<WorkshopTask>(`task:${appId}`),
       this.ctx.storage.get<MarketEntry>(`shared:${appId}`),
@@ -606,11 +605,10 @@ export class Workshop extends DurableObject<Env> {
   }
   private async allocate(appId: string): Promise<number> {
     const existing = await this.ctx.storage.get<number>(`allocation:${appId}`); if (existing) return existing;
-    const fixed: Record<string, number> = { jolly: 2000000 };
     const prior = await this.candidate(appId);
     return this.ctx.storage.transaction(async storage => {
       const allocated = await storage.get<number>(`allocation:${appId}`); if (allocated) return allocated;
-      let base = fixed[appId] ?? prior?.modules.base;
+      let base = prior?.modules.base;
       if (!base) {
         base = await storage.get<number>("allocation:next") ?? 2300000;
         while (await storage.get<string>(`application-range:${base}`)) base += 100000;
@@ -848,7 +846,7 @@ export class Workshop extends DurableObject<Env> {
           const owned = !!viewer && task?.ownerId === viewer.id;
           const candidate = owned ? await this.candidate(appId) : null;
           const manifest = published?.manifest ?? candidate;
-          if (!manifest || appId === "jolly") return json({ message: "这个应用已撤回或暂未上架" }, 404);
+          if (!manifest) return json({ message: "这个应用已撤回或暂未上架" }, 404);
           const authorId = published?.authorId ?? task?.ownerId;
           const profiles = authorId ? await publicProfiles([authorId], this.env).catch(() => new Map()) : new Map();
           const author = authorId ? profiles.get(authorId) : undefined;
@@ -920,8 +918,6 @@ export class Workshop extends DurableObject<Env> {
             if (!stored) return json({ error: "application icon not uploaded" }, 409);
             try { validateApplicationIcon(await stored.text()); } catch { return json({ error: "application icon must be static self-contained SVG" }, 400); }
           }
-          const fixedOwners: Record<number, string> = { 2000000: "jolly" };
-          if (fixedOwners[base] && fixedOwners[base] !== manifest.appId) return json({ error: "application module range reserved" }, 409);
           const priorLatest = await this.candidate(manifest.appId);
           if (match[2] === "latest") {
             if (candidates.has(manifest.appId)) return json({ error: "duplicate candidate pointer" }, 400);
@@ -975,14 +971,28 @@ export class Workshop extends DurableObject<Env> {
 
       if (path === "/v1/official-release" && request.method === "POST") {
         if (!await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN)) return json({ message: "官方公开发布需要维护者凭证" }, 403);
-        const { appId, releaseId } = await request.json() as { appId: string; releaseId: string };
-        if (!/^[a-z][a-z0-9-]{0,63}$/.test(appId) || !/^[a-f0-9]{64}$/.test(releaseId)) return json({ message: "请指定应用和不可变版本" }, 400);
+        const { appId, releaseId, action } = await request.json() as { appId: string; releaseId?: string; action?: string };
+        if (!/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return json({ message: "请指定应用" }, 400);
+        if (action === "withdraw") {
+          if (await this.ctx.storage.get(`task:${appId}`)) return json({ message: "只能下架官方应用作品" }, 403);
+          const shared = await this.ctx.storage.get<MarketEntry>(`shared:${appId}`);
+          if (shared && shared.authorId !== OFFICIAL_ACCOUNT_ID) return json({ message: "不能下架其他作者的作品" }, 403);
+          if (!shared && !await this.ctx.storage.get(`withdrawn:${appId}`)) return json({ message: "公开作品不存在" }, 404);
+          await this.ctx.storage.transaction(async storage => {
+            await storage.delete(`shared:${appId}`);
+            await storage.put(`withdrawn:${appId}`, true);
+            this.marketIndex.remove(appId);
+          });
+          this.emitWork(OFFICIAL_ACCOUNT_ID, appId);
+          return json({ appId, withdrawn: true }, 200);
+        }
+        if (action !== undefined || !/^[a-f0-9]{64}$/.test(releaseId || "")) return json({ message: "请指定不可变版本" }, 400);
         if (await this.ctx.storage.get(`deleted:${appId}`)) return json({ message: "作品已删除" }, 410);
         if (await this.ctx.storage.get(`task:${appId}`)) return json({ message: "用户作品必须由作者决定上架" }, 409);
         const manifest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/releases/${releaseId}`, "json");
         if (!manifest || manifest.appId !== appId || manifest.releaseId !== releaseId || manifest.source.dirty) return json({ message: "指定版本尚未上传或无效" }, 409);
         const prior = await this.ctx.storage.get<MarketEntry>(`shared:${appId}`);
-        const entry: MarketEntry = { manifest, title: manifest.appName, summary: manifest.description, category: prior?.category || (appId === "jolly" ? "creative" : "other"), screenshots: prior?.screenshots || [], publishedAt: prior?.manifest.releaseId === releaseId ? prior.publishedAt || Date.now() : Date.now(), authorId: OFFICIAL_ACCOUNT_ID, authorName: OFFICIAL_PROFILE.name, authorAvatarUrl: OFFICIAL_PROFILE.avatarUrl, authorOfficial: true, originalAppId: null };
+        const entry: MarketEntry = { manifest, title: manifest.appName, summary: manifest.description, category: prior?.category || "other", screenshots: prior?.screenshots || [], publishedAt: prior?.manifest.releaseId === releaseId ? prior.publishedAt || Date.now() : Date.now(), authorId: OFFICIAL_ACCOUNT_ID, authorName: OFFICIAL_PROFILE.name, authorAvatarUrl: OFFICIAL_PROFILE.avatarUrl, authorOfficial: true, originalAppId: null };
         await this.ctx.storage.transaction(async storage => {
           await storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${releaseId}`]: true });
           this.marketIndex.put(entry);
@@ -1088,7 +1098,6 @@ export class Workshop extends DurableObject<Env> {
       let task = await this.ctx.storage.get<WorkshopTask>(`task:${appId}`);
       if (task && task.ownerId !== user.id) return json({ message: "这个作品属于其他账号" }, 403);
       if (path === "/v1/jules" && input.method === "POST" && input.path === "/v1alpha/sessions") {
-        if ((OFFICIAL_APPLICATIONS as readonly string[]).includes(appId)) return json({ message: "请基于这个应用创作新作品" }, 403);
         if (task?.session) {
           if (input.requestId && input.requestId === task.requestId) { this.ctx.waitUntil(this.notifyResult(structuredClone(task), true, "制作需求已提交，点击查看本轮进度。完成或失败都会在这里通知你。", "work-submitted")); return json({ name: task.session, ownerId: task.ownerId, approvalToken: task.token }, 200); }
           return json({ message: "这个应用已有 session，请从作品列表接回" }, 409);

@@ -36,7 +36,7 @@ test('work deletion enforces ownership, removes listings and revokes late public
   const request=(id,auth=true)=>new Request('https://test/v1/works/'+id,{method:'DELETE',headers:auth?headers:{}});
   assert.equal((await worker.fetch(request(appId,false),f.env)).status,401);
   assert.equal((await worker.fetch(request(other),f.env)).status,403);
-  assert.equal((await worker.fetch(request('jolly'),f.env)).status,403);
+  assert.equal((await worker.fetch(request('ordinary-id'),f.env)).status,404);
   assert.equal((await worker.fetch(request('missing'),f.env)).status,404);
   assert.equal((await f.workshopCtx.storage.get('task:'+appId)).appId,appId);
   assert.deepEqual(await(await worker.fetch(request(appId),f.env)).json(),{deleted:true,appId});
@@ -97,7 +97,7 @@ test('batch notification records and counters roll back together on write failur
   assert.deepEqual(await f.postsCtx.storage.get('notice-unread-categories:'+alice),{creation:0,interaction:1});
  }finally{await f.postsCtx.flush();f.close()}
 });
-test('market migration, Unicode substring, stable cursors, edit and withdrawal',async()=>{const c=context();try{await c.storage.put({'shared:app-a':market('app-a'),'shared:app-b':market('app-b','其他',100),'shared:jolly':market('jolly')});const index=new MarketIndex(c);await index.ensure();assert.equal(index.page({limit:1}).total,2);assert.deepEqual(index.page({query:'萌星',limit:10}).rows.map(r=>r.app_id),['app-a','app-b']);assert.equal(index.page({query:'😺',limit:10}).total,2);assert.equal(index.page({query:'宝 萌',limit:10}).total,0);const first=index.page({limit:1}).rows[0];assert.deepEqual(index.page({after:{at:first.at,id:first.app_id},limit:1}).rows.map(r=>r.app_id),['app-b']);index.put(market('app-a','新版'));assert.equal(index.page({query:'离谱',limit:10}).total,0);index.remove('app-b');assert.equal(index.page({}).total,1);const scans=c.lists();await new MarketIndex(c).ensure();assert.equal(c.lists(),scans)}finally{c.close()}});
+test('market migration, Unicode substring, stable cursors, edit and withdrawal',async()=>{const c=context();try{await c.storage.put({'shared:app-a':market('app-a'),'shared:app-b':market('app-b','其他',100)});const index=new MarketIndex(c);await index.ensure();assert.equal(index.page({limit:1}).total,2);assert.deepEqual(index.page({query:'萌星',limit:10}).rows.map(r=>r.app_id),['app-a','app-b']);assert.equal(index.page({query:'😺',limit:10}).total,2);assert.equal(index.page({query:'宝 萌',limit:10}).total,0);const first=index.page({limit:1}).rows[0];assert.deepEqual(index.page({after:{at:first.at,id:first.app_id},limit:1}).rows.map(r=>r.app_id),['app-b']);index.put(market('app-a','新版'));assert.equal(index.page({query:'离谱',limit:10}).total,0);index.remove('app-b');assert.equal(index.page({}).total,1);const scans=c.lists();await new MarketIndex(c).ensure();assert.equal(c.lists(),scans)}finally{c.close()}});
 test('canonical KV and SQL updates roll back together',async()=>{const c=context();try{const i=new MarketIndex(c);await i.ensure();await assert.rejects(c.storage.transaction(async st=>{await st.put('shared:app-a',market('app-a'));i.put(market('app-a'));throw Error('abort')}));assert.equal(await c.storage.get('shared:app-a'),undefined);assert.equal(i.page({}).total,0)}finally{c.close()}});
 test('following index finds sparse older authors beyond 5000 posts and respects unfollow',async()=>{const c=context();try{for(let n=0;n<5100;n++)await c.storage.put('post:'+String(n).padStart(13,'0')+':'+String(n).padStart(64,'0'),{author:{id:n===5099?bob:alice}});await c.storage.put('follow:viewer:'+bob,true);const i=new TimelineIndex(c);await i.ensure();const scans=c.lists();assert.equal(i.posts({viewer:'viewer',limit:51}).length,1);assert.equal(i.posts({author:bob,limit:51}).length,1);i.follow('viewer',bob,false);assert.equal(i.posts({viewer:'viewer',limit:51}).length,0);assert.equal(c.lists(),scans);const plan=c.storage.sql.exec('EXPLAIN QUERY PLAN SELECT p.key FROM timeline_read p WHERE p.author_id IN (SELECT author_id FROM timeline_follow WHERE viewer=?) ORDER BY p.key LIMIT 51','viewer').toArray();assert.ok(plan.some(row=>row.detail.includes('timeline_read_author')));const key=i.posts({author:bob,limit:1})[0];i.removePost(key);assert.equal(i.posts({author:bob,limit:1}).length,0)}finally{c.close()}});
 test('notification category index migrates and removes records',async()=>{const c=context();try{await c.storage.put({'notice:alice:1':{kind:'work-success'},'notice:alice:2':{kind:'like'}});const i=new TimelineIndex(c);await i.ensure();assert.deepEqual(i.notices('alice','creation',undefined,10),['notice:alice:1']);assert.deepEqual(i.notices('alice','interaction',undefined,10),['notice:alice:2']);i.removeNotice('notice:alice:1');assert.equal(i.notices('alice','creation',undefined,10).length,0)}finally{c.close()}});
@@ -160,4 +160,20 @@ test('post friend shares use canonical snapshots and idempotent authenticated se
   assert.equal((await send('c'.repeat(64))).status,409);assert.equal((await send(post.id,'post-message-00002',false)).status,401);assert.equal((await send('c'.repeat(64),'post-message-00003')).status,404);
   const key=await f.postsCtx.storage.get('id:'+post.id);await f.postsCtx.storage.delete(key);assert.equal((await send()).status,200);assert.equal((await send(post.id,'post-message-00004')).status,404);
  }finally{await f.postsCtx.flush();f.close()}
+});
+
+
+test('official withdrawal requires maintainer identity and official ownership and preserves release history',async()=>{
+ const f=fixture();try{
+  f.env.OFFICIAL_PUBLISH_TOKEN=token;
+  const official='00000000-0000-4000-8000-000000000001',appId='official-old',version='b'.repeat(64);
+  await f.workshopCtx.storage.put({['shared:'+appId]:market(appId,'旧官方作品',100,official),['candidate:'+appId]:{releaseId:version},['allocation:'+appId]:5100000,['published:'+appId+':'+version]:true,'shared:foreign':market('foreign'),'task:user-work':{ownerId:alice}});
+  const withdraw=(id,auth=true)=>worker.fetch(new Request('https://test/v1/official-release',{method:'POST',headers:{...(auth?headers:{}),'Content-Type':'application/json'},body:JSON.stringify({appId:id,action:'withdraw'})}),f.env);
+  assert.equal((await withdraw(appId,false)).status,403);
+  assert.equal((await withdraw('foreign')).status,403);assert.equal((await withdraw('user-work')).status,403);assert.equal((await withdraw('missing')).status,404);
+  assert.equal((await withdraw(appId)).status,200);assert.equal((await withdraw(appId)).status,200);
+  assert.equal(await f.workshopCtx.storage.get('shared:'+appId),undefined);assert.equal(await f.workshopCtx.storage.get('withdrawn:'+appId),true);
+  assert.equal(await f.workshopCtx.storage.get('allocation:'+appId),5100000);assert.equal(await f.workshopCtx.storage.get('published:'+appId+':'+version),true);assert.equal((await f.workshopCtx.storage.get('candidate:'+appId)).releaseId,version);
+  const marketPage=await(await f.call('/v1/market')).json();assert.ok(!marketPage.applications.some(item=>item.manifest.appId===appId));assert.equal((await f.call('/v1/applications/'+appId+'/public')).status,404);
+ }finally{await f.workshopCtx.flush();await f.postsCtx.flush();f.close()}
 });
