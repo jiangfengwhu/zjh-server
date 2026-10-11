@@ -48,7 +48,7 @@ APP_DATA 使用 SQLite Durable Objects。私有实例按 userId 分配，内部�
 | /v1/messages、/v1/messages/<用户 ID> | 私信会话、文字发送与历史；登录鉴权、幂等发送 |
 | /v1/workshop、/v1/works、/v1/jules | 按账号和 appId 管理制作，同应用复用会话并串行写入 |
 | /v1/creation-media | 账号认证的制作参考图上传，JPEG 最大 2 MB，沿用上传额度 |
-| /v1/application-blobs/<id>/<sha256>、/v1/catalog | 候选上传、哈希与本轮授权校验 |
+| /v1/application-blobs/<id>/<sha256>、/v1/catalog | 候选上传、本轮授权及清单结构检查；不校验文件哈希 |
 | /v1/market、应用 public | 作者主动公开的快照，后续候选发布不改变公开版本 |
 | POST /v1/application-download/<id> | 宿主成功安装后异步记录，按登录账号及应用去重；仅接受已上架 releaseId，市场列表返回 downloadCount |
 | /posts/<id>、/applications/<id>、/download | 公开分享落地页、打开 App 的兜底入口；下载地址重定向到当前 R2 APK |
@@ -78,7 +78,7 @@ GET /v1/messages/live 以 Authorization 头建立 WebSocket，复用 Posts 的�
 
 GET /v1/application-discussions/<appId> 返回已公开作品的独立讨论及当前账号的点赞、收藏状态；讨论按应用 ID 跨版本保留，不进入社区时间线。点赞、评论复用 /v1/posts/<id>/like、comments；POST/DELETE /v1/posts/<id>/bookmark 幂等收藏/取消收藏。讨论不能作为动态删除，读作品讨论时重新校验公开状态。复用既有 Posts 存储与账号鉴权，不新增绑定。
 
-维护者可用 `POST /v1/application-source` 修复当前公开版本的源码定位，携带 appId、releaseId、commit、branch；接口核对应用目录快照和分支包含关系，不修改公开包或合入 PR。旧版本缺少应用目录快照时，须先在独立目录重建并确认 bundle 与全部 assets 一致，再携带 rebuiltBundleSha256、rebuiltAssets；可用 remixAppIds 指定需要同步来源记录的已有改编任务。接口仅接受维护者授权。
+维护者可用 `POST /v1/application-source` 修复当前公开版本的源码定位，携带 appId、releaseId、commit、branch；接口核对应用目录快照和分支包含关系，不修改公开包或合入 PR。提交必须匹配已记录的源码快照，不提供通过重建包哈希绕过快照匹配的旧流程；可用 remixAppIds 指定需要同步来源记录的已有改编任务。接口仅接受维护者授权。
 
 ## 宿主页面读模型
 

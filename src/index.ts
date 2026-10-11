@@ -22,8 +22,8 @@ const DYNAMIC_JSON_KEY = /^v1\/(?:release|apk|maps\/vendor\.json|applications\/[
 const PLUGIN_SOURCE = "sources/github/jiangfengwhu/zjh-plugin";
 const allowedSource = (source?: string) => source === PLUGIN_SOURCE;
 
-/** 包体的键：vendor、app、插件 DEX，全部按内容哈希命名，写入后不再改。 */
-const BLOB_KEY = /^v1\/apk\/[a-f0-9]{64}\.apk$|^v1\/(?:vendor|app|sdk)\/[a-f0-9]{64}$|^v1\/plugins\/[a-z0-9-]+\/[a-f0-9]{64}$/;
+/** 宿主 vendor、app 与 APK 包体，按内容哈希命名，写入后不再改。 */
+const BLOB_KEY = /^v1\/apk\/[a-f0-9]{64}\.apk$|^v1\/(?:vendor|app)\/[a-f0-9]{64}$/;
 
 const ACTIVITY_MASK =
   "activities.name,activities.id,activities.createTime,activities.description,activities.progressUpdated,activities.planGenerated,activities.planApproved,activities.sessionCompleted,activities.sessionFailed,activities.agentMessaged,activities.userMessaged,nextPageToken";
@@ -745,19 +745,19 @@ export class Workshop extends DurableObject<Env> {
         const chunks: Uint8Array[] = []; let size = 0;
         while (true) { const chunk = await reader.read(); if (chunk.done) break; size += chunk.value.byteLength; if (size > maximum) { await reader.cancel(); return json({ message: "包体过大" }, 413); } chunks.push(chunk.value); }
         const bytes = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-        const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(byte => byte.toString(16).padStart(2, "0")).join("");
-        if (digest !== upload[2]) return json({ message: "包体哈希不匹配" }, 400);
         const task = await this.ctx.storage.get<WorkshopTask>(`task:${upload[1]}`);
         const quotaKey = `upload-quota:${upload[1]}:${task?.publishEpoch ?? "maintainer"}`;
         const quota = await this.ctx.storage.get<{ bytes: number; count: number }>(quotaKey) ?? { bytes: 0, count: 0 };
         if (quota.bytes + size > 512 * 1024 * 1024 || quota.count >= 256) return json({ message: "本轮上传额度已用完" }, 429);
         await this.ctx.storage.put(quotaKey, { bytes: quota.bytes + size, count: quota.count + 1 });
-        await this.env.BLOBS.put(`v1/app/${digest}`, bytes, { httpMetadata: { contentType: "application/octet-stream", cacheControl: "public,max-age=31536000,immutable" } });
+        // Resource identities are immutable. Repeated uploads must not replace
+        // a file already referenced by another release; no content hash needed.
+        await this.env.BLOBS.put(`v1/app/${upload[2]}`, bytes, { onlyIf: new Headers({ "If-None-Match": "*" }), httpMetadata: { contentType: "application/octet-stream", cacheControl: "public,max-age=31536000,immutable" } });
         return json({ uploaded: true, bytes: size }, 200);
       }
       if (path === "/v1/application-source" && request.method === "POST") {
         if (!await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN)) return json({ message: "维护者权限不足" }, 403);
-        const input = await request.json() as { appId?: string; releaseId?: string; commit?: string; branch?: string; rebuiltBundleSha256?: string; rebuiltAssets?: Array<{ name: string; sha256: string; bytes: number }>; remixAppIds?: string[] };
+        const input = await request.json() as { appId?: string; releaseId?: string; commit?: string; branch?: string; remixAppIds?: string[] };
         const { appId, releaseId, commit, branch } = input;
         if (!/^[a-z][a-z0-9-]{0,63}$/.test(appId || "") || !/^[a-f0-9]{64}$/.test(releaseId || "") || !/^[a-f0-9]{40}$/.test(commit || "") || !branch || branch.length > 200 || input.remixAppIds && (!Array.isArray(input.remixAppIds) || input.remixAppIds.length > 50 || input.remixAppIds.some(id => !/^[a-z][a-z0-9-]{0,63}$/.test(id)))) return json({ message: "源码修复参数无效" }, 400);
         const shared = await this.ctx.storage.get<MarketEntry>(`shared:${appId}`);
@@ -769,13 +769,7 @@ export class Workshop extends DurableObject<Env> {
         if (!["identical", "ahead"].includes(comparison.status)) return json({ message: "指定分支不包含源码提交" }, 409);
         const matches = application.source.applicationTree ? source.applicationTree === application.source.applicationTree
           : application.source.tree ? source.tree === application.source.tree : !application.source.dirty && application.source.commit === commit;
-        if (!matches) {
-          // Legacy releases captured an unpushed whole-repository tree. Only a
-          // maintainer who reproduced the bundle AND every asset may repair it.
-          const artifacts = application as ApplicationRelease & { bundle: { sha256: string }; assets: Array<{ name: string; sha256: string; bytes: number }> };
-          const assets = (items: typeof artifacts.assets) => JSON.stringify(items.map(({ name, sha256, bytes }) => ({ name, sha256, bytes })).sort((a, b) => a.name.localeCompare(b.name)));
-          if (application.source.applicationTree || input.rebuiltBundleSha256 !== artifacts.bundle.sha256 || !Array.isArray(input.rebuiltAssets) || assets(input.rebuiltAssets) !== assets(artifacts.assets)) return json({ message: "源码未匹配；旧版本需先重建并核对包体与全部资源" }, 409);
-        }
+        if (!matches) return json({ message: "提交与应用源码快照不匹配" }, 409);
         await this.rememberSource(application, { commit: commit!, branch, ...source, tree: application.source.tree });
         const repairedRemixes: string[] = [];
         for (const id of input.remixAppIds || []) {
@@ -876,11 +870,8 @@ export class Workshop extends DurableObject<Env> {
           const base = manifest.modules?.base;
           if (manifest.appId !== match[1] || typeof manifest.source?.dirty !== "boolean" || !/^[a-f0-9]{64}$/.test(manifest.releaseId) || !Number.isSafeInteger(base) || base < 2000000 || base % 100000 || manifest.modules.size !== 100000) return json({ error: "application manifest invalid" }, 400);
           const document = JSON.parse(item.body);
-          const { releaseId, ...content } = document;
-          const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(content)));
-          const identity = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
           if ((document.source.dirty || document.source.tree !== undefined) && !/^[a-f0-9]{40}$/.test(document.source.tree)) return json({ error: "application source tree invalid" }, 400);
-          if (identity !== releaseId || document.format !== 1 || !/^[a-f0-9]{40}$/.test(document.source.commit) || !/^\d+\.\d+\.\d+$/.test(document.sdk ?? "") || document.requires !== undefined) return json({ error: "application integrity invalid" }, 400);
+          if (document.format !== 1 || !/^[a-f0-9]{40}$/.test(document.source.commit) || !/^\d+\.\d+\.\d+$/.test(document.sdk ?? "") || document.requires !== undefined) return json({ error: "application manifest invalid" }, 400);
           if (document.source.repository !== "jiangfengwhu/zjh-plugin" || document.dataSchemaVersion !== 1) return json({ error: "application source or data schema invalid" }, 400);
           if (document.source.applicationTree !== undefined && !/^[a-f0-9]{40}$/.test(document.source.applicationTree)) return json({ error: "application source snapshot invalid" }, 400);
           for (const blob of [document.bundle, ...(document.assets ?? [])]) {
