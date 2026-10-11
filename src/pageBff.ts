@@ -8,17 +8,22 @@ export async function pageBff(request: Request, env: Env): Promise<Response | un
   if (url.pathname === "/v1/discovery") {
     const params = new URLSearchParams(url.searchParams);
     params.set("limit", params.get("limit") || "24");
+    params.delete("social");
+    if (url.searchParams.get("social") === "only") params.set("view", "summary");
     const response = await env.WORKSHOP.getByName("dynamic").fetch(new Request(`https://workshop.internal/v1/market?${params}`));
     if (!response.ok) return response;
+    if (url.searchParams.get("social") === "0") return new Response(response.body, { headers: { "Content-Type": "application/json", "Cache-Control": "private,no-store" } });
     const page = await response.json() as { applications: Array<{ manifest: { appId: string }; authorId?: string }> };
     try {
       const interactions = await env.POSTS.getByName("timeline").fetch(new Request("https://posts.internal/internal/application-interactions", { method: "POST", headers: request.headers, body: JSON.stringify({ applications: page.applications }) }));
       if (!interactions.ok) throw new Error("interactions unavailable");
       const { items } = await interactions.json() as { items: Array<{ appId: string; post: unknown; following: boolean }> };
+      if (url.searchParams.get("social") === "only") return Response.json({ items }, { headers: { "Cache-Control": "private,no-store" } });
       const byId = new Map(items.map(item => [item.appId, item]));
       return Response.json({ ...page, applications: page.applications.map(item => ({ ...item, discussion: byId.get(item.manifest.appId)?.post, authorFollowing: byId.get(item.manifest.appId)?.following })) }, { headers: { "Cache-Control": "private,no-store" } });
     } catch {
       // A social outage must not prevent playing published applications.
+      if (url.searchParams.get("social") === "only") return Response.json({ message: "互动信息暂时不可用" }, { status: 503, headers: { "Cache-Control": "private,no-store" } });
       return Response.json(page, { headers: { "Cache-Control": "private,no-store" } });
     }
   }
