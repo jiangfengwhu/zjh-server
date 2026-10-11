@@ -62,6 +62,7 @@ export default {
       if (request.method === "PUT" && /^\/v1\/application-blobs\/[a-z][a-z0-9-]{0,63}\/[a-f0-9]{64}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && /^\/v1\/application-publisher\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && /^\/v1\/application-download\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
+      if (request.method === "DELETE" && /^\/v1\/works\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (/^\/v1\/applications\/[a-z][a-z0-9-]{0,63}\/(?:latest|candidate|public|releases\/[a-f0-9]{64})$/.test(url.pathname) || ["/v1/official-release", "/v1/application-source", "/v1/development-reset", "/v1/works", "/v1/market"].includes(url.pathname) || /^\/v1\/application-allocation\/[a-z][a-z0-9-]{0,63}$/.test(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "GET" && ["/v1/applications", "/v1/application-updates"].includes(url.pathname)) return env.WORKSHOP.getByName("dynamic").fetch(request);
       if (request.method === "POST" && url.pathname === "/v1/workshop") return env.WORKSHOP.getByName("dynamic").fetch(request);
@@ -310,6 +311,7 @@ export class Workshop extends DurableObject<Env> {
     try { await pending; } finally { this.notices.delete(pending); }
   }
   private async sendResultNotice(task: WorkshopTask, success: boolean, message: string, kind?: "work-submitted") {
+    if (await this.ctx.storage.get(`deleted:${task.appId}`)) return;
     const round = task.publishEpoch || task.requestId || task.session;
     if (!round) return;
     const event = kind || String(success);
@@ -334,6 +336,7 @@ export class Workshop extends DurableObject<Env> {
     if (this.resetting) return;
     const pending = await this.ctx.storage.list<{ ownerId: string; appId: string; round: string; success: boolean; kind?: "work-submitted"; title: string; message: string }>({ prefix: "work-notice:", limit: 100 });
     for (const [key, payload] of pending) {
+      if (await this.ctx.storage.get(`deleted:${payload.appId}`)) { await this.ctx.storage.delete(key); continue; }
       try {
         const response = await this.env.POSTS.getByName("timeline").fetch(new Request("https://posts.internal/internal/work-notice", { method: "POST", body: JSON.stringify(payload) }));
         if (response.ok) { await this.ctx.storage.put(key.replace("work-notice:", "work-notice-sent:"), true); await this.ctx.storage.delete(key); }
@@ -462,6 +465,7 @@ export class Workshop extends DurableObject<Env> {
     } catch { return json({ message: "请求格式不正确" }, 400); }
   }
   private async publisher(request: Request, appId: string): Promise<boolean> {
+    if (await this.ctx.storage.get(`deleted:${appId}`)) return false;
     if (await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN)) return true;
     const grant = await readPublisherGrant(request, this.env.OFFICIAL_PUBLISH_TOKEN);
     if (!grant || grant.appId !== appId) return false;
@@ -486,11 +490,41 @@ export class Workshop extends DurableObject<Env> {
   }
   private async saveTask(task: WorkshopTask) {
     await this.ctx.storage.transaction(async storage => {
+      if (await storage.get(`deleted:${task.appId}`)) throw new Error("作品已删除");
       await storage.put({ [`task:${task.appId}`]: task, [`owner:${task.ownerId}:${task.appId}`]: task });
       await storage.delete(`watch:${task.appId}`);
       const quota = await storage.get<{ day: number; count: number; reservations?: Record<string, number> }>(`quota:${task.ownerId}`);
       if (quota?.reservations?.[task.appId]) { delete quota.reservations[task.appId]; await storage.put(`quota:${task.ownerId}`, quota); }
     });
+  }
+  private async deleteWork(request: Request, appId: string): Promise<Response> {
+    const user = await authenticatedUser(request, this.env);
+    if (!user) return json({ message: "请先登录" }, 401);
+    if (appId === "jolly") return json({ message: "不能删除宿主应用" }, 403);
+    const [task, shared, deleted] = await Promise.all([
+      this.ctx.storage.get<WorkshopTask>(`task:${appId}`),
+      this.ctx.storage.get<MarketEntry>(`shared:${appId}`),
+      this.ctx.storage.get<{ ownerId: string }>(`deleted:${appId}`),
+    ]);
+    const ownerId = deleted?.ownerId ?? task?.ownerId ?? shared?.authorId;
+    if (!ownerId) return json({ message: "作品不存在" }, 404);
+    if (ownerId !== user.id) return json({ message: "只能删除自己的作品" }, 403);
+    await this.ctx.storage.transaction(async storage => {
+      await storage.put({ [`deleted:${appId}`]: { ownerId, at: Date.now() }, [`deleted-work:${ownerId}:${appId}`]: appId, [`withdrawn:${appId}`]: true });
+      await storage.delete([`task:${appId}`, `owner:${ownerId}:${appId}`, `candidate:${appId}`, `shared:${appId}`, `work-summary:${appId}`, `progress-output:${appId}`, `application-icon:${appId}`, `watch:${appId}`]);
+      this.marketIndex.remove(appId);
+      const quota = await storage.get<{ day: number; count: number; reservations?: Record<string, number> }>(`quota:${ownerId}`);
+      if (quota?.reservations?.[appId]) { delete quota.reservations[appId]; await storage.put(`quota:${ownerId}`, quota); }
+      const notices = await storage.list({ prefix: `work-notice:${appId}:` });
+      for (const key of notices.keys()) await storage.delete(key);
+    });
+    // Allocation, immutable releases and shared blobs remain valid for existing references.
+    this.ctx.waitUntil(this.env.CATALOG.delete(`v1/applications/${appId}/latest`).catch(() => {}));
+    if (!deleted && task?.phase === "working" && /^sessions\/[A-Za-z0-9_-]+$/.test(task.session)) {
+      this.ctx.waitUntil(proxyJules(new Request(request.url, { method: "POST", body: JSON.stringify({ method: "POST", path: `/v1alpha/${task.session}:sendMessage`, body: JSON.stringify({ prompt: "作品已删除，立即停止当前制作，不再修改或发布。" }) }) }), this.env).then(() => {}).catch(() => {}));
+    }
+    this.emitWork(ownerId, appId);
+    return json({ deleted: true, appId }, 200);
   }
   private async publisherInstruction(task: WorkshopTask, initialize = false) {
     const grant = await issuePublisherGrant({ appId: task.appId, ownerId: task.ownerId, epoch: task.publishEpoch! }, this.env.OFFICIAL_PUBLISH_TOKEN);
@@ -943,6 +977,7 @@ export class Workshop extends DurableObject<Env> {
         if (!await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN)) return json({ message: "官方公开发布需要维护者凭证" }, 403);
         const { appId, releaseId } = await request.json() as { appId: string; releaseId: string };
         if (!/^[a-z][a-z0-9-]{0,63}$/.test(appId) || !/^[a-f0-9]{64}$/.test(releaseId)) return json({ message: "请指定应用和不可变版本" }, 400);
+        if (await this.ctx.storage.get(`deleted:${appId}`)) return json({ message: "作品已删除" }, 410);
         if (await this.ctx.storage.get(`task:${appId}`)) return json({ message: "用户作品必须由作者决定上架" }, 409);
         const manifest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/releases/${releaseId}`, "json");
         if (!manifest || manifest.appId !== appId || manifest.releaseId !== releaseId || manifest.source.dirty) return json({ message: "指定版本尚未上传或无效" }, 409);
@@ -996,6 +1031,8 @@ export class Workshop extends DurableObject<Env> {
         if (proof && (manifest.source.applicationTree ? proof.applicationTree === manifest.source.applicationTree : manifest.source.tree && proof.tree === manifest.source.tree)) response.headers.set("X-Application-Source-Commit", proof.commit);
         return response;
       }
+      const deleteRoute = path.match(/^\/v1\/works\/([a-z][a-z0-9-]{0,63})$/);
+      if (deleteRoute && request.method === "DELETE") return this.deleteWork(request, deleteRoute[1]);
       if (path === "/v1/works" && request.method === "GET") {
         const user = await authenticatedUser(request, this.env); if (!user) return json({ message: "请先登录" }, 401);
         const params = new URL(request.url).searchParams;
@@ -1037,14 +1074,17 @@ export class Workshop extends DurableObject<Env> {
           const ttl = status.completed && status.application ? 300000 : 20000;
           return { submissionId: task.requestId, appId: task.appId, ownerId: task.ownerId, session: task.session, approvalToken: task.token, title: task.title ?? task.appId, wish: task.wish ?? "", startedAt: task.startedAt, originalAppId: task.originalAppId, originalReleaseId: task.originalReleaseId, originalCommit: task.originalCommit, branch: task.branch, phase: task.phase, status: { ...status, stale: !settled && (!valid || Date.now() - cached.at >= ttl || force && cached.at === previous?.at) }, sharing: { shared: shared?.authorId === user.id ? shared : null, application, iconUrl: metadata.get(`application-icon:${task.appId}`) as string | undefined }, updatedAt: valid ? cached.at : null };
         }));
-        const selected = works.filter((work): work is NonNullable<typeof work> => !!work);
-        const response = json(gallery ? {works: selected.map(work => ({appId: work.appId, title: work.status.application?.appName || work.title, wish: work.wish, createdAt: work.startedAt || 0, manifest: work.status.application || work.sharing.application, sharing: work.sharing, stale: work.status.stale, message: work.status.message, stage: work.status.state === "FAILED" ? "failed" : work.status.state === "PAUSED" ? "paused" : work.status.state === "AWAITING_USER_FEEDBACK" ? "reply" : work.status.completed ? work.status.application ? "load" : work.status.delivery === "blocked" ? "blocked" : "making" : "making"})), nextCursor, totalCount: allTasks.length} : {works: selected}, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
+        const deletedAppIds = [...(await this.ctx.storage.list<string>({ prefix: `deleted-work:${user.id}:` })).values()];
+        const deletedIds = new Set(deletedAppIds);
+        const selected = works.filter((work): work is NonNullable<typeof work> => !!work && !deletedIds.has(work.appId));
+        const response = json(gallery ? {works: selected.map(work => ({appId: work.appId, title: work.status.application?.appName || work.title, wish: work.wish, createdAt: work.startedAt || 0, manifest: work.status.application || work.sharing.application, sharing: work.sharing, stale: work.status.stale, message: work.status.message, stage: work.status.state === "FAILED" ? "failed" : work.status.state === "PAUSED" ? "paused" : work.status.state === "AWAITING_USER_FEEDBACK" ? "reply" : work.status.completed ? work.status.application ? "load" : work.status.delivery === "blocked" ? "blocked" : "making" : "making"})), nextCursor, totalCount: allTasks.filter(task => !deletedIds.has(task.appId)).length, deletedAppIds} : {works: selected, deletedAppIds}, 200); response.headers.set("Cache-Control", "private,no-store"); return response;
       }
       const input = await request.json() as { appId?: string; originalAppId?: string; originalReleaseId?: string; requestId?: string; action?: string; session?: string; token?: string; approvalToken?: string; method?: string; path?: string; body?: string; releaseId?: string; title?: string; summary?: string; category?: string; screenshots?: string[]; applicationReleases?: Record<string, string>; pageToken?: string; compact?: boolean };
       const appId = input.appId;
       if (!appId || !/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return json({ message: "请指定目标应用" }, 400);
       const user = await authenticatedUser(request, this.env);
       if (!user) return json({ message: "请先登录后再操作作品" }, 401);
+      if (await this.ctx.storage.get(`deleted:${appId}`)) return json({ message: "作品已删除" }, 410);
       let task = await this.ctx.storage.get<WorkshopTask>(`task:${appId}`);
       if (task && task.ownerId !== user.id) return json({ message: "这个作品属于其他账号" }, 403);
       if (path === "/v1/jules" && input.method === "POST" && input.path === "/v1alpha/sessions") {

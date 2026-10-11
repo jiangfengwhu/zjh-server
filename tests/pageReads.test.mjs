@@ -24,6 +24,55 @@ function context(){
 function fixture(){const workshopCtx=context(),postsCtx=context();const env={ACCOUNTS:{getByName:()=>({fetch:async req=>{if(new URL(req.url).pathname==='/internal/profiles'){const {ids}=await req.json();return Response.json({profiles:ids.map(id=>({id,name:id===alice?'Alice':'Bob',avatarUrl:null}))});}return Response.json(req.headers.get('Authorization')==='Bearer '+token?{user:{id:alice,name:'Alice',avatarUrl:null}}:{},{status:req.headers.get('Authorization')==='Bearer '+token?200:401})}})},CATALOG:{get:async()=>null},BLOBS:{},WORKSHOP:{getByName:()=>workshop},POSTS:{getByName:()=>posts}};const workshop=new Workshop(workshopCtx,env),posts=new Posts(postsCtx,env);return {env,workshop,posts,workshopCtx,postsCtx,call:(path,auth=false)=>worker.fetch(new Request('https://test'+path,{headers:auth?headers:{}}),env),close(){workshopCtx.close();postsCtx.close()}};}
 const market=(id,title='离谱鉴宝',at=100,author=bob)=>({manifest:{appId:id,releaseId:'b'.repeat(64),appName:title,description:'简介',accent:'#fff',source:{commit:'c'.repeat(40),dirty:false}},title,summary:'AI 萌星物语 😺',authorId:author,authorName:'Bob',publishedAt:at,category:'other'});
 
+test('work deletion enforces ownership, removes listings and revokes late publication without deleting immutable references',async()=>{
+ const f=fixture();try{
+  const removed=[];f.env.CATALOG.delete=async key=>{removed.push(key)};
+  f.env.OFFICIAL_PUBLISH_TOKEN=token;
+  const appId='app-delete',other='app-keep';
+  const task={appId,ownerId:alice,session:'',token:'test',branch:'main',phase:'paused',startedAt:100,title:'删除测试',wish:'test'};
+  const entry=market(appId,'删除测试',100,alice),version=entry.manifest.releaseId;
+  await f.workshopCtx.storage.put({['task:'+appId]:task,['owner:'+alice+':'+appId]:task,['shared:'+appId]:entry,['candidate:'+appId]:entry.manifest,['allocation:'+appId]:{base:2000000},['published:'+appId+':'+version]:true,['work-notice:'+appId+':round:true']:{appId},['quota:'+alice]:{day:1,count:3,reservations:{[appId]:Date.now()+60000}}});
+  const foreign={...task,appId:other,ownerId:bob};await f.workshopCtx.storage.put({['task:'+other]:foreign,['owner:'+bob+':'+other]:foreign,['shared:'+other]:market(other)});
+  const request=(id,auth=true)=>new Request('https://test/v1/works/'+id,{method:'DELETE',headers:auth?headers:{}});
+  assert.equal((await worker.fetch(request(appId,false),f.env)).status,401);
+  assert.equal((await worker.fetch(request(other),f.env)).status,403);
+  assert.equal((await worker.fetch(request('jolly'),f.env)).status,403);
+  assert.equal((await worker.fetch(request('missing'),f.env)).status,404);
+  assert.equal((await f.workshopCtx.storage.get('task:'+appId)).appId,appId);
+  assert.deepEqual(await(await worker.fetch(request(appId),f.env)).json(),{deleted:true,appId});
+  for(const key of ['task:'+appId,'owner:'+alice+':'+appId,'shared:'+appId,'candidate:'+appId,'work-notice:'+appId+':round:true'])assert.equal(await f.workshopCtx.storage.get(key),undefined);
+  assert.equal((await f.workshopCtx.storage.get('quota:'+alice)).count,3);
+  assert.deepEqual((await f.workshopCtx.storage.get('quota:'+alice)).reservations,{});
+  assert.equal((await f.workshopCtx.storage.get('allocation:'+appId)).base,2000000);
+  assert.equal(await f.workshopCtx.storage.get('published:'+appId+':'+version),true);
+  assert.equal((await f.workshopCtx.storage.get('task:'+other)).ownerId,bob);
+  const listing=await(await f.call('/v1/market')).json();assert.deepEqual(listing.applications.map(a=>a.manifest.appId),[other]);
+  const works=await(await f.call('/v1/works',true)).json();assert.deepEqual(works.works,[]);assert.deepEqual(works.deletedAppIds,[appId]);
+  const gallery=await(await f.call('/v1/me/works',true)).json();assert.equal(gallery.totalCount,0);assert.deepEqual(gallery.deletedAppIds,[appId]);
+  assert.equal((await f.call('/v1/applications/'+appId+'/public')).status,404);
+  await assert.rejects(()=>f.workshop.saveTask(task),/作品已删除/);
+  assert.equal(await f.workshop.publisher(new Request('https://test',{headers}),appId),false);
+  const resume=new Request('https://test/v1/workshop',{method:'POST',headers,body:JSON.stringify({appId,action:'status'})});assert.equal((await worker.fetch(resume,f.env)).status,410);
+  const publish=new Request('https://test/v1/official-release',{method:'POST',headers,body:JSON.stringify({appId,releaseId:version})});assert.equal((await worker.fetch(publish,f.env)).status,410);
+  assert.equal((await worker.fetch(request(appId),f.env)).status,200);
+  await f.workshopCtx.flush();assert.ok(removed.every(key=>key==='v1/applications/'+appId+'/latest'));
+ }finally{f.close()}
+});
+
+test('work deletion filters a list request that was already waiting for progress',async()=>{
+ const f=fixture();try{
+  f.env.CATALOG.delete=async()=>{};
+  const appId='app-delete-race';const task={appId,ownerId:alice,session:'',token:'test',branch:'main',phase:'working',startedAt:100,wish:'test'};
+  await f.workshopCtx.storage.put({['task:'+appId]:task,['owner:'+alice+':'+appId]:task});
+  let release,entered;const started=new Promise(r=>{entered=r});const blocked=new Promise(r=>{release=r});
+  f.workshop.refreshSummary=()=>{entered();return blocked};
+  const pending=f.call('/v1/works?view=gallery&refresh=1',true);await started;
+  assert.equal((await worker.fetch(new Request('https://test/v1/works/'+appId,{method:'DELETE',headers}),f.env)).status,200);
+  release();const page=await(await pending).json();assert.deepEqual(page.works,[]);assert.equal(page.totalCount,0);assert.deepEqual(page.deletedAppIds,[appId]);
+  await f.workshopCtx.flush();
+ }finally{f.close()}
+});
+
 test('batch notification reads are idempotent, account-scoped and exclude later arrivals',async()=>{
  const f=fixture();try{
   const ids=[1,2,3,4].map(n=>String(n).padStart(64,'0'));

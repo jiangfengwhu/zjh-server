@@ -47,6 +47,7 @@ APP_DATA 使用 SQLite Durable Objects。私有实例按 userId 分配，内部�
 | /v1/posts、/v1/notifications、/v1/profiles | 动态、互动、公开身份及关注／粉丝分页 |
 | /v1/messages、/v1/messages/<用户 ID> | 私信会话、文字发送与历史；登录鉴权、幂等发送 |
 | /v1/workshop、/v1/works、/v1/jules | 按账号和 appId 管理制作，同应用复用会话并串行写入 |
+| DELETE /v1/works/<appId> | 作者删除作品及制作记录，同时下架并撤销发布授权；重复删除幂等。作品读取返回当前账号的 deletedAppIds，供设备清理旧缓存；保留模块分配及不可变历史包，删除的 ID 不可再次制作或发布 |
 | /v1/creation-media | 账号认证的制作参考图上传，JPEG 最大 2 MB，沿用上传额度 |
 | /v1/application-blobs/<id>/<sha256>、/v1/catalog | 候选上传、本轮授权及清单结构检查；不校验文件哈希 |
 | /v1/market、应用 public | 作者主动公开的快照，后续候选发布不改变公开版本 |
