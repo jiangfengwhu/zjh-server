@@ -4,6 +4,7 @@ import { androidAssetLinks, downloadLatestApk, readSharedApplication } from "./s
 import { DurableObject } from "cloudflare:workers";
 import { authenticatedUser, OFFICIAL_ACCOUNT_ID, OFFICIAL_PROFILE, publicProfiles, readAvatar } from "./accounts";
 import { KeyedQueue } from "./concurrency";
+import { careerMaterials } from "./careerMaterials";
 import { MarketIndex } from "./readIndexes";
 import { pageBff } from "./pageBff";
 import { sdkPreparation } from "./sdk-distribution";
@@ -34,6 +35,7 @@ export default {
   async fetch(request, env): Promise<Response> {
     const url = new URL(request.url);
     try {
+      if (url.pathname === "/v1/career-rescue/materials") return env.WORKSHOP.getByName("dynamic").fetch(request);
       const page = await pageBff(request, env);
       if (page) return page;
       if (url.pathname.startsWith("/v1/app-files/")) return applicationFiles(request, env);
@@ -402,6 +404,7 @@ export class Workshop extends DurableObject<Env> {
   private resetting = false;
   private writes = new Set<Promise<Response>>();
   async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname === "/v1/career-rescue/materials") return careerMaterials(request, this.ctx.storage, await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN));
     await this.marketIndex.ensure();
     if (new URL(request.url).pathname === "/v1/development-reset") return this.reset(request);
     if (this.resetting) return json({ message: "开发数据正在重置，请稍后重试" }, 503);

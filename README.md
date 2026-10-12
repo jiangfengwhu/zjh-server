@@ -24,6 +24,8 @@ Secrets 用 `npx wrangler secret put <NAME>` 交互配置，值不写入代码�
 
 GitHub/Jules 集成仅开放 zjh-plugin；云端不获得 R2、Wrangler 或全局发布权限。
 
+求职急救站的公开资料和维护者更新接口见 [资料维护](docs/career-materials.md)。资料复用 Workshop SQLite 原子保存，不新增存储绑定；应用缓存支持离线阅读。
+
 ## 应用云数据
 
 APP_DATA 使用 SQLite Durable Objects。私有实例按 userId 分配，内部再按 appId 隔离；公开实例按 appId 分配。入口从宿主登录 Token 获取用户身份，只允许已公开应用或当前作者的作品访问，不使用发布授权。公开记录仅创建者可改删，客户端不能覆盖归属和版本字段。集合首次写入自动创建；单条 JSON ≤32 KB，每个实例业务数据 ≤50 MB、记录 ≤10 万，每应用集合 ≤100；每用户每实例每分钟 ≤120 次请求。写入 requestId 一小时去重，最多保留 2000 条去重结果，超出时拒绝新写入而不提前丢弃旧结果。分页使用绑定账号、应用、集合和条件的游标。
