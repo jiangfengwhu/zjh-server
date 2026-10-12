@@ -7,11 +7,13 @@ if (!file) throw new Error('用法：node scripts/update-career-materials.mjs <J
 const url = 'https://zijinhua.297782.xyz/v1/career-rescue/materials';
 const input = JSON.parse(await readFile(path.resolve(file), 'utf8'));
 const read = await fetch(url, { signal: AbortSignal.timeout(15000) });
-if (!read.ok || !read.headers.get('etag')) throw new Error(`读取资料版本失败：${read.status}`);
+if (!read.ok) throw new Error(`读取资料版本失败：${read.status}`);
+const current = await read.json();
+if (!Number.isSafeInteger(current.revision) || current.revision < 0) throw new Error('资料版本格式无效');
 const token = (process.env.OFFICIAL_PUBLISH_TOKEN || await readFile(path.join(os.homedir(), '.codex', 'zjh-official-publish-token'), 'utf8')).trim();
 const result = await fetch(url, {
   method: process.argv.includes('--replace') ? 'PUT' : 'PATCH',
-  headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'If-Match': read.headers.get('etag') },
+  headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'If-Match': `"${current.revision}"` },
   body: JSON.stringify({ items: input.items, ...(input.removeIds ? { removeIds: input.removeIds } : {}) }), signal: AbortSignal.timeout(20000),
 });
 const body = await result.json();

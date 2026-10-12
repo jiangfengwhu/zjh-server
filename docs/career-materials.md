@@ -38,7 +38,7 @@ node scripts/update-career-materials.mjs C:\资料\本次更新.json
 - GET：公开读取 `{revision, updatedAt, items}`，返回 `ETag: "版本整数"`；支持 If-None-Match，未更新返回304。
 - PATCH：新增/修改 items、删除 removeIds，其余保留。
 - PUT：完整替换 items。
-- 写入均需 `Authorization: Bearer <维护者授权>`、`Content-Type: application/json`、`If-Match: <刚读到的ETag>`。
+- 写入均需 `Authorization: Bearer <维护者授权>`、`Content-Type: application/json`、`If-Match: "刚读到的revision整数"`，例如 GET 返回 revision=1，则传 `If-Match: "1"`。更新脚本会自动处理。
 - 成功返回 `{published:true, revision, count, updatedAt}`。403无权限、428缺版本条件、409并发冲突、400资料无效、413超限。失败不修改已有资料。
 
 应用打开时最多每5分钟静默同步，资料库右上角可以立即刷新；断网时使用本机缓存。学习状态、笔记、回答、收藏按账号保存在本机，不上传到资料接口。阅读不需要AI；点评使用用户配置的AI。

@@ -30,6 +30,8 @@ test('catalog requires maintainer and revision, validates real sources and publi
     assert.notEqual(next.items[0].contentVersion, seed.items[0].contentVersion);
     const cached = await careerMaterials(new Request('https://test/v1/career-rescue/materials', { headers: { 'If-None-Match': '"2"' } }), f.storage, false);
     assert.equal(cached.status, 304);
+    const compressed = await careerMaterials(new Request('https://test/v1/career-rescue/materials', { headers: { 'If-None-Match': 'W/"2"' } }), f.storage, false);
+    assert.equal(compressed.status, 304);
     assert.equal((await f.call('PATCH', { items: [], removeIds: [seed.items[0].id] }, '"2"')).status, 200);
     assert.equal((await (await f.call()).json()).items.some(i => i.id === seed.items[0].id), false);
     assert.equal((await f.call('PUT', { items: [] }, '"3"')).status, 200);

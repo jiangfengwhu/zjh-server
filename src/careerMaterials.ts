@@ -76,7 +76,7 @@ export async function careerMaterials(request: Request, storage: DurableObjectSt
   };
   if (!writing) {
     const catalog = read(), etag = `"${catalog.revision}"`, headers = { ETag: etag, 'Cache-Control': 'no-cache' };
-    if (request.headers.get('If-None-Match') === etag) return new Response(null, { status: 304, headers });
+    if (request.headers.get('If-None-Match')?.split(',').some(value => value.trim() === '*' || value.trim().replace(/^W\//, '') === etag)) return new Response(null, { status: 304, headers });
     return request.method === 'HEAD' ? new Response(null, { headers }) : response(catalog, 200, headers);
   }
   const match = request.headers.get('If-Match');
