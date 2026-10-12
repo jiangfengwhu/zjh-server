@@ -3,10 +3,11 @@ const MAX_ITEMS = 300;
 const roles = ['通用', '产品', '运营', '前端', '后端', '数据分析', '设计'];
 type Source = { label: string; url: string };
 type Material = {
-  id: string; kind: string; title: string; summary: string; roles: string[]; tags: string[];
+  id: string; kind: string; topic: string; title: string; summary: string; roles: string[]; tags: string[];
   level: string; minutes: number; updatedAt: string; contentVersion: string; company?: string; interviewDate?: string;
   sources: Source[]; sections: { title: string; body: string }[];
   question?: string; answerPoints: string[]; followUps: string[]; pitfalls: string[];
+  deadlineAt?: string; applicationUrl?: string;
 };
 type Catalog = { revision: number; updatedAt: string; items: Material[] };
 const response = (body: unknown, status = 200, headers: Record<string, string> = {}) => Response.json(body, { status, headers: { 'Cache-Control': 'no-cache', ...headers } });
@@ -32,7 +33,9 @@ function strings(v: unknown, name: string, max = 10, length = 400): string[] {
 function material(value: unknown): Material {
   const v = object(value), id = text(v.id, 'id', 64), kind = text(v.kind, 'kind', 10);
   if (!/^[a-z][a-z0-9-]{0,63}$/.test(id)) throw new Error('id需以小写字母开头，仅含小写字母、数字和短横线');
-  if (!['考点', '面经', '指南'].includes(kind)) throw new Error('kind需为考点、面经或指南');
+  if (!['考点', '面经', '指南', '机会'].includes(kind)) throw new Error('kind需为考点、面经、指南或机会');
+  const topic = v.topic === undefined ? (kind === '机会' ? '机会' : '面试') : text(v.topic, 'topic', 10);
+  if (!['简历', '面试', '谈薪', '校招', '权益', '机会'].includes(topic)) throw new Error('topic需为简历、面试、谈薪、校招、权益或机会');
   const roleList = strings(v.roles, 'roles', 7, 20);
   if (!roleList.length || roleList.some(r => !roles.includes(r))) throw new Error('roles需包含至少一个有效岗位');
   if (!Array.isArray(v.sources) || !v.sources.length || v.sources.length > 5) throw new Error('每份资料需提供 1–5 个真实来源');
@@ -46,11 +49,16 @@ function material(value: unknown): Material {
   const sections = v.sections.map(s => { const row = object(s); return { title: text(row.title, '段落标题', 80), body: text(row.body, '段落正文', 6000) }; });
   const company = text(v.company, '公司', 100, true), interviewDate = v.interviewDate === undefined ? '' : date(v.interviewDate, '面试日期');
   if (kind === '面经' && (!company || !interviewDate)) throw new Error('面经必须填写公司和实际面试日期');
+  if (kind === '机会' && !company) throw new Error('具体招聘机会必须填写实际招聘公司');
+  const deadlineAt = text(v.deadlineAt, '截止时间', 40, true), applicationUrl = text(v.applicationUrl, '投递地址', 1000, true);
+  if (deadlineAt && (!/T.+(?:Z|[+-]\d{2}:\d{2})$/.test(deadlineAt) || !Number.isFinite(Date.parse(deadlineAt)))) throw new Error('deadlineAt需为包含时区的ISO日期时间，且必须有来源依据');
+  if (deadlineAt) date(deadlineAt.slice(0, 10), '截止日期');
+  if (applicationUrl) { let u: URL; try { u = new URL(applicationUrl); } catch { throw new Error('投递地址无效'); } if (u.protocol !== 'https:' || u.username || u.password) throw new Error('投递地址需为无凭据HTTPS链接'); }
   const level = text(v.level, 'level', 10);
   if (!['入门', '进阶'].includes(level) || !Number.isInteger(v.minutes) || Number(v.minutes) < 1 || Number(v.minutes) > 60) throw new Error('level需为入门/进阶，minutes需为 1–60 的整数');
   const question = text(v.question, '练习题', 160, true);
   if (kind === '考点' && !question) throw new Error('考点必须有可练习的问题');
-  const result: Material = { id, kind, title: text(v.title, '标题', 100), summary: text(v.summary, '摘要', 300), roles: roleList, tags: strings(v.tags, 'tags', 8, 30), level, minutes: Number(v.minutes), updatedAt: date(v.updatedAt, '更新日期'), contentVersion: crypto.randomUUID(), sources, sections, answerPoints: strings(v.answerPoints, '回答要点'), followUps: strings(v.followUps, '追问'), pitfalls: strings(v.pitfalls, '易错点'), ...(company ? { company } : {}), ...(interviewDate ? { interviewDate } : {}), ...(question ? { question } : {}) };
+  const result: Material = { id, kind, topic, title: text(v.title, '标题', 100), summary: text(v.summary, '摘要', 300), roles: roleList, tags: strings(v.tags, 'tags', 8, 30), level, minutes: Number(v.minutes), updatedAt: date(v.updatedAt, '更新日期'), contentVersion: crypto.randomUUID(), sources, sections, answerPoints: strings(v.answerPoints, '回答要点'), followUps: strings(v.followUps, '追问'), pitfalls: strings(v.pitfalls, '易错点'), ...(company ? { company } : {}), ...(interviewDate ? { interviewDate } : {}), ...(question ? { question } : {}), ...(deadlineAt ? { deadlineAt } : {}), ...(applicationUrl ? { applicationUrl } : {}) };
   if (new TextEncoder().encode(JSON.stringify(result)).byteLength > 32 * 1024) throw new Error(`${id}单份资料不能超过 32 KiB`);
   return result;
 }

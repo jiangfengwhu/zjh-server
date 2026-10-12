@@ -20,6 +20,8 @@ test('catalog requires maintainer and revision, validates real sources and publi
     assert.equal((await f.call('PATCH', seed)).status, 428);
     assert.equal((await f.call('PUT', { items: [{ ...seed.items[0], sources: [{ label: 'bad', url: 'javascript:alert(1)' }] }] }, '"0"')).status, 400);
     assert.equal((await f.call('PUT', { items: [{ ...seed.items[0], kind: '面经' }] }, '"0"')).status, 400);
+    assert.equal((await f.call('PUT', { items: [{ ...seed.items[0], topic: 'unknown' }] }, '"0"')).status, 400);
+    assert.equal((await f.call('PUT', { items: [{ ...seed.items[0], kind: '机会', company: '测试招聘方', deadlineAt: '2026-02-30T12:00:00+08:00' }] }, '"0"')).status, 400);
     const first = await f.call('PUT', seed, '"0"'); assert.equal(first.status, 200);
     assert.equal((await first.json()).count, seed.items.length);
     assert.equal((await f.call('PUT', { items: [] }, '"0"')).status, 409);
@@ -36,6 +38,10 @@ test('catalog requires maintainer and revision, validates real sources and publi
     assert.equal((await (await f.call()).json()).items.some(i => i.id === seed.items[0].id), false);
     assert.equal((await f.call('PUT', { items: [] }, '"3"')).status, 200);
     assert.deepEqual((await (await f.call()).json()).items, []);
+    const announcement = { ...seed.items[0], id: 'test-opening', kind: '机会', topic: '校招', company: '测试招聘方', deadlineAt: '2026-10-20T23:59:00+08:00', applicationUrl: 'https://example.com/job' };
+    assert.equal((await f.call('PATCH', { items: [announcement] }, '"4"')).status, 200);
+    const saved = (await (await f.call()).json()).items[0];
+    assert.equal(saved.deadlineAt, announcement.deadlineAt); assert.equal(saved.topic, '校招');
   } finally { f.close(); }
 });
 test('oversized and malformed requests leave the existing catalog unchanged', async () => {
