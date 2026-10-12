@@ -4,7 +4,7 @@ import { androidAssetLinks, downloadLatestApk, readSharedApplication } from "./s
 import { DurableObject } from "cloudflare:workers";
 import { authenticatedUser, OFFICIAL_ACCOUNT_ID, OFFICIAL_PROFILE, publicProfiles, readAvatar } from "./accounts";
 import { KeyedQueue } from "./concurrency";
-import { careerMaterials } from "./careerMaterials";
+import { careerContent } from "./careerContent";
 import { MarketIndex } from "./readIndexes";
 import { pageBff } from "./pageBff";
 import { sdkPreparation } from "./sdk-distribution";
@@ -35,7 +35,7 @@ export default {
   async fetch(request, env): Promise<Response> {
     const url = new URL(request.url);
     try {
-      if (url.pathname === "/v1/career-rescue/materials") return env.WORKSHOP.getByName("dynamic").fetch(request);
+      if (url.pathname === "/v1/career-rescue/content") return env.WORKSHOP.getByName("dynamic").fetch(request);
       const page = await pageBff(request, env);
       if (page) return page;
       if (url.pathname.startsWith("/v1/app-files/")) return applicationFiles(request, env);
@@ -404,7 +404,7 @@ export class Workshop extends DurableObject<Env> {
   private resetting = false;
   private writes = new Set<Promise<Response>>();
   async fetch(request: Request): Promise<Response> {
-    if (new URL(request.url).pathname === "/v1/career-rescue/materials") return careerMaterials(request, this.ctx.storage, await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN));
+    if (new URL(request.url).pathname === "/v1/career-rescue/content") return careerContent(request, this.ctx.storage, await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN));
     await this.marketIndex.ensure();
     if (new URL(request.url).pathname === "/v1/development-reset") return this.reset(request);
     if (this.resetting) return json({ message: "开发数据正在重置，请稍后重试" }, 503);
@@ -974,7 +974,7 @@ export class Workshop extends DurableObject<Env> {
 
       if (path === "/v1/official-release" && request.method === "POST") {
         if (!await authorized(request, this.env.OFFICIAL_PUBLISH_TOKEN)) return json({ message: "官方公开发布需要维护者凭证" }, 403);
-        const { appId, releaseId, action } = await request.json() as { appId: string; releaseId?: string; action?: string };
+        const { appId, releaseId, action, branch } = await request.json() as { appId: string; releaseId?: string; action?: string; branch?: string };
         if (!/^[a-z][a-z0-9-]{0,63}$/.test(appId)) return json({ message: "请指定应用" }, 400);
         if (action === "withdraw") {
           if (await this.ctx.storage.get(`task:${appId}`)) return json({ message: "只能下架官方应用作品" }, 403);
@@ -994,10 +994,20 @@ export class Workshop extends DurableObject<Env> {
         if (await this.ctx.storage.get(`task:${appId}`)) return json({ message: "用户作品必须由作者决定上架" }, 409);
         const manifest = await this.env.CATALOG.get<ApplicationRelease>(`v1/applications/${appId}/releases/${releaseId}`, "json");
         if (!manifest || manifest.appId !== appId || manifest.releaseId !== releaseId || manifest.source.dirty) return json({ message: "指定版本尚未上传或无效" }, 409);
+        if (typeof branch !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(branch) || branch.includes("..") || branch.includes("//") || branch.endsWith("/")) return json({ message: "请指定已推送的应用源码分支" }, 400);
+        if (manifest.source.repository !== "jiangfengwhu/zjh-plugin" || !manifest.source.applicationTree || !/^[a-f0-9]{40}$/.test(manifest.source.commit)) return json({ message: "官方作品源码不完整" }, 409);
+        let proof: SourceProof;
+        try {
+          const comparison = await this.github(`compare/${manifest.source.commit}...${encodeURIComponent(branch)}`);
+          if (!["identical", "ahead"].includes(comparison.status)) return json({ message: "指定分支不包含作品源码提交" }, 409);
+          const source = await this.sourceTree(manifest.source.commit, appId);
+          if (!source || source.applicationTree !== manifest.source.applicationTree) return json({ message: "作品源码目录与发布包不一致" }, 409);
+          proof = { commit: manifest.source.commit, branch, ...source };
+        } catch { return json({ message: "无法核对GitHub源码分支，请稍后重试" }, 409); }
         const prior = await this.ctx.storage.get<MarketEntry>(`shared:${appId}`);
-        const entry: MarketEntry = { manifest, title: manifest.appName, summary: manifest.description, category: prior?.category || "other", screenshots: prior?.screenshots || [], publishedAt: prior?.manifest.releaseId === releaseId ? prior.publishedAt || Date.now() : Date.now(), authorId: OFFICIAL_ACCOUNT_ID, authorName: OFFICIAL_PROFILE.name, authorAvatarUrl: OFFICIAL_PROFILE.avatarUrl, authorOfficial: true, originalAppId: null };
+        const entry: MarketEntry = { manifest, title: manifest.appName, summary: manifest.description, category: prior?.category || "other", screenshots: prior?.screenshots || [], publishedAt: prior?.manifest.releaseId === releaseId ? prior.publishedAt || Date.now() : Date.now(), authorId: OFFICIAL_ACCOUNT_ID, authorName: OFFICIAL_PROFILE.name, authorAvatarUrl: OFFICIAL_PROFILE.avatarUrl, authorOfficial: true, originalAppId: null, sourceCommit: proof.commit, sourceBranch: proof.branch };
         await this.ctx.storage.transaction(async storage => {
-          await storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${releaseId}`]: true });
+          await storage.put({ [`shared:${appId}`]: entry, [`published:${appId}:${releaseId}`]: true, [`source-proof:${appId}:${releaseId}`]: proof });
           this.marketIndex.put(entry);
         });
         await this.ctx.storage.delete(`withdrawn:${appId}`);

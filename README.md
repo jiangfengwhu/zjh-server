@@ -24,7 +24,7 @@ Secrets 用 `npx wrangler secret put <NAME>` 交互配置，值不写入代码�
 
 GitHub/Jules 集成仅开放 zjh-plugin；云端不获得 R2、Wrangler 或全局发布权限。
 
-求职急救站的公开资料和维护者更新接口见 [资料维护](docs/career-materials.md)。资料复用 Workshop SQLite 原子保存，不新增存储绑定；应用缓存支持离线阅读。
+求职急救站的五类资料使用一个统一接口，维护方法见 [内容维护](docs/career-content.md)。复用 Workshop SQLite 原子保存，不新增存储绑定；旧 materials 接口已删除。
 
 ## 应用云数据
 
@@ -61,7 +61,7 @@ APP_DATA 使用 SQLite Durable Objects。私有实例按 userId 分配，内部�
 
 通知 category=creation/interaction 使用独立分页游标；不传 category 返回全部通知。通知列表、未读查询与标记已读均返回 unreadByCategory（creation/interaction 未读数）；点赞、评论、回复归入互动，重复点赞不生成通知，取消点赞清理对应通知。制作状态携带 submissionId/startedAt，旧轮终态不能覆盖新提交；继续修改的 requestId 绑定账号、应用、会话与正文，成功重试不再次提交。
 
-候选发布必须提供 expectedReleases 原子基线，冲突返回 409；candidate 为权威候选，latest 为私有镜像，不检查应用提交祖先。发现与安装只消费公开版本，APK 只内置宿主 vendor/app 包；官方身份由服务端生成。
+候选发布必须提供 expectedReleases 原子基线，冲突返回 409；candidate 为权威候选，latest 为私有镜像，不检查应用提交祖先。发现与安装只消费公开版本，APK 只内置宿主 vendor/app 包；官方身份由服务端生成。官方发布须指定已推送的源码分支；服务端核对GitHub提交及应用目录，并保存来源，供后续改编从原作分支启动。
 
 任务命令保存应用本轮身份，发布脚本通过 POST /v1/application-publisher/<appId> 自动获取最长 30 分钟的发布授权，期限不超过任务凭据；账号、应用与 publishEpoch 必须一致。同一轮 working/ready 状态允许重复发布，停止或开始新一轮立即使旧授权失效。任务提示明确要求完成开发和清单后再发布，不发布初始化模板。
 
