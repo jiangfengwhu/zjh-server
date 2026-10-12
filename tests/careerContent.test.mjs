@@ -47,3 +47,18 @@ test('real reports and timelines require sources; payload limits leave published
     assert.equal((await (await f.call()).json()).revision, 1);
   } finally { f.close(); }
 });
+test('more than 500 items and deletions are accepted; aggregate catalog may exceed one request', async () => {
+  const f = fixture(); try {
+    const initial = Array.from({ length: 650 }, (_, index) => ({ ...question, id: `question-${index}` }));
+    const first = await f.call('PUT', { items: initial }, '"0"');
+    assert.equal(first.status, 200); assert.equal((await first.json()).count, 650);
+    for (let batch = 0; batch < 2; batch++) {
+      const items = Array.from({ length: 180 }, (_, index) => ({ ...question, id: `large-${batch}-${index}`, body: 'x'.repeat(3000) }));
+      assert.equal((await f.call('PATCH', { items }, `"${batch + 1}"`)).status, 200);
+    }
+    const head = await f.call('HEAD'); assert.equal(head.headers.get('ETag'), '"3"'); assert.equal(await head.text(), '');
+    const current = await (await f.call()).json(); assert.equal(current.items.length, 1010); assert.ok(Buffer.byteLength(JSON.stringify(current)) > 1024 * 1024);
+    const removed = await f.call('PATCH', { items: [], removeIds: initial.map(item => item.id) }, '"3"');
+    assert.equal(removed.status, 200); assert.equal((await removed.json()).count, 360);
+  } finally { f.close(); }
+});

@@ -10,7 +10,7 @@ node scripts/update-career-content.mjs C:\资料\本次更新.json
 
 全量替换加`--replace`。授权沿用本机保存的维护者配置，脚本自动读取revision与处理并发冲突。发布内容不需要重发应用。
 
-正文格式为`{"items":[...],"removeIds":["待删除id"]}`。PUT不传removeIds。批次id不得重复，也不得同时更新和删除；失败整批不写入。单条32KiB，整个库1MiB、最多500项。成功返回published、revision、count和按kind分类的counts。
+正文格式为`{"items":[...],"removeIds":["待删除id"]}`。PUT不传removeIds。批次id不得重复，也不得同时更新和删除；失败整批不写入。资料总量、单批items与removeIds不设置条数上限；单条32KiB，单次请求最多1MiB，较大的增量分多批PATCH提交。维护脚本使用HEAD读取ETag，不下载整库。成功返回published、revision、count和按kind分类的counts。
 
 | 字段 | 说明 |
 | --- | --- |

@@ -1,5 +1,4 @@
 const MAX_BYTES = 1024 * 1024;
-const MAX_ITEMS = 500;
 const kinds = ['resume', 'question', 'followup', 'risk', 'timeline'] as const;
 type Kind = typeof kinds[number];
 type Item = { id: string; kind: Kind; title: string; body: string; roles: string[]; tags: string[]; updatedAt: string; company?: string; source?: { label: string; url: string }; provenance: '官方资料' | '公开面经' | '示例'; before?: string; after?: string; question?: string; followups?: string[]; interviewDate?: string; severity?: '高' | '中' | '低'; reportCount?: number; startAt?: string; endAt?: string; eventType?: string; applicationUrl?: string };
@@ -84,27 +83,28 @@ export async function careerContent(request: Request, storage: DurableObjectStor
   storage.sql.exec('CREATE TABLE IF NOT EXISTS career_content (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL)');
   const read = (): Catalog => { const row = storage.sql.exec<{ body: string }>('SELECT body FROM career_content WHERE id=1').toArray()[0]; return row ? JSON.parse(row.body) : { revision: 0, updatedAt: '', items: [] }; };
   if (!writing) {
-    const current = read(), etag = `"${current.revision}"`, headers = { ETag: etag, 'Cache-Control': 'no-cache' };
+    const metadata = storage.sql.exec<{ revision: number }>("SELECT json_extract(body,'$.revision') AS revision FROM career_content WHERE id=1").toArray()[0];
+    const etag = `"${metadata?.revision ?? 0}"`, headers = { ETag: etag, 'Cache-Control': 'no-cache' };
     if (request.headers.get('If-None-Match')?.split(',').some(v => v.trim() === '*' || v.trim().replace(/^W\//, '') === etag)) return new Response(null, { status: 304, headers });
-    return request.method === 'HEAD' ? new Response(null, { headers }) : response(current, 200, headers);
+    return request.method === 'HEAD' ? new Response(null, { headers }) : response(read(), 200, headers);
   }
   const match = request.headers.get('If-Match');
   if (!match || !/^"\d+"$/.test(match)) return response({ message: '先GET读取revision，再传If-Match: "版本整数"' }, 428);
   try {
     const input = object(await readBody(request));
-    if (!Array.isArray(input.items) || input.items.length > MAX_ITEMS) throw new Error('items最多500项');
-    const items = input.items.map(item), removed = list(input.removeIds, 'removeIds', MAX_ITEMS, 64).map(id);
-    if (new Set(items.map(i => i.id)).size !== items.length || items.some(i => removed.includes(i.id))) throw new Error('批次id不能重复或同时更新与删除');
-    if (request.method === 'PUT' && removed.length) throw new Error('全量替换不传removeIds');
+    if (!Array.isArray(input.items)) throw new Error('items须为数组');
+    if (input.removeIds !== undefined && !Array.isArray(input.removeIds)) throw new Error('removeIds须为数组');
+    const items = input.items.map(item), removed = new Set(((input.removeIds ?? []) as unknown[]).map(id));
+    if (new Set(items.map(i => i.id)).size !== items.length || items.some(i => removed.has(i.id))) throw new Error('批次id不能重复或同时更新与删除');
+    if (request.method === 'PUT' && removed.size) throw new Error('全量替换不传removeIds');
     return storage.transactionSync(() => {
       const current = read(); if (match !== `"${current.revision}"`) return response({ message: '资料已更新，请重新读取后提交', revision: current.revision }, 409);
       const merged = request.method === 'PUT' ? new Map<string, Item>() : new Map(current.items.map(i => [i.id, i]));
       removed.forEach(id => merged.delete(id)); items.forEach(i => merged.set(i.id, i));
-      if (merged.size > MAX_ITEMS) throw new Error('资料库最多500项');
       const next: Catalog = { revision: current.revision + 1, updatedAt: new Date().toISOString(), items: [...merged.values()] }, body = JSON.stringify(next);
-      if (new TextEncoder().encode(body).byteLength > MAX_BYTES) throw new RangeError('资料库最多1 MiB');
       storage.sql.exec('INSERT INTO career_content(id,body) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body', body);
-      return response({ published: true, revision: next.revision, count: merged.size, counts: Object.fromEntries(kinds.map(kind => [kind, next.items.filter(i => i.kind === kind).length])), updatedAt: next.updatedAt }, 200, { ETag: `"${next.revision}"` });
+      const counts = Object.fromEntries(kinds.map(kind => [kind, 0])); for (const value of merged.values()) counts[value.kind]++;
+      return response({ published: true, revision: next.revision, count: merged.size, counts, updatedAt: next.updatedAt }, 200, { ETag: `"${next.revision}"` });
     });
   } catch (error) { return response({ message: error instanceof Error ? error.message : '资料格式无效' }, error instanceof RangeError ? 413 : 400); }
 }
