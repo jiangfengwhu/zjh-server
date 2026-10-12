@@ -80,7 +80,7 @@ export async function careerMaterials(request: Request, storage: DurableObjectSt
     return request.method === 'HEAD' ? new Response(null, { headers }) : response(catalog, 200, headers);
   }
   const match = request.headers.get('If-Match');
-  if (!match || !/^"\d+"$/.test(match)) return response({ message: '先 GET 获取 ETag，再将其放入 If-Match' }, 428);
+  if (!match || !/^"\d+"$/.test(match)) return response({ message: '先 GET 读取 revision，再传 If-Match: "版本整数"' }, 428);
   try {
     const input = object(await readBody(request));
     if (!Array.isArray(input.items) || input.items.length > MAX_ITEMS) throw new Error(`items需为数组，最多 ${MAX_ITEMS} 份资料`);
