@@ -7,3 +7,5 @@ dist/
 .dev.vars
 .dev.vars.*
 *.log
+/go/api
+/go/api.exe

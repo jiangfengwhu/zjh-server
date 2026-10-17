@@ -1,0 +1,25 @@
+[Unit]
+Description=Shenghua Go API (shadow deployment)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=shenghua
+Group=shenghua
+WorkingDirectory=/opt/shenghua
+EnvironmentFile=/etc/shenghua/api.env
+Environment=GOMEMLIMIT=256MiB
+Environment=GOMAXPROCS=2
+ExecStart=/opt/shenghua/shenghua-api
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+UMask=0077
+LimitNOFILE=16384
+
+[Install]
+WantedBy=multi-user.target
