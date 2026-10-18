@@ -29,11 +29,15 @@ go build -o ../dist/shenghua-api ./cmd/api
 - 先导入隔离的新库，核对账号、作品、动态、消息、云记录、文件元数据与密钥。SQL 派生搜索索引可从源记录重建；不要复制 Cloudflare 内部 SQLite 表。
 - 迁移窗口短暂停写，排空旧端在途事务，导出最后一致快照再导入。切换后只允许新端写入；回退须先同步新端产生的数据，不能直接把 DNS 指回旧库。
 - 沿用原 API 域名时，Cloudflare Worker 的通配路由仍会拦截请求；域名解析与 Worker 路由需要一起处理。TLS 可先使用 DNS-01 签发，避免提前切流才能验证 HTTP-01 的依赖。
-- 保留旧 Worker 和原存储到完整验收后。按用户要求，不创建数据库定时备份；迁移用的临时导出文件仅用于导入与核对，验收后清理。现在未修改正式 API 的 DNS、Worker 路由或生产存储。
+- 保留旧 Worker 和原存储到完整验收后。按用户要求，不创建数据库定时备份；迁移用的临时导出文件仅用于导入与核对，验收后清理。用户已将正式域名 DNS 指向新服务器，并确认尚未上线，接受迁移期间无法访问。原 Worker 路由与存储仍保留。
 
 ## 部署配置
 
-deploy/nginx.conf 是切换后的目标配置，处理 HTTPS/WebSocket/大包上传。证书由 Certbot 获取和续期，成功续期后先 nginx -t，再 reload；不得未校验即替换活动配置。初期不自动启用该配置。
+deploy/nginx.conf 是完整迁移后的目标配置，处理 HTTPS/WebSocket/大包上传，目前不启用。已部署 Nginx 1.30.6 容器，HTTP 使用 nginx-bootstrap.conf：仅开放 ACME 验证文件，其余路径返回 503；证书签发后先启用 nginx-migration.conf，HTTPS 同样返回迁移中，避免暴露未完成接口。shenghua-nginx.service 管理启动顺序，reload 前执行 nginx -t。
+
+公网 HTTP 验证被上游 ADM/2.1.1 返回 403，本机同路径返回 200；Let's Encrypt HTTP-01 因此失败。已使用 Certbot 5.8.0 手工 DNS-01 签发证书，有效期至 2027-01-16，已加载 nginx-migration.conf；临时 TXT 验证记录可删除。镜像固定为 certbot/certbot@sha256:f70ad0adbb7e117f0fe42a63c553f28ea451edabc0148757b6efcd9735acaa20。手工 TXT 验证不能自动续期，不启用会重复失败的 webroot 续期任务；自动续期须另外完成 DNS 更新授权和验证。
+
+本机 HTTPS 返回迁移中，公网当前仍是 HTTP ADM 拦截页与 HTTPS 连接重置；尚不能认定域名已可公网使用。用户确认未上线，接受迁移期间不可访问，不要求回到旧服务。镜像拉取临时代理及 SSH 转发已移除，服务运行不依赖桌面网络。
 
 deploy/shenghua-api.service 使用独立低权限账号。现有 CentOS Linux 8 按用户要求保留；需要选用能够在当前系统运行的部署方式。证书与密钥持久化到服务器受限目录。
 
@@ -45,6 +49,6 @@ deploy/shenghua-api.service 使用独立低权限账号。现有 CentOS Linux 8 
 
 `go build -o ../dist/shenghua-check ./cmd/check` 可构建连接诊断工具；在服务器受限环境中运行，只输出配置、数据库、R2、Jules 的连接布尔值，不打印密钥或上游正文。
 
-当前部署状态：账号与云集合接口已在新服务器运行并通过 21 项定向验证；求职资料接口通过 12 项验证（含 501 条批量写入与并发 revision 冲突），过期记录清理已部署。Go 诊断确认数据库、R2、Jules 均可连接。SSH 公钥认证已恢复，配置被关闭的来源尚未查明。数据库补充 shenghua-postgres.service，显式等待可连接后再启动 API，并随 Docker 的启停和重启联动。Nginx/Let's Encrypt、完整数据导入、动态/社交/制作/房间/文件接口及正式切换尚未完成。
+当前部署状态：账号与云集合接口已在新服务器运行并通过 21 项定向验证；求职资料接口通过 12 项验证（含 501 条批量写入与并发 revision 冲突），过期记录清理已部署。Go 诊断确认数据库、R2、Jules 均可连接。SSH 公钥认证已恢复，配置被关闭的来源尚未查明。数据库补充 shenghua-postgres.service，显式等待可连接后再启动 API，并随 Docker 的启停和重启联动。Nginx/证书已就绪；证书自动续期、完整数据导入、动态/社交/制作/房间/文件接口及正式开放尚未完成。
 
-DNS 由用户配置。接口、数据和 HTTPS 就绪后，再将 zijinhua.297782.xyz 的 A 记录改为 1.92.67.206，初次切换使用 DNS only；删除同名冲突的 CNAME 或旧 AAAA 记录。维护者同步解除原正式 API Worker 通配路由，确认流量进入 Nginx，并进行登录、发现、制作、分享、云数据、WebSocket 验证。R2/CDN 域名与 Jules 转发域名保持原配置。
+DNS 由用户配置，zijinhua.297782.xyz 的 A 记录已是 1.92.67.206、DNS only。当前仅开放迁移状态页。完整接口与数据就绪、确认公网连接正常后，维护者启用 nginx.conf、清理原正式 API Worker 通配路由，并验证登录、发现、制作、分享、云数据、WebSocket。R2/CDN 域名与 Jules 转发域名保持原配置。
