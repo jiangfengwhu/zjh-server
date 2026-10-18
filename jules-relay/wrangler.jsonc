@@ -1,0 +1,8 @@
+{
+  "name": "shenghua-jules-relay",
+  "main": "index.ts",
+  "compatibility_date": "2026-09-29",
+  "workers_dev": false,
+  "routes": [{ "pattern": "jules-relay.297782.xyz", "custom_domain": true }],
+  "observability": { "enabled": false }
+}

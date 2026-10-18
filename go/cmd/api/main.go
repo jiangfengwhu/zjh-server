@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"github.com/jiangfengwhu/zjh-server/go/internal/blob"
 	"github.com/jiangfengwhu/zjh-server/go/internal/config"
 	"github.com/jiangfengwhu/zjh-server/go/internal/database"
 	"github.com/jiangfengwhu/zjh-server/go/internal/httpapi"
@@ -37,7 +38,13 @@ func main() {
 		os.Exit(1)
 	}
 	cancel()
-	app := &httpapi.Server{DB: db, CDN: cfg.CDNURL, Log: logger}
+	go db.Maintenance(ctx)
+	app := &httpapi.Server{DB: db, CDN: cfg.CDNURL, Log: logger, ResendKey: cfg.ResendKey, MailFrom: cfg.MailFrom, MailClient: &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}}
+	app.PublicURL = cfg.PublicURL
+	app.OfficialToken = cfg.OfficialToken
+	if cfg.R2Endpoint != "" {
+		app.Blobs = blob.New(cfg.R2Endpoint, cfg.R2Bucket, cfg.R2AccessKey, cfg.R2SecretKey)
+	}
 	srv := &http.Server{Addr: cfg.Listen, Handler: app.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 2 * time.Minute, IdleTimeout: 75 * time.Second, MaxHeaderBytes: 32 << 10}
 	failure := make(chan error, 1)
 	go func() { failure <- srv.ListenAndServe() }()

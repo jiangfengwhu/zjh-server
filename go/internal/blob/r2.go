@@ -15,8 +15,13 @@ type R2 struct {
 	bucket string
 }
 
+func (r *R2) Check(ctx context.Context) error {
+	_, err := r.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(r.bucket)})
+	return err
+}
+
 func New(endpoint, bucket, access, secret string) *R2 {
-	cfg := aws.Config{Region: "auto", Credentials: credentials.NewStaticCredentialsProvider(access, secret, "")}
+	cfg := aws.Config{Region: "auto", Credentials: credentials.NewStaticCredentialsProvider(access, secret, ""), RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired, ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired}
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) { o.BaseEndpoint = aws.String(endpoint) })
 	return &R2{client: client, bucket: bucket}
 }

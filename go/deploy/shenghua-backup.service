@@ -1,0 +1,11 @@
+[Unit]
+Description=Shenghua PostgreSQL backup
+After=shenghua-docker.service
+Requires=shenghua-docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/shenghua/backup-postgres.sh
+UMask=0077
+Nice=10
+IOSchedulingClass=idle

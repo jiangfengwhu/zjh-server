@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/jackc/pgx/v5"
+	"github.com/jiangfengwhu/zjh-server/go/internal/blob"
 	"github.com/jiangfengwhu/zjh-server/go/internal/database"
 	"log/slog"
 	"net/http"
@@ -14,13 +15,31 @@ import (
 )
 
 type Server struct {
-	DB  *database.Store
-	CDN string
-	Log *slog.Logger
+	OfficialToken       string
+	DB                  *database.Store
+	CDN                 string
+	Log                 *slog.Logger
+	ResendKey, MailFrom string
+	MailClient          *http.Client
+	Blobs               *blob.R2
+	PublicURL           string
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/auth/code", s.sendCode)
+	mux.HandleFunc("POST /v1/auth/verify", s.verifyCode)
+	mux.HandleFunc("POST /v1/auth/logout", s.logout)
+	mux.HandleFunc("GET /v1/account", s.readAccount)
+	mux.HandleFunc("PATCH /v1/account", s.patchAccount)
+	mux.HandleFunc("PUT /v1/account/avatar", s.putAvatar)
+	mux.HandleFunc("DELETE /v1/account/avatar", s.deleteAvatar)
+	mux.HandleFunc("GET /v1/avatars/{user}/{hash}", s.readBlob)
+	mux.HandleFunc("GET /v1/app/{hash}", s.readBlob)
+	mux.HandleFunc("GET /v1/vendor/{hash}", s.readBlob)
+	mux.HandleFunc("GET /v1/apk/{hash}", s.readBlob)
+	mux.HandleFunc("POST /v1/app-data/{app}/{scope}/{collection}", s.applicationData)
+	mux.HandleFunc("/v1/career-rescue/content", s.careerContent)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		send(w, 200, map[string]any{"ok": true, "service": "shenghua-go"})
 	})

@@ -1,7 +1,9 @@
 [Unit]
 Description=Shenghua Go API (shadow deployment)
-After=network-online.target
+After=network-online.target shenghua-docker.service
 Wants=network-online.target
+Requires=shenghua-docker.service
+StartLimitIntervalSec=0
 
 [Service]
 User=shenghua

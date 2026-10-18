@@ -39,3 +39,28 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
  PRIMARY KEY(namespace,object_id)
 );
 CREATE INDEX IF NOT EXISTS scheduled_jobs_due ON scheduled_jobs(due_at);
+CREATE TABLE IF NOT EXISTS users (
+ id uuid PRIMARY KEY, email text UNIQUE, name text NOT NULL,
+ avatar_url text, created_at bigint NOT NULL
+);
+INSERT INTO users(id,email,name,avatar_url,created_at)
+ VALUES('00000000-0000-4000-8000-000000000001',NULL,'生花官方',
+ 'https://zijinhua.297782.xyz/v1/avatars/00000000-0000-4000-8000-000000000001/db19c53b9c42cd5205709edd1e646b0ada6ab6ed5d08299d7ddcc8220a943322',
+ (extract(epoch FROM now())*1000)::bigint) ON CONFLICT(id) DO NOTHING;
+CREATE TABLE IF NOT EXISTS account_sessions (
+ token_hash text PRIMARY KEY, user_id uuid NOT NULL REFERENCES users(id), expires_at bigint NOT NULL
+);
+CREATE INDEX IF NOT EXISTS account_sessions_expiry ON account_sessions(expires_at);
+CREATE TABLE IF NOT EXISTS login_challenges (
+ email_hash text PRIMARY KEY, salt text NOT NULL, digest text NOT NULL,
+ expires_at bigint NOT NULL, attempts integer NOT NULL, sent_at bigint NOT NULL, pending boolean NOT NULL DEFAULT false
+);
+CREATE INDEX IF NOT EXISTS login_challenges_expiry ON login_challenges(expires_at);
+CREATE TABLE IF NOT EXISTS rate_limits (
+ key text PRIMARY KEY, expires_at bigint NOT NULL, count integer NOT NULL
+);
+CREATE INDEX IF NOT EXISTS rate_limits_expiry ON rate_limits(expires_at);
+CREATE TABLE IF NOT EXISTS application_usage (
+ tenant text PRIMARY KEY, bytes bigint NOT NULL DEFAULT 0 CHECK(bytes>=0),
+ records bigint NOT NULL DEFAULT 0 CHECK(records>=0)
+);
