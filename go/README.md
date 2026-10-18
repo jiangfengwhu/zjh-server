@@ -39,10 +39,10 @@ deploy/shenghua-api.service 使用独立低权限账号。现有 CentOS Linux 8 
 
 当前服务器运行 Docker 静态发行版 29.9.1（systemd 服务 shenghua-docker），需要维护者主动更新；数据库 postgres:17-alpine 的镜像摘要固定为 `sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24`。容器 shenghua-postgres 使用持久卷，端口只绑定 127.0.0.1:5432，限制 512MB 内存、1.25 CPU、128 个进程；API 数据库角色不具备超级用户、创建库或创建角色权限。镜像拉取时的桌面临时代理已移除。
 
-deploy/backup-postgres.sh 和配套 service/timer 每天服务器时间 02:15 左右生成 PostgreSQL 自定义格式备份，校验可读取后才纳入轮换，保留最近七份；目录 /var/backups/shenghua 权限 0700，备份文件 0600。完整恢复演练和异机备份仍需在正式迁移前完成。数据库备份包含私有数据，不能上传到公开 CDN。
+deploy/backup-postgres.sh 和配套 service/timer 已启用，每天服务器时间 02:15 左右生成 PostgreSQL 自定义格式备份，校验可读取后才纳入轮换，保留最近七份；目录 /var/backups/shenghua 权限 0700，备份文件 0600。已在独立临时库完成恢复演练，六类业务表行数一致，演练库已删除；正式数据导入后仍须再做恢复验证，并配置异机备份。数据库备份包含私有数据，不能上传到公开 CDN。
 
 服务器不能直连 Jules；按用户确认，暂保留独立 [Jules 转发 Worker](../jules-relay/index.ts)，仅允许固定 Google Jules API 路径，使用独立 RELAY_TOKEN 鉴权，不绑定业务存储，也不记录请求内容。服务器 api.env 配置 JULES_BASE_URL=https://jules-relay.297782.xyz 和 JULES_RELAY_TOKEN；Worker 的 RELAY_TOKEN、JULES_API_KEY 用 Wrangler Secrets 配置。不能用桌面代理充当线上出口。现有生产 Worker 不依赖该转发器。
 
 `go build -o ../dist/shenghua-check ./cmd/check` 可构建连接诊断工具；在服务器受限环境中运行，只输出配置、数据库、R2、Jules 的连接布尔值，不打印密钥或上游正文。
 
-当前部署状态：账号与云集合接口已在新服务器运行并通过 21 项定向验证；求职资料接口、过期记录清理及备份定时任务已编译/准备，尚待部署验证。部署过程中服务器 SSH 不再提供公钥认证，连接恢复前不认定这些任务已启用。Nginx/Let's Encrypt、完整数据导入、动态/社交/制作/房间/文件接口及正式切换尚未完成。
+当前部署状态：账号与云集合接口已在新服务器运行并通过 21 项定向验证；求职资料接口通过 12 项验证（含 501 条批量写入与并发 revision 冲突），过期记录清理及备份定时任务已部署。Go 诊断确认数据库、R2、Jules 均可连接。SSH 公钥认证已恢复，配置被关闭的来源尚未查明。数据库补充 shenghua-postgres.service，显式等待可连接后再启动 API，并随 Docker 的启停和重启联动。Nginx/Let's Encrypt、完整数据导入、动态/社交/制作/房间/文件接口及正式切换尚未完成。
