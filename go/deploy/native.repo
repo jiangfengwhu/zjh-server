@@ -1,0 +1,23 @@
+[shenghua-pgdg17]
+name=PostgreSQL 17 official
+baseurl=https://download.postgresql.org/pub/repos/yum/17/redhat/rhel-8-x86_64/
+enabled=1
+gpgcheck=1
+gpgkey=https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-RHEL
+module_hotfixes=1
+
+[shenghua-pgdg-common]
+name=PostgreSQL common official
+baseurl=https://download.postgresql.org/pub/repos/yum/common/redhat/rhel-8-x86_64/
+enabled=1
+gpgcheck=1
+gpgkey=https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-RHEL
+module_hotfixes=1
+
+[shenghua-nginx]
+name=Nginx stable official
+baseurl=https://nginx.org/packages/centos/8/x86_64/
+enabled=1
+gpgcheck=1
+gpgkey=https://nginx.org/keys/nginx_signing.key
+module_hotfixes=1

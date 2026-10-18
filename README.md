@@ -1,6 +1,6 @@
 # 生花服务端
 
-Go 与自建数据库迁移正在 [go/](go/README.md) 开发。当前生产仍由下述 Worker 提供；在完整迁移与验收之前不切换域名或删除 Cloudflare 数据。
+Go 与自建数据库迁移正在 [go/](go/README.md) 开发。Nginx、PostgreSQL、Go 已直接部署到服务器，不使用 Docker；正式域名已按用户配置指向服务器，目前返回迁移状态页。完整业务与数据迁移尚未完成，原 Worker 和 Cloudflare 数据保留供迁移使用。原 Worker 的维护命令见下文，原生部署与当前状态以 go/README.md 为准。
 
 Cloudflare Worker 提供账号、动态互动、作品与产物接口及 Jules 制作代理。SDK/宿主在 zjh-dynamic，APK 在 zjh-android，应用源码与云端 Agent 规则在 zjh-plugin。维护边界见 [AGENTS.md](AGENTS.md)。
 

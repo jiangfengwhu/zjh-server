@@ -1,9 +1,9 @@
 [Unit]
 Description=Shenghua Go API (shadow deployment)
-After=network-online.target shenghua-postgres.service
+After=network-online.target postgresql-17.service
 Wants=network-online.target
-Requires=shenghua-postgres.service
-PartOf=shenghua-postgres.service
+Requires=postgresql-17.service
+PartOf=postgresql-17.service
 StartLimitIntervalSec=0
 
 [Service]

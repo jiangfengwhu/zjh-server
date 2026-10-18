@@ -2,3 +2,4 @@ go/deploy/*.sh text eol=lf
 go/deploy/*.service text eol=lf
 go/deploy/*.timer text eol=lf
 go/deploy/*.conf text eol=lf
+go/deploy/*.repo text eol=lf
